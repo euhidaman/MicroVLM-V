@@ -65,15 +65,21 @@ def main():
     if args.mode in ['images', 'all']:
         print("\nDownloading images...")
         
-        # Determine which metadata to use
-        if args.max_images and args.max_images <= args.test_samples:
-            metadata_file = output_dir / f"cc12m_test_{args.test_samples}.tsv"
-        else:
-            metadata_file = output_dir / "cc12m_metadata_0.tsv"
+        # Determine which metadata to use - prefer test file if it exists
+        test_file = output_dir / f"cc12m_test_{args.test_samples}.tsv"
+        full_file = output_dir / "cc12m_metadata_0.tsv"
         
-        if not metadata_file.exists():
-            print(f"Metadata file not found: {metadata_file}")
-            print("Please download metadata first using --mode metadata")
+        if test_file.exists() and args.max_images and args.max_images <= args.test_samples:
+            metadata_file = test_file
+            print(f"Using test metadata: {metadata_file}")
+        elif full_file.exists():
+            metadata_file = full_file
+            print(f"Using full metadata: {metadata_file}")
+        else:
+            print(f"Metadata file not found. Tried:")
+            print(f"  - {test_file}")
+            print(f"  - {full_file}")
+            print("Please download metadata first using --mode metadata or --mode test")
             return
         
         image_dir = output_dir / "images"
