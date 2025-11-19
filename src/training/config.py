@@ -16,8 +16,8 @@ class TrainingConfig:
     deit_checkpoint: Optional[str] = None
     
     # Data
-    metadata_file: str = "./data/cc12m/cc12m_metadata_0.tsv"
-    image_dir: str = "./data/cc12m/images"
+    train_metadata_file: str = "./data/cc12m/train_metadata.json"
+    val_metadata_file: str = "./data/cc12m/val_metadata.json"
     max_samples: Optional[int] = None  # None for full dataset
     
     # Training
@@ -76,10 +76,11 @@ class TrainingConfig:
 
 @dataclass
 class SmallScaleTestConfig(TrainingConfig):
-    """Configuration for small-scale testing with 1000 images"""
+    """Configuration for small-scale testing with downloaded images"""
     
-    metadata_file: str = "./data/cc12m/cc12m_test_1000.tsv"
-    max_samples: int = 1000
+    train_metadata_file: str = "./data/cc12m/train_metadata.json"
+    val_metadata_file: str = "./data/cc12m/val_metadata.json"
+    max_samples: int = None  # Use all downloaded images
     batch_size: int = 16
     num_epochs: int = 5
     log_interval: int = 10

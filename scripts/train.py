@@ -277,8 +277,8 @@ def main():
     # Create dataloaders
     print("Creating dataloaders...")
     train_loader, val_loader = create_dataloaders(
-        metadata_file=config.metadata_file,
-        image_dir=config.image_dir,
+        train_metadata_file=config.train_metadata_file,
+        val_metadata_file=config.val_metadata_file,
         tokenizer=model.language_model.tokenizer,
         batch_size=config.batch_size,
         num_workers=config.num_workers,

@@ -21,30 +21,33 @@ class CC12MDataset(Dataset):
     Conceptual Captions 12M dataset
     """
     
-    def __init__(self, metadata_file, image_dir, transform=None, max_samples=None,
+    def __init__(self, metadata_file, image_dir=None, transform=None, max_samples=None,
                  tokenizer=None, max_length=77):
         """
         Args:
-            metadata_file: path to metadata TSV file
-            image_dir: directory containing downloaded images
+            metadata_file: path to metadata JSON file (train_metadata.json or val_metadata.json)
+            image_dir: directory containing downloaded images (optional, can be in metadata)
             transform: image transformations
             max_samples: limit number of samples (for testing)
             tokenizer: text tokenizer
             max_length: maximum text length
         """
-        self.image_dir = Path(image_dir)
+        self.image_dir = Path(image_dir) if image_dir else None
         self.transform = transform
         self.tokenizer = tokenizer
         self.max_length = max_length
         
         # Load metadata
         print(f"Loading metadata from {metadata_file}")
-        self.metadata = pd.read_csv(metadata_file, sep='\t', names=['caption', 'url'])
+        with open(metadata_file, 'r') as f:
+            metadata = json.load(f)
+        
+        self.samples = metadata['samples']
         
         if max_samples is not None:
-            self.metadata = self.metadata.head(max_samples)
+            self.samples = self.samples[:max_samples]
         
-        print(f"Loaded {len(self.metadata)} samples")
+        print(f"Loaded {len(self.samples)} samples")
         
         # Default transform
         if self.transform is None:
@@ -56,17 +59,13 @@ class CC12MDataset(Dataset):
             ])
     
     def __len__(self):
-        return len(self.metadata)
+        return len(self.samples)
     
     def __getitem__(self, idx):
         """Get image-caption pair"""
-        row = self.metadata.iloc[idx]
-        caption = row['caption']
-        url = row['url']
-        
-        # Get image filename from URL
-        image_name = f"{idx:08d}.jpg"
-        image_path = self.image_dir / image_name
+        sample = self.samples[idx]
+        caption = sample['caption']
+        image_path = sample['image_path']
         
         # Load image
         try:
@@ -282,37 +281,33 @@ def create_small_test_dataset(metadata_file, output_metadata, num_samples=1000):
     print(f"Created test dataset with {len(subset)} samples at {output_metadata}")
 
 
-def create_dataloaders(metadata_file, image_dir, tokenizer, batch_size=32,
-                       num_workers=4, max_samples=None, train_split=0.95):
+def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer, 
+                       batch_size=32, num_workers=4, max_samples=None):
     """
     Create train and validation dataloaders
     
     Args:
-        metadata_file: path to metadata
-        image_dir: path to images
+        train_metadata_file: path to train_metadata.json
+        val_metadata_file: path to val_metadata.json
         tokenizer: text tokenizer
         batch_size: batch size
         num_workers: number of workers
-        max_samples: limit samples
-        train_split: fraction for training
+        max_samples: limit samples for testing
     
     Returns:
         train_loader, val_loader
     """
-    # Create dataset
-    dataset = CC12MDataset(
-        metadata_file=metadata_file,
-        image_dir=image_dir,
+    # Create datasets
+    train_dataset = CC12MDataset(
+        metadata_file=train_metadata_file,
         tokenizer=tokenizer,
         max_samples=max_samples
     )
     
-    # Split
-    train_size = int(len(dataset) * train_split)
-    val_size = len(dataset) - train_size
-    
-    train_dataset, val_dataset = torch.utils.data.random_split(
-        dataset, [train_size, val_size]
+    val_dataset = CC12MDataset(
+        metadata_file=val_metadata_file,
+        tokenizer=tokenizer,
+        max_samples=None  # Use all validation data
     )
     
     # Create loaders
