@@ -215,11 +215,16 @@ class AttentionVisualizer(nn.Module):
         attention = F.softmax(scores, dim=-1)  # (B, seq_len, k_prefix)
         
         # Statistics
+        entropy = self._compute_entropy(attention)
+        max_entropy = max(np.log(attention.size(-1)), 1e-8)
+        normalized_entropy = (entropy / max_entropy).clamp(min=0.0, max=1.0)
+        attention_sparsity = (1.0 - normalized_entropy).mean().item()
+        
         stats = {
             'mean_attention': attention.mean().item(),
             'max_attention': attention.max().item(),
-            'attention_entropy': self._compute_entropy(attention).mean().item(),
-            'attention_sparsity': (attention < 0.01).float().mean().item()
+            'attention_entropy': entropy.mean().item(),
+            'attention_sparsity': attention_sparsity
         }
         
         # Apply slicing test
