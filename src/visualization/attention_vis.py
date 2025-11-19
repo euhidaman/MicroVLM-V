@@ -188,31 +188,40 @@ class AttentionVisualizer(nn.Module):
         
         return attention_weights
     
-    def analyze_cross_modal_attention(self, image_tokens, text_tokens):
+    def analyze_cross_modal_attention(self, image_tokens, text_tokens, attention_weights=None):
         """
         Analyze attention between image and text
         
         Args:
             image_tokens: (batch, k_prefix, hidden_dim)
             text_tokens: (batch, seq_len, hidden_dim)
+            attention_weights: optional precomputed attention (batch, seq_len, k_prefix)
         
         Returns:
             statistics: dictionary of attention statistics
         """
         batch_size = image_tokens.size(0)
         
-        # Compute attention from text to image
-        query = text_tokens  # (B, seq_len, D)
-        key = image_tokens  # (B, k_prefix, D)
-        
-        # Ensure dtype consistency for matmul
-        if query.dtype != key.dtype:
-            key = key.to(query.dtype)
-        
-        # Simple attention (without multi-head split)
-        scores = torch.matmul(query, key.transpose(-2, -1))
-        scores = scores / np.sqrt(query.size(-1))
-        attention = F.softmax(scores, dim=-1)  # (B, seq_len, k_prefix)
+        if attention_weights is None:
+            # Compute approximate attention from embeddings if true weights not provided
+            query = text_tokens  # (B, seq_len, D)
+            key = image_tokens  # (B, k_prefix, D)
+            
+            # Ensure dtype consistency for matmul
+            if query.dtype != key.dtype:
+                key = key.to(query.dtype)
+            
+            scores = torch.matmul(query, key.transpose(-2, -1))
+            scores = scores / np.sqrt(query.size(-1))
+            attention = F.softmax(scores, dim=-1)  # (B, seq_len, k_prefix)
+        else:
+            attention = attention_weights
+            if attention.dim() == 4:
+                # If heads dimension present, average across heads
+                attention = attention.mean(dim=1)
+            # Renormalize over prefix tokens to interpret as probability
+            attn_sum = attention.sum(dim=-1, keepdim=True).clamp_min(1e-8)
+            attention = attention / attn_sum
         
         # Statistics
         entropy = self._compute_entropy(attention)

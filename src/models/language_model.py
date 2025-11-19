@@ -117,7 +117,8 @@ class Qwen2LanguageModel(nn.Module):
     
     def forward(self, input_ids=None, inputs_embeds=None, attention_mask=None, 
                 labels=None, past_key_values=None, use_cache=False,
-                output_hidden_states=False, return_dict=True):
+                output_hidden_states=False, output_attentions=False,
+                return_dict=True):
         """
         Forward pass through language model
         
@@ -144,6 +145,7 @@ class Qwen2LanguageModel(nn.Module):
                 past_key_values=past_key_values,
                 use_cache=use_cache,
                 output_hidden_states=output_hidden_states,
+                output_attentions=output_attentions,
                 return_dict=return_dict
             )
         else:
@@ -154,6 +156,7 @@ class Qwen2LanguageModel(nn.Module):
             # Simple forward through layers
             hidden_states = inputs_embeds
             all_hidden_states = [] if output_hidden_states else None
+            all_attentions = [] if output_attentions else None
             
             for layer in self.layers:
                 if output_hidden_states:
@@ -166,6 +169,10 @@ class Qwen2LanguageModel(nn.Module):
                     hidden_states,  # Using as both query and memory
                     tgt_mask=None
                 )
+                if output_attentions:
+                    # TransformerDecoderLayer in PyTorch does not expose attentions directly
+                    # Placeholder None is appended to keep API parity
+                    all_attentions.append(None)
             
             hidden_states = self.norm(hidden_states)
             
@@ -193,9 +200,13 @@ class Qwen2LanguageModel(nn.Module):
                     logits=logits,
                     past_key_values=None,
                     hidden_states=all_hidden_states,
+                    attentions=tuple(all_attentions) if output_attentions else None
                 )
             else:
-                return (loss, logits, all_hidden_states) if loss is not None else (logits, all_hidden_states)
+                outputs = (loss, logits, None, all_hidden_states)
+                if output_attentions:
+                    outputs = outputs + (tuple(all_attentions),)
+                return outputs
     
     def generate(self, input_ids, max_length=50, **kwargs):
         """Generate text"""

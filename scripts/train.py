@@ -566,8 +566,36 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         
                         viz_prefix_tokens, _ = model.encode_image(viz_images)
                         viz_text_embeddings, _ = model.encode_text(viz_input_ids, viz_attention_mask)
+                        attention_from_lm = None
+                        try:
+                            fused_embeddings, fused_mask = model.fusion(
+                                viz_prefix_tokens, viz_text_embeddings, viz_attention_mask
+                            )
+                            model_dtype = None
+                            if hasattr(model.language_model, 'model') and model.language_model.model is not None:
+                                model_dtype = next(model.language_model.model.parameters()).dtype
+                            elif hasattr(model.language_model, 'embed_tokens') and model.language_model.embed_tokens is not None:
+                                model_dtype = model.language_model.embed_tokens.weight.dtype
+                            if model_dtype is not None and fused_embeddings.dtype != model_dtype:
+                                fused_embeddings = fused_embeddings.to(model_dtype)
+                            lm_viz_outputs = model.language_model(
+                                inputs_embeds=fused_embeddings,
+                                attention_mask=fused_mask,
+                                output_attentions=True,
+                                output_hidden_states=False,
+                                use_cache=False,
+                                return_dict=True
+                            )
+                            attentions = getattr(lm_viz_outputs, 'attentions', None)
+                            if attentions:
+                                attn = attentions[-1].detach()
+                                prefix_len = viz_prefix_tokens.size(1)
+                                attention_from_lm = attn[:, :, prefix_len:, :prefix_len]
+                        except Exception as exc:
+                            print(f"Warning: unable to compute attention maps from LM: {exc}")
+                            attention_from_lm = None
                         stats, attention = visualizer.analyze_cross_modal_attention(
-                            viz_prefix_tokens, viz_text_embeddings
+                            viz_prefix_tokens, viz_text_embeddings, attention_weights=attention_from_lm
                         )
                         
                         if not hasattr(visualizer, '_caption_tokenizer'):
@@ -853,7 +881,8 @@ def main():
         vision_checkpoint=getattr(config, 'vision_checkpoint', config.deit_checkpoint),
         quantize_4bit=(getattr(config, 'quantize_vision_4bit', False) or 
                       getattr(config, 'quantize_language_4bit', False)),
-        quantize_memory_158bit=getattr(config, 'quantize_memory_158bit', False)
+        quantize_memory_158bit=getattr(config, 'quantize_memory_158bit', False),
+        training_config=config
     )
     
     # Log quantization statistics if enabled

@@ -27,10 +27,12 @@ class MicroVLM(nn.Module):
     """
     
     def __init__(self, config, vision_checkpoint=None, language_checkpoint=None, 
-                 quantize_4bit=False, quantize_memory_158bit=False):
+                 quantize_4bit=False, quantize_memory_158bit=False,
+                 training_config=None):
         super().__init__()
         
         self.config = config
+        self.training_config = training_config
         self.quantize_4bit = quantize_4bit
         self.quantize_memory_158bit = quantize_memory_158bit
         
@@ -272,21 +274,32 @@ class MicroVLM(nn.Module):
         outputs['logits'] = lm_outputs.logits
         outputs['hidden_states'] = lm_outputs.hidden_states
         
-        # Compute total loss - ensure it's a tensor
-        if lm_outputs.loss is not None:
-            total_loss = lm_outputs.loss
-        else:
-            # Create zero tensor on same device as model
-            device = next(self.parameters()).device
-            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        def _get_training_attr(name, default):
+            if self.training_config is None:
+                return default
+            if isinstance(self.training_config, dict):
+                return self.training_config.get(name, default)
+            return getattr(self.training_config, name, default)
+        
+        lm_weight = _get_training_attr('lm_loss_weight', 1.0)
+        alignment_weight = _get_training_attr('alignment_loss_weight', 0.1)
+        memory_weight = _get_training_attr('memory_kl_weight', 0.01)
+        addressing_weight = _get_training_attr('addressing_kl_weight', 0.001)
+        
+        device = fused_embeddings.device
+        total_loss = torch.zeros((), device=device)
+        
+        if outputs.get('lm_loss') is not None:
+            total_loss = total_loss + lm_weight * outputs['lm_loss']
         
         if 'alignment_loss' in outputs:
-            total_loss = total_loss + 0.1 * outputs['alignment_loss']
+            total_loss = total_loss + alignment_weight * outputs['alignment_loss']
         
-        if use_memory:
-            # Add memory KL losses
-            total_loss = total_loss + 0.01 * outputs['memory_kl']
-            total_loss = total_loss + 0.001 * outputs['addressing_kl']
+        if use_memory and 'memory_kl' in outputs:
+            total_loss = total_loss + memory_weight * outputs['memory_kl']
+        
+        if use_memory and 'addressing_kl' in outputs:
+            total_loss = total_loss + addressing_weight * outputs['addressing_kl']
         
         outputs['loss'] = total_loss
         
@@ -387,7 +400,8 @@ class MicroVLM(nn.Module):
 
 
 def create_microvlm(config, vision_checkpoint=None, language_checkpoint=None,
-                    quantize_4bit=False):
+                    quantize_4bit=False, quantize_memory_158bit=False,
+                    training_config=None):
     """
     Factory function to create MicroVLM model
     
@@ -396,6 +410,8 @@ def create_microvlm(config, vision_checkpoint=None, language_checkpoint=None,
         vision_checkpoint: path to DeiT checkpoint
         language_checkpoint: path to Qwen checkpoint or HF model name
         quantize_4bit: whether to apply 4-bit quantization
+        quantize_memory_158bit: whether to apply 1.58-bit memory quantization
+        training_config: optional training config for loss weighting
     
     Returns:
         model: MicroVLM instance
@@ -404,6 +420,8 @@ def create_microvlm(config, vision_checkpoint=None, language_checkpoint=None,
         config,
         vision_checkpoint=vision_checkpoint,
         language_checkpoint=language_checkpoint,
-        quantize_4bit=quantize_4bit
+        quantize_4bit=quantize_4bit,
+        quantize_memory_158bit=quantize_memory_158bit,
+        training_config=training_config
     )
     return model

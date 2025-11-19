@@ -34,9 +34,9 @@ class TrainingConfig:
     
     # Loss weights
     lm_loss_weight: float = 1.0
-    alignment_loss_weight: float = 0.1
-    memory_kl_weight: float = 0.01
-    addressing_kl_weight: float = 0.001
+    alignment_loss_weight: float = 0.3
+    memory_kl_weight: float = 0.05
+    addressing_kl_weight: float = 0.01
     
     # Quantization
     use_4bit: bool = False
@@ -70,9 +70,9 @@ class TrainingConfig:
     mixed_precision: bool = True
     
     # Freezing strategy
-    freeze_vision: bool = True
+    freeze_vision: bool = False
     freeze_language: bool = True
-    unfreeze_last_n_layers: int = 0  # 0 means fully frozen
+    unfreeze_last_n_layers: int = 4  # 0 means fully frozen
     
     # Memory
     use_memory: bool = True
@@ -111,8 +111,8 @@ class Stage1Config(TrainingConfig):
 class Stage2Config(TrainingConfig):
     """Stage 2: Unfreeze last N language layers"""
     
-    freeze_vision: bool = True
-    freeze_language: bool = False  # Will unfreeze last N
+    freeze_vision: bool = False
+    freeze_language: bool = True  # Freeze early layers, unfreeze last N
     unfreeze_last_n_layers: int = 4
     
     num_epochs: int = 5

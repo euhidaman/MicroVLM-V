@@ -30,10 +30,17 @@ class TrainingConfig:
     # Memory
     use_memory: bool = True
     episode_size: int = 1
+    memory_kl_weight: float = 0.05
+    addressing_kl_weight: float = 0.01
+    lm_loss_weight: float = 1.0
+    alignment_loss_weight: float = 0.3
     
     # Alignment
     use_alignment: bool = True
     alignment_temperature: float = 0.07
+    freeze_vision: bool = False
+    freeze_language: bool = True
+    unfreeze_last_n_layers: int = 4
     
     # Quantization
     enable_quantization: bool = False
@@ -81,6 +88,7 @@ class Stage1Config(TrainingConfig):
     freeze_vision: bool = True
     freeze_language: bool = True
     train_adapter_only: bool = True
+    unfreeze_last_n_layers: int = 0
     
     # Quantization - Enable for efficiency
     enable_quantization: bool = True
@@ -109,10 +117,11 @@ class Stage2Config(TrainingConfig):
     warmup_steps: int = 1000
     
     # Keep vision/language frozen, train adapter + memory
-    freeze_vision: bool = True
+    freeze_vision: bool = False
     freeze_language: bool = True
     train_adapter_only: bool = False
     train_memory: bool = True
+    unfreeze_last_n_layers: int = 4
     
     # Full quantization
     enable_quantization: bool = True
@@ -124,8 +133,8 @@ class Stage2Config(TrainingConfig):
     memory_size: int = 512
     observation_noise_std: float = 0.000001
     pseudoinverse_steps: int = 15
-    memory_kl_weight: float = 0.01
-    addressing_kl_weight: float = 0.001
+    memory_kl_weight: float = 0.05
+    addressing_kl_weight: float = 0.01
     
     # Visualization
     visualize_interval: int = 100
