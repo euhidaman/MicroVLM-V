@@ -176,12 +176,15 @@ class EpisodicMemory(nn.Module):
         
         # c_z = wU / sigma_z
         c_z = wU / sigma_z
+        c_z = torch.clamp(c_z, min=-1e3, max=1e3)
         
         # Update mean: M_new = M_old + c_z^T * Delta
+        Delta_clamped = torch.clamp(Delta, min=-1e2, max=1e2)
         posterior_mean = old_mean + torch.bmm(
             c_z.transpose(0, 1).transpose(1, 2), 
-            Delta.transpose(0, 1)
+            Delta_clamped.transpose(0, 1)
         )
+        posterior_mean = torch.clamp(posterior_mean, min=-1e3, max=1e3)
         
         # Update covariance: Cov_new = Cov_old - c_z^T * wU
         posterior_cov = old_cov - torch.bmm(
@@ -191,6 +194,15 @@ class EpisodicMemory(nn.Module):
 
         # Ensure covariance stays symmetric positive-definite
         posterior_cov = 0.5 * (posterior_cov + posterior_cov.transpose(-1, -2))
+        
+        # Clamp covariance diagonal to prevent extreme values
+        diag_indices = torch.arange(self.memory_size, device=posterior_cov.device)
+        posterior_cov[:, diag_indices, diag_indices] = torch.clamp(
+            posterior_cov[:, diag_indices, diag_indices],
+            min=1e-3,
+            max=1e3
+        )
+        
         identity = torch.eye(
             self.memory_size,
             device=posterior_cov.device,
@@ -303,9 +315,20 @@ class EpisodicMemory(nn.Module):
         p_diag = torch.diagonal(U_prior, dim1=-2, dim2=-1)
         q_diag = torch.diagonal(U, dim1=-2, dim2=-1)
 
+        # Debug: Check for problematic values before clamping
+        if torch.any(torch.isinf(p_diag)) or torch.any(torch.isinf(q_diag)):
+            print(f"⚠️ Inf detected in covariance diagonals before clamping")
+            print(f"  p_diag range: [{p_diag.min().item()}, {p_diag.max().item()}]")
+            print(f"  q_diag range: [{q_diag.min().item()}, {q_diag.max().item()}]")
+        
+        if torch.any(p_diag < EPSILON) or torch.any(q_diag < EPSILON):
+            print(f"⚠️ Very small diagonal values detected")
+            print(f"  p_diag min: {p_diag.min().item()}")
+            print(f"  q_diag min: {q_diag.min().item()}")
+
         # Clamp diagonals to avoid division by zero or log of non-positive values
-        p_diag = torch.clamp(p_diag, min=EPSILON, max=1e6)
-        q_diag = torch.clamp(q_diag, min=EPSILON, max=1e6)
+        p_diag = torch.clamp(p_diag, min=1e-3, max=1e6)
+        q_diag = torch.clamp(q_diag, min=1e-3, max=1e6)
         ratio = q_diag / p_diag
         ratio = torch.clamp(ratio, min=EPSILON, max=1e3)
 
@@ -326,6 +349,16 @@ class EpisodicMemory(nn.Module):
         t4 = torch.clamp(t4, min=-1e6, max=1e6)
         
         dkl_M = torch.mean(t1 + t2 + t3 + t4)
+        
+        # Debug: Check final value
+        if torch.isinf(dkl_M) or torch.isnan(dkl_M):
+            print(f"⚠️ Invalid KL divergence computed")
+            print(f"  t1: {t1.mean().item()}")
+            print(f"  t2: {t2.mean().item()}")
+            print(f"  t3: {t3}")
+            print(f"  t4: {t4.mean().item()}")
+            print(f"  dkl_M: {dkl_M.item()}")
+        
         dkl_M = torch.clamp(dkl_M, min=-1e6, max=1e6)
         return dkl_M
     
