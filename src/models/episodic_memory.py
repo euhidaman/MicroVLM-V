@@ -257,7 +257,8 @@ class EpisodicMemory(nn.Module):
         if deterministic:
             w = w_mean
         else:
-            w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0)  # (1, 1, memory_size)
+            # Ensure w_logvar matches w_mean dtype for sampling
+            w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0).to(w_mean.dtype)  # (1, 1, memory_size)
             std = torch.exp(0.5 * w_logvar)
             w = w_mean + std * torch.randn_like(w_mean)
         
