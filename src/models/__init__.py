@@ -10,7 +10,7 @@ from .microvlm import MicroVLM
 
 
 def create_microvlm(config, language_checkpoint=None, vision_checkpoint=None, 
-                    quantize_4bit=False):
+                    quantize_4bit=False, quantize_memory_158bit=False):
     """
     Create MicroVLM model instance
     
@@ -19,6 +19,7 @@ def create_microvlm(config, language_checkpoint=None, vision_checkpoint=None,
         language_checkpoint: path to Qwen2.5-0.5B checkpoint
         vision_checkpoint: path to DeiT-Tiny checkpoint
         quantize_4bit: whether to use 4-bit quantization
+        quantize_memory_158bit: whether to use 1.58-bit quantization for memory
     
     Returns:
         model: MicroVLM instance
@@ -27,7 +28,8 @@ def create_microvlm(config, language_checkpoint=None, vision_checkpoint=None,
         config=config,
         vision_checkpoint=vision_checkpoint,
         language_checkpoint=language_checkpoint,
-        quantize_4bit=quantize_4bit
+        quantize_4bit=quantize_4bit,
+        quantize_memory_158bit=quantize_memory_158bit
     )
     return model
 
