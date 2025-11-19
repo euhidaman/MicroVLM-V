@@ -232,8 +232,18 @@ def main():
     config = load_config(args.config)
     print(f"Loaded configuration: {args.config}")
     
+    # Create output directories
+    Path(config.output_dir).mkdir(parents=True, exist_ok=True)
+    Path(config.output_dir).joinpath("checkpoints").mkdir(exist_ok=True)
+    Path(config.output_dir).joinpath("visualizations").mkdir(exist_ok=True)
+    
     # Load model configuration
-    model_config_path = Path(__file__).parent.parent.parent / "configs" / "model_config.json"
+    model_config_path = Path(__file__).parent.parent / "configs" / "model_config.json"
+    if not model_config_path.exists():
+        print(f"ERROR: Model config not found: {model_config_path}")
+        print("Run: python scripts/extract_model_config.py")
+        sys.exit(1)
+    
     with open(model_config_path, 'r') as f:
         model_config = json.load(f)
     
