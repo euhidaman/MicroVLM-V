@@ -22,9 +22,9 @@ class EpisodicMemory(nn.Module):
     def __init__(self, config):
         super().__init__()
         
-        self.memory_size = config['memory_size']  # K_mem
-        self.code_size = config['memory_dim']  # C_mem
-        self.qwen_hidden_dim = config['qwen_hidden_dim']
+        self.memory_size = config.get('memory_size', 512)  # K_mem
+        self.code_size = config.get('memory_dim', 896)  # C_mem
+        self.qwen_hidden_dim = config.get('qwen_hidden_dim', 896)
         self.num_layers = config.get('num_layers', 24)
         self.num_heads = config.get('num_heads', 14)
         self.head_dim = config.get('head_dim', 64)
@@ -314,8 +314,8 @@ class ScopeDetector(nn.Module):
     def __init__(self, config):
         super().__init__()
         
-        self.input_dim = config['qwen_hidden_dim']
-        self.hidden_dim = config['scope_hidden_dim']
+        self.input_dim = config.get('qwen_hidden_dim', 896)
+        self.hidden_dim = config.get('scope_hidden_dim', 256)
         
         self.mlp = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),

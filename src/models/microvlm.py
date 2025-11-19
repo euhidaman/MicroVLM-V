@@ -55,10 +55,15 @@ class MicroVLM(nn.Module):
         self.scope_detector = ScopeDetector(config)
         
         # Image feature projection for alignment (DeiT 192-dim -> Qwen 896-dim)
-        self.image_proj_for_alignment = nn.Linear(config.vision_hidden_size, config.language_hidden_size)
+        self.image_proj_for_alignment = nn.Linear(
+            config.get('vision_hidden_size', 192), 
+            config.get('language_hidden_size', 896)
+        )
         
         # Alignment loss
-        self.alignment_loss = ContrastiveAlignmentLoss(temperature=config.alignment_temperature)
+        self.alignment_loss = ContrastiveAlignmentLoss(
+            temperature=config.get('alignment_temperature', 0.07)
+        )
         
         # Memory state (persistent across forward passes)
         self.memory_state = None
@@ -139,7 +144,13 @@ class MicroVLM(nn.Module):
         use_memory = use_memory if use_memory is not None else self.use_memory
         use_alignment = use_alignment if use_alignment is not None else self.use_alignment
         
-        batch_size = images.size(0) if images is not None else input_ids.size(0)
+        # Determine batch size - prioritize images if both present
+        if images is not None:
+            batch_size = images.size(0)
+        elif input_ids is not None:
+            batch_size = input_ids.size(0)
+        else:
+            raise ValueError("Either images or input_ids must be provided")
         
         outputs = {}
         
@@ -181,6 +192,13 @@ class MicroVLM(nn.Module):
                     episode_size, episode_batch_size, -1
                 )
             else:
+                # Warn about episode_size mismatch
+                if episode_size > 1 and batch_size % episode_size != 0:
+                    import warnings
+                    warnings.warn(
+                        f"Batch size {batch_size} not divisible by episode_size {episode_size}. "
+                        f"Using episode_size=1 instead."
+                    )
                 z_for_memory = fused_context.unsqueeze(0)
                 episode_size = 1
             
@@ -219,8 +237,13 @@ class MicroVLM(nn.Module):
         outputs['logits'] = lm_outputs.logits
         outputs['hidden_states'] = lm_outputs.hidden_states
         
-        # Compute total loss
-        total_loss = lm_outputs.loss if lm_outputs.loss is not None else 0
+        # Compute total loss - ensure it's a tensor
+        if lm_outputs.loss is not None:
+            total_loss = lm_outputs.loss
+        else:
+            # Create zero tensor on same device as model
+            device = next(self.parameters()).device
+            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
         if 'alignment_loss' in outputs:
             total_loss = total_loss + 0.1 * outputs['alignment_loss']

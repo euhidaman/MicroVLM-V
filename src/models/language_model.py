@@ -18,7 +18,7 @@ class Qwen2LanguageModel(nn.Module):
     def __init__(self, config, pretrained_path=None, quantize_4bit=False):
         super().__init__()
         
-        self.hidden_size = config['qwen_hidden_dim']
+        self.hidden_size = config.get('qwen_hidden_dim', 896)
         self.num_layers = config.get('num_layers', 24)
         self.vocab_size = config.get('vocab_size', 151936)
         
@@ -97,7 +97,7 @@ class Qwen2LanguageModel(nn.Module):
         else:
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
-                torch_dtype=torch.float16,
+                dtype=torch.float16,
                 trust_remote_code=True
             )
         

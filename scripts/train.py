@@ -21,6 +21,7 @@ from src.models import create_microvlm
 from src.data.cc12m_loader import create_dataloaders
 from src.training.config import load_config, create_run_name
 from src.visualization.attention_vis import create_attention_visualizer
+from src.visualization.wandb_logger import WandBLogger
 from src.quantization.quantize_4bit import QuantizationConfig
 
 
@@ -88,7 +89,7 @@ def create_scheduler(optimizer, config, total_steps):
 
 
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
-                epoch, global_step, wandb_run=None):
+                epoch, global_step, wandb_run=None, wandb_logger=None):
     """Train for one epoch"""
     model.train()
     
@@ -136,70 +137,120 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         
         # Accumulate losses
         total_loss += loss.item()
-        lm_loss_total += outputs.get('lm_loss', 0).item() if outputs.get('lm_loss') is not None else 0
-        alignment_loss_total += outputs.get('alignment_loss', 0).item() if 'alignment_loss' in outputs else 0
-        memory_kl_total += outputs.get('memory_kl', 0).item() if 'memory_kl' in outputs else 0
+        
+        # Safely extract loss values
+        lm_loss_val = outputs.get('lm_loss')
+        lm_loss_total += lm_loss_val.item() if lm_loss_val is not None else 0
+        
+        alignment_loss_val = outputs.get('alignment_loss')
+        alignment_loss_total += alignment_loss_val.item() if alignment_loss_val is not None else 0
+        
+        memory_kl_val = outputs.get('memory_kl')
+        memory_kl_total += memory_kl_val.item() if memory_kl_val is not None else 0
         
         global_step += 1
         
         # Update progress bar
+        lm_loss_display = outputs.get('lm_loss')
         pbar.set_postfix({
             'loss': loss.item(),
-            'lm': outputs.get('lm_loss', 0).item() if outputs.get('lm_loss') is not None else 0,
+            'lm': lm_loss_display.item() if lm_loss_display is not None else 0.0,
             'lr': optimizer.param_groups[0]['lr']
         })
         
         # Logging
         if global_step % config.log_interval == 0:
-            metrics = {
-                'train/loss': loss.item(),
-                'train/lm_loss': outputs.get('lm_loss', 0).item() if outputs.get('lm_loss') is not None else 0,
-                'train/learning_rate': optimizer.param_groups[0]['lr'],
-                'train/epoch': epoch,
-                'train/global_step': global_step
-            }
+            # Use comprehensive WandB logger
+            if wandb_logger:
+                # Core training metrics
+                wandb_logger.log_training_metrics(outputs, optimizer, epoch, global_step)
+                
+                # Gradient metrics
+                wandb_logger.log_gradient_metrics(model, global_step)
+                
+                # Language model metrics
+                wandb_logger.log_language_model_metrics(outputs, input_ids, global_step)
             
-            if 'alignment_loss' in outputs:
-                metrics['train/alignment_loss'] = outputs['alignment_loss'].item()
-            
-            if 'memory_kl' in outputs:
-                metrics['train/memory_kl'] = outputs['memory_kl'].item()
-                metrics['train/addressing_kl'] = outputs['addressing_kl'].item()
-            
-            if wandb_run:
+            # Legacy simple logging (fallback)
+            elif wandb_run:
+                # Build metrics dict with safe access
+                lm_loss_metric = outputs.get('lm_loss')
+                metrics = {
+                    'train/loss': loss.item(),
+                    'train/lm_loss': lm_loss_metric.item() if lm_loss_metric is not None else 0.0,
+                    'train/learning_rate': optimizer.param_groups[0]['lr'],
+                    'train/epoch': epoch,
+                    'train/global_step': global_step
+                }
+                
+                if 'alignment_loss' in outputs:
+                    metrics['train/alignment_loss'] = outputs['alignment_loss'].item()
+                
+                if 'memory_kl' in outputs:
+                    metrics['train/memory_kl'] = outputs['memory_kl'].item()
+                    metrics['train/addressing_kl'] = outputs['addressing_kl'].item()
+                
                 wandb_run.log(metrics, step=global_step)
         
         # Visualization
-        if global_step % config.visualize_interval == 0 and visualizer is not None:
+        if global_step % config.visualize_interval == 0 and (visualizer is not None or wandb_logger):
             model.eval()
             with torch.no_grad():
-                # Analyze attention
-                prefix_tokens, image_features = model.encode_image(images[:1])
+                # Extract features for visualization
+                prefix_tokens, image_features = model.encode_image(images[:4])
                 text_embeddings, text_features = model.encode_text(
-                    input_ids[:1], attention_mask[:1]
+                    input_ids[:4], attention_mask[:4]
                 )
                 
-                stats, attention = visualizer.analyze_cross_modal_attention(
-                    prefix_tokens, text_embeddings
-                )
+                # Vision encoder visualizations
+                if wandb_logger:
+                    wandb_logger.log_vision_encoder_metrics(model, images, global_step)
                 
-                # Save visualization
-                save_path = Path(config.output_dir) / "visualizations" / f"attention_step_{global_step}.png"
-                visualizer.visualize_attention(
-                    attention[0],
-                    save_path=str(save_path),
-                    title=f"Cross-Modal Attention (Step {global_step})"
-                )
+                # Alignment visualizations
+                if wandb_logger and 'alignment_loss' in outputs:
+                    wandb_logger.log_alignment_metrics(
+                        image_features, text_features, global_step
+                    )
                 
-                # Log to wandb
-                if wandb_run:
-                    wandb_run.log({
-                        'attention/mean': stats['mean_attention'],
-                        'attention/max': stats['max_attention'],
-                        'attention/entropy': stats['attention_entropy'],
-                        'attention/sparsity': stats['attention_sparsity'],
-                        'attention/divergence': stats['divergence_statistic']
-                    }, step=global_step)
+                # Cross-modal attention analysis
+                if visualizer:
+                    stats, attention = visualizer.analyze_cross_modal_attention(
+                        prefix_tokens, text_embeddings
+                    )
+                    
+                    # Save attention visualization
+                    save_path = Path(config.output_dir) / "visualizations" / f"attention_step_{global_step}.png"
+                    visualizer.visualize_attention(
+                        attention[0],
+                        save_path=str(save_path),
+                        title=f"Cross-Modal Attention (Step {global_step})"
+                    )
+                    
+                    # Log to wandb via logger
+                    if wandb_logger:
+                        wandb_logger.log_cross_modal_attention(
+                            attention, global_step
+                        )
+                    
+                    # Legacy wandb logging
+                    elif wandb_run:
+                        wandb_run.log({
+                            'attention/mean': stats['mean_attention'],
+                            'attention/max': stats['max_attention'],
+                            'attention/entropy': stats['attention_entropy'],
+                            'attention/sparsity': stats['attention_sparsity'],
+                            'attention/divergence': stats['divergence_statistic']
+                        }, step=global_step)
+                
+                # Memory visualizations
+                if config.use_memory and wandb_logger and model.memory_state is not None:
+                    # Get current batch memory state
+                    z_for_memory = model.encode_text(input_ids[:4], attention_mask[:4])[0].mean(dim=1).unsqueeze(0)
+                    w_mean = model.episodic_memory._solve_w_mean(z_for_memory, model.memory_state[0])
+                    
+                    wandb_logger.log_memory_heatmap(
+                        model.memory_state, w_mean, global_step
+                    )
             
             model.train()
         
@@ -266,6 +317,9 @@ def main():
     
     # Setup WandB
     wandb_run = setup_wandb(config, run_name)
+    
+    # Create WandB comprehensive logger
+    wandb_logger = WandBLogger(config, wandb_run) if wandb_run else None
     
     # Create model
     print("Creating model...")
@@ -336,10 +390,15 @@ def main():
             visualizer=visualizer,
             epoch=epoch,
             global_step=global_step,
-            wandb_run=wandb_run
+            wandb_run=wandb_run,
+            wandb_logger=wandb_logger
         )
         
         print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+        
+        # Log weight histograms at end of epoch (if wandb_logger available)
+        if wandb_logger and (epoch % max(1, config.num_epochs // 5) == 0):
+            wandb_logger.log_model_weights_histogram(model, global_step)
         
         # Save epoch checkpoint
         save_checkpoint(model, optimizer, epoch, global_step, config)

@@ -71,8 +71,9 @@ class CC12MDataset(Dataset):
         try:
             image = Image.open(image_path).convert('RGB')
         except Exception as e:
-            # Fallback to placeholder
-            print(f"Error loading {image_path}: {e}")
+            # Fallback to placeholder with warning
+            import warnings
+            warnings.warn(f"Failed to load image {image_path}: {e}. Using placeholder.")
             image = Image.new('RGB', (224, 224), color=(128, 128, 128))
         
         # Apply transform

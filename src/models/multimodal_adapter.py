@@ -18,10 +18,10 @@ class MultimodalAdapter(nn.Module):
     def __init__(self, config):
         super().__init__()
         
-        self.deit_dim = config['deit_embed_dim']
-        self.qwen_dim = config['qwen_hidden_dim']
-        self.num_patches = config['num_patches']
-        self.k_prefix = config['k_prefix']
+        self.deit_dim = config.get('deit_embed_dim', 192)
+        self.qwen_dim = config.get('qwen_hidden_dim', 896)
+        self.num_patches = config.get('num_patches', 196)
+        self.k_prefix = config.get('k_prefix', 25)
         
         # Projection layer: deit_dim -> qwen_dim
         self.projection = nn.Linear(self.deit_dim, self.qwen_dim)
