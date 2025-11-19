@@ -351,7 +351,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     if num_samples > 0:
                         if not hasattr(visualizer, '_caption_tokenizer'):
                             from transformers import AutoTokenizer
-                            visualizer._caption_tokenizer = AutoTokenizer.from_pretrained(config.text_model)
+                            tokenizer_name = getattr(config, 'text_model', None) or getattr(config, 'qwen_model', None)
+                            if tokenizer_name is None:
+                                raise ValueError("No text model or tokenizer specified in config")
+                            visualizer._caption_tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
                         tokenizer = visualizer._caption_tokenizer
                         captions = []
                         for i in range(num_samples):

@@ -13,6 +13,7 @@ class TrainingConfig:
     
     # Model paths
     qwen_model: str = "Qwen/Qwen2.5-0.5B"
+    text_model: Optional[str] = None  # Optional override for tokenizer name
     deit_checkpoint: Optional[str] = None
     
     # Data
