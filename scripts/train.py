@@ -15,7 +15,7 @@ from tqdm import tqdm
 import wandb
 
 # Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent.parent))
+sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from src.models import create_microvlm
 from src.data.cc12m_loader import create_dataloaders
