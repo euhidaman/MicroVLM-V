@@ -430,23 +430,6 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             }, step=global_step)
                     
                     print("=" * 60 + "\n")
-                        
-                        # Log to WandB with prefix for grouping
-                        wandb_logger.log_image(
-                            single_image, 
-                            f"enhanced_viz/image_{idx}", 
-                            global_step
-                        )
-                        wandb_logger.log_cross_modal_attention(
-                            attention, 
-                            global_step, 
-                            prefix=f"enhanced_viz/attention_{idx}"
-                        )
-                        
-                        print(f"  Image {idx+1}: entropy={stats['attention_entropy']:.4f}, "
-                              f"sparsity={stats['attention_sparsity']:.4f}")
-                    
-                    print("=" * 60 + "\n")
                 
                 # Memory visualizations
                 if config.use_memory and wandb_logger and model.memory_state is not None:
