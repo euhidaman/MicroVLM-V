@@ -180,6 +180,13 @@ class MicroVLM(nn.Module):
             fused_embeddings = text_embeddings
             fused_mask = attention_mask
         
+        # Convert to same dtype as language model if needed
+        # Qwen is loaded in float16, so we need to match that
+        if hasattr(self.language_model, 'model') and self.language_model.model is not None:
+            model_dtype = next(self.language_model.model.parameters()).dtype
+            if fused_embeddings.dtype != model_dtype:
+                fused_embeddings = fused_embeddings.to(model_dtype)
+        
         # Episodic memory processing
         if use_memory:
             # Reshape for episode processing
