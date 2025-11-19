@@ -80,9 +80,14 @@ class EpisodicMemory(nn.Module):
         prior_cov = torch.diag(prior_var)
         return self.memory_mean, prior_cov
     
-    def _get_prior_state(self, batch_size):
+    def _get_prior_state(self, batch_size, dtype=None):
         """Initialize prior memory state for batch"""
         prior_mean, prior_cov = self._get_prior_params()
+        
+        # Convert to target dtype if specified
+        if dtype is not None:
+            prior_mean = prior_mean.to(dtype)
+            prior_cov = prior_cov.to(dtype)
         
         batch_prior_mean = prior_mean.unsqueeze(0).expand(batch_size, -1, -1)
         batch_prior_cov = prior_cov.unsqueeze(0).expand(batch_size, -1, -1)
@@ -150,6 +155,10 @@ class EpisodicMemory(nn.Module):
         """
         old_mean, old_cov = old_memory
         
+        # Ensure old_mean and old_cov match z dtype
+        old_mean = old_mean.to(z.dtype)
+        old_cov = old_cov.to(z.dtype)
+        
         # Delta = z - w^T * M
         Delta = z - torch.bmm(w.transpose(0, 1), old_mean).transpose(0, 1)
         
@@ -203,8 +212,8 @@ class EpisodicMemory(nn.Module):
             # Convert back to original dtype and ensure device consistency
             z = z.to(dtype=original_dtype, device=original_device)
         
-        # Get prior
-        prior_memory = self._get_prior_state(batch_size)
+        # Get prior with matching dtype
+        prior_memory = self._get_prior_state(batch_size, dtype=original_dtype)
         
         # Sequential write using Sherman-Morrison updates
         new_memory = prior_memory
@@ -238,6 +247,9 @@ class EpisodicMemory(nn.Module):
         # Store original dtype for consistency
         original_dtype = z.dtype
         
+        # Ensure M matches z dtype
+        M = M.to(z.dtype)
+        
         # Compute addressing weights
         w_mean = self._solve_w_mean(z, M)
         
@@ -267,6 +279,10 @@ class EpisodicMemory(nn.Module):
         """Compute KL divergence between prior and posterior memory"""
         R_prior, U_prior = prior_memory
         R, U = posterior_memory
+        
+        # Ensure dtype consistency for KL computation
+        R = R.to(R_prior.dtype)
+        U = U.to(U_prior.dtype)
         
         p_diag = torch.diagonal(U_prior, dim1=-2, dim2=-1)
         q_diag = torch.diagonal(U, dim1=-2, dim2=-1)
