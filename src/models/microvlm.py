@@ -232,10 +232,24 @@ class MicroVLM(nn.Module):
             kv_memory = None
         
         # Language model forward pass
+        # Adjust labels to match fused_embeddings length if we added prefix tokens
+        adjusted_labels = labels
+        if labels is not None and prefix_tokens is not None:
+            # Pad labels with -100 (ignore_index) for prefix tokens
+            batch_size = labels.size(0)
+            prefix_len = prefix_tokens.size(1)
+            prefix_labels = torch.full(
+                (batch_size, prefix_len),
+                -100,
+                dtype=labels.dtype,
+                device=labels.device
+            )
+            adjusted_labels = torch.cat([prefix_labels, labels], dim=1)
+        
         lm_outputs = self.language_model(
             inputs_embeds=fused_embeddings,
             attention_mask=fused_mask,
-            labels=labels,
+            labels=adjusted_labels,
             output_hidden_states=True,
             return_dict=True
         )
