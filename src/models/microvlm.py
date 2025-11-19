@@ -54,8 +54,11 @@ class MicroVLM(nn.Module):
         # Scope detector
         self.scope_detector = ScopeDetector(config)
         
+        # Image feature projection for alignment (DeiT 192-dim -> Qwen 896-dim)
+        self.image_proj_for_alignment = nn.Linear(config.vision_hidden_size, config.language_hidden_size)
+        
         # Alignment loss
-        self.alignment_loss = ContrastiveAlignmentLoss(temperature=0.07)
+        self.alignment_loss = ContrastiveAlignmentLoss(temperature=config.alignment_temperature)
         
         # Memory state (persistent across forward passes)
         self.memory_state = None
@@ -73,13 +76,16 @@ class MicroVLM(nn.Module):
         
         Returns:
             prefix_tokens: (batch_size, k_prefix, qwen_dim)
-            image_features: (batch_size, deit_dim) for alignment
+            image_features: (batch_size, qwen_dim) for alignment - projected to same space as text
         """
         # Extract patch embeddings
         patch_embeddings = self.vision_encoder(images)  # (B, num_patches, deit_dim)
         
         # Get image-level features (CLS token)
-        image_features = self.vision_encoder.get_cls_token(images)  # (B, deit_dim)
+        raw_image_features = self.vision_encoder.get_cls_token(images)  # (B, deit_dim=192)
+        
+        # Project image features to language space for alignment
+        image_features = self.image_proj_for_alignment(raw_image_features)  # (B, qwen_dim=896)
         
         # Project to language space
         prefix_tokens = self.multimodal_adapter(patch_embeddings)  # (B, k_prefix, qwen_dim)
