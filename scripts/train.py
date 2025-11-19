@@ -122,6 +122,27 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         
         loss = outputs['loss']
         
+        # Debug: Check for NaN/Inf in loss components
+        if torch.isnan(loss) or torch.isinf(loss):
+            print(f"\n⚠️ Invalid loss detected at step {global_step}:")
+            print(f"  Total loss: {loss.item()}")
+            if 'lm_loss' in outputs and outputs['lm_loss'] is not None:
+                print(f"  LM loss: {outputs['lm_loss'].item()}")
+            if 'alignment_loss' in outputs:
+                print(f"  Alignment loss: {outputs['alignment_loss'].item()}")
+            if 'memory_kl' in outputs:
+                print(f"  Memory KL: {outputs['memory_kl'].item()}")
+            if 'addressing_kl' in outputs:
+                print(f"  Addressing KL: {outputs['addressing_kl'].item()}")
+            
+            # Check for NaN in model parameters
+            for name, param in model.named_parameters():
+                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                    print(f"  NaN/Inf gradient in: {name}")
+            
+            print("  Skipping this batch...")
+            continue
+        
         # Backward pass
         optimizer.zero_grad()
         loss.backward()
