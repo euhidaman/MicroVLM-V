@@ -137,8 +137,22 @@ def process_tsv(tsv_path, output_dir, max_samples=None, num_workers=16):
 
     print(f"Reading TSV file: {tsv_path}")
 
-    # Read TSV - CC12M format is: caption \t url
-    df = pd.read_csv(tsv_path, sep='\t', names=['caption', 'url'])
+    # Read TSV - Try to auto-detect format
+    # Read first line to check format
+    with open(tsv_path, 'r', encoding='utf-8', errors='ignore') as f:
+        first_line = f.readline().strip()
+        parts = first_line.split('\t')
+        if len(parts) >= 2:
+            # Check if first column looks like URL
+            if parts[0].startswith('http'):
+                df = pd.read_csv(tsv_path, sep='\t', names=['url', 'caption'])
+                print("Detected format: url \\t caption")
+            else:
+                df = pd.read_csv(tsv_path, sep='\t', names=['caption', 'url'])
+                print("Detected format: caption \\t url")
+        else:
+            print(f"WARNING: Unexpected TSV format. First line: {first_line[:100]}")
+            df = pd.read_csv(tsv_path, sep='\t', names=['caption', 'url'])
 
     if max_samples is not None:
         df = df.head(max_samples)
