@@ -32,6 +32,8 @@ def main():
                        help='Number of samples for test dataset')
     parser.add_argument('--num_workers', type=int, default=8,
                        help='Number of download workers')
+    parser.add_argument('--verbose', action='store_true',
+                       help='Print detailed error messages for failed downloads')
     
     args = parser.parse_args()
     
@@ -89,7 +91,8 @@ def main():
             str(metadata_file),
             str(image_dir),
             max_images=args.max_images,
-            num_workers=args.num_workers
+            num_workers=args.num_workers,
+            verbose=args.verbose
         )
         
         print(f"Images saved to {image_dir}")

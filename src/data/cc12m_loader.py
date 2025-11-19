@@ -162,7 +162,7 @@ def download_cc12m_metadata(output_dir):
     print("Metadata download complete")
 
 
-def download_cc12m_images(metadata_file, output_dir, max_images=None, num_workers=8):
+def download_cc12m_images(metadata_file, output_dir, max_images=None, num_workers=8, verbose=False):
     """
     Download CC12M images from URLs in metadata
     
@@ -171,6 +171,7 @@ def download_cc12m_images(metadata_file, output_dir, max_images=None, num_worker
         output_dir: directory to save images
         max_images: maximum number of images to download
         num_workers: number of parallel download workers
+        verbose: print detailed error messages
     """
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
@@ -183,6 +184,9 @@ def download_cc12m_images(metadata_file, output_dir, max_images=None, num_worker
     
     print(f"Downloading {len(metadata)} images...")
     
+    # Track failed URLs for debugging
+    failed_urls = []
+    
     def download_image(idx_url):
         idx, url = idx_url
         image_name = f"{idx:08d}.jpg"
@@ -191,21 +195,41 @@ def download_cc12m_images(metadata_file, output_dir, max_images=None, num_worker
         if image_path.exists():
             return True
         
-        try:
-            response = requests.get(url, timeout=10)
-            response.raise_for_status()
-            
-            # Verify it's an image
-            img = Image.open(io.BytesIO(response.content))
-            img = img.convert('RGB')
-            
-            # Save
-            img.save(image_path, 'JPEG', quality=95)
-            return True
-            
-        except Exception as e:
-            # print(f"Error downloading {url}: {e}")
-            return False
+        # Retry logic
+        max_retries = 3
+        last_error = None
+        for attempt in range(max_retries):
+            try:
+                # Add user agent to avoid blocking
+                headers = {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36'
+                }
+                response = requests.get(url, timeout=15, headers=headers, stream=True)
+                response.raise_for_status()
+                
+                # Verify it's an image
+                img = Image.open(io.BytesIO(response.content))
+                img = img.convert('RGB')
+                
+                # Save
+                img.save(image_path, 'JPEG', quality=95)
+                return True
+                
+            except requests.exceptions.Timeout as e:
+                last_error = f"Timeout: {e}"
+                if attempt == max_retries - 1:
+                    break
+                continue
+            except requests.exceptions.RequestException as e:
+                last_error = f"Request error: {e}"
+                break
+            except Exception as e:
+                last_error = f"Image processing error: {e}"
+                break
+        
+        if verbose and last_error:
+            failed_urls.append((idx, url, last_error))
+        return False
     
     # Download with progress bar
     from concurrent.futures import ThreadPoolExecutor, as_completed
@@ -230,6 +254,12 @@ def download_cc12m_images(metadata_file, output_dir, max_images=None, num_worker
                 pbar.set_postfix({'success': successful, 'failed': failed})
     
     print(f"\nDownload complete: {successful} successful, {failed} failed")
+    
+    if verbose and failed_urls:
+        print(f"\nFirst 10 failed URLs:")
+        for idx, url, error in failed_urls[:10]:
+            print(f"  {idx}: {url}")
+            print(f"     Error: {error}")
 
 
 def create_small_test_dataset(metadata_file, output_metadata, num_samples=1000):
