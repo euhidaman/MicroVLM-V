@@ -341,14 +341,33 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 
                 # Cross-modal attention analysis + side-by-side visualization
                 if visualizer:
-                    stats, attention = visualizer.analyze_cross_modal_attention(
-                        prefix_tokens, text_embeddings
-                    )
-                    
-                    # Prepare captions for the first few samples
                     num_viz_images = getattr(config, 'num_viz_images', 3)
-                    num_samples = min(num_viz_images, images.size(0))
-                    if num_samples > 0:
+                    # Cache first batch for consistent visualization
+                    if not hasattr(visualizer, '_fixed_samples'):
+                        cache_samples = min(num_viz_images, images.size(0))
+                        if cache_samples > 0:
+                            visualizer._fixed_samples = {
+                                'images': images[:cache_samples].detach().cpu().clone(),
+                                'input_ids': input_ids[:cache_samples].detach().cpu().clone(),
+                                'attention_mask': attention_mask[:cache_samples].detach().cpu().clone() if attention_mask is not None else None
+                            }
+                    fixed_samples = getattr(visualizer, '_fixed_samples', None)
+                    if fixed_samples:
+                        num_samples = min(num_viz_images, fixed_samples['images'].size(0))
+                        device = images.device
+                        text_device = input_ids.device
+                        viz_images = fixed_samples['images'][:num_samples].to(device)
+                        viz_input_ids = fixed_samples['input_ids'][:num_samples].to(text_device)
+                        viz_attention_mask = None
+                        if fixed_samples['attention_mask'] is not None:
+                            viz_attention_mask = fixed_samples['attention_mask'][:num_samples].to(text_device)
+                        
+                        viz_prefix_tokens, _ = model.encode_image(viz_images)
+                        viz_text_embeddings, _ = model.encode_text(viz_input_ids, viz_attention_mask)
+                        stats, attention = visualizer.analyze_cross_modal_attention(
+                            viz_prefix_tokens, viz_text_embeddings
+                        )
+                        
                         if not hasattr(visualizer, '_caption_tokenizer'):
                             from transformers import AutoTokenizer
                             tokenizer_name = getattr(config, 'text_model', None) or getattr(config, 'qwen_model', None)
@@ -358,20 +377,19 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         tokenizer = visualizer._caption_tokenizer
                         captions = []
                         for i in range(num_samples):
-                            if attention_mask is not None:
-                                valid_len = int(attention_mask[i].sum().item())
-                                token_ids = input_ids[i][:valid_len].tolist()
+                            if viz_attention_mask is not None:
+                                valid_len = int(viz_attention_mask[i].sum().item())
+                                token_ids = viz_input_ids[i][:valid_len].tolist()
                             else:
-                                token_ids = input_ids[i].tolist()
+                                token_ids = viz_input_ids[i].tolist()
                             caption = tokenizer.decode(token_ids, skip_special_tokens=True)
                             captions.append(caption if caption.strip() else "(empty caption)")
                         
-                        # Create side-by-side visualization with captions
                         sbs_path = Path(config.output_dir) / "visualizations" / f"attention_sidebyside_step_{global_step}.png"
                         visualizer.visualize_attention_side_by_side(
-                            images=images[:num_samples],
-                            image_tokens=prefix_tokens[:num_samples],
-                            text_tokens=text_embeddings[:num_samples],
+                            images=viz_images.cpu(),
+                            image_tokens=viz_prefix_tokens,
+                            text_tokens=viz_text_embeddings,
                             attention_weights=attention[:num_samples],
                             captions=captions,
                             save_path=str(sbs_path),
