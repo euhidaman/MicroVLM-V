@@ -430,41 +430,6 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             }, step=global_step)
                     
                     print("=" * 60 + "\n")
-                
-                # Also keep individual visualizations for detailed analysis
-                if global_step % viz_save_interval == 0 and wandb_logger:
-                    import random
-                    batch_size = images.shape[0]
-                    # Select random indices (up to num_viz_images)
-                    num_samples = min(num_viz_images, batch_size)
-                    random_indices = random.sample(range(batch_size), num_samples)
-                    
-                    print(f"Generating individual attention visualizations...")
-                    
-                    for idx, img_idx in enumerate(random_indices):
-                        # Get single image and text
-                        single_image = images[img_idx:img_idx+1]
-                        single_input_ids = input_ids[img_idx:img_idx+1]
-                        single_attention_mask = attention_mask[img_idx:img_idx+1]
-                        
-                        # Encode
-                        single_prefix, single_img_feat = model.encode_image(single_image)
-                        single_text_emb, single_text_feat = model.encode_text(
-                            single_input_ids, single_attention_mask
-                        )
-                        
-                        # Analyze attention
-                        stats, attention = visualizer.analyze_cross_modal_attention(
-                            single_prefix, single_text_emb
-                        )
-                        
-                        # Save detailed visualization
-                        viz_path = Path(config.output_dir) / "visualizations" / f"detailed_step_{global_step}_img_{idx}.png"
-                        visualizer.visualize_attention(
-                            attention[0],
-                            save_path=str(viz_path),
-                            title=f"Step {global_step} - Image {idx+1}/{num_samples}"
-                        )
                         
                         # Log to WandB with prefix for grouping
                         wandb_logger.log_image(
