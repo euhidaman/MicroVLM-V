@@ -57,6 +57,10 @@ class TrainingConfig:
     wandb_username: str = "aman-derax20"
     wandb_run_name: Optional[str] = None
     
+    # HuggingFace
+    hf_username: str = "euhidaman"
+    hf_repo_name: str = "MicroVLM-V"
+    
     # Output
     output_dir: str = "./checkpoints"
     

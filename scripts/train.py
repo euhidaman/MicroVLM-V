@@ -183,13 +183,16 @@ def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
         # Get HF token from environment
         hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
         if not hf_token:
-            print("⚠️  Warning: No HuggingFace token found. Set HF_TOKEN environment variable.")
-            print("   Skipping HuggingFace push.")
+            print("⚠️  Warning: No HuggingFace token found.")
+            print("   Set HF_TOKEN environment variable to enable auto-push:")
+            print("   - Linux/Mac: export HF_TOKEN=your_token")
+            print("   - Windows: $env:HF_TOKEN=\"your_token\"")
+            print("   - Or get token from: https://huggingface.co/settings/tokens")
             return False
         
-        # Determine repo name
+        # Get repo config
         repo_name = getattr(config, 'hf_repo_name', 'MicroVLM-V')
-        username = getattr(config, 'hf_username', config.wandb_username)
+        username = getattr(config, 'hf_username', 'euhidaman')
         repo_id = f"{username}/{repo_name}"
         
         print(f"\n🤗 Pushing to HuggingFace: {repo_id}")
@@ -198,14 +201,15 @@ def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
         api = HfApi()
         try:
             api.create_repo(repo_id=repo_id, token=hf_token, exist_ok=True, repo_type="model")
-            print(f"   Repository ready: https://huggingface.co/{repo_id}")
+            print(f"   ✓ Repository ready: https://huggingface.co/{repo_id}")
         except Exception as e:
-            print(f"   Note: {e}")
+            print(f"   ℹ Repository check: {e}")
         
         # Commit message
         commit_message = f"{stage_name}: epoch {epoch} checkpoint"
         
         # Upload checkpoint folder
+        print(f"   ⏳ Uploading checkpoint files...")
         api.upload_folder(
             folder_path=str(checkpoint_dir),
             repo_id=repo_id,
@@ -214,8 +218,9 @@ def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
             token=hf_token
         )
         
-        print(f"✅ Successfully pushed to HuggingFace!")
-        print(f"   Commit: {commit_message}")
+        print(f"   ✅ Successfully pushed!")
+        print(f"   📝 Commit: \"{commit_message}\"")
+        print(f"   🔗 View at: https://huggingface.co/{repo_id}")
         return True
         
     except Exception as e:
@@ -785,52 +790,6 @@ def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_na
     print(f"📊 Statistics saved: {stats_path}")
     
     return checkpoint_path, stats
-
-def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
-    """Push model to HuggingFace Hub"""
-    try:
-        # Get HF token from environment
-        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
-        if not hf_token:
-            print("⚠️  Warning: No HuggingFace token found. Set HF_TOKEN environment variable.")
-            print("   Skipping HuggingFace push.")
-            return False
-        
-        # Determine repo name
-        repo_name = getattr(config, 'hf_repo_name', 'MicroVLM-V')
-        username = getattr(config, 'hf_username', config.wandb_username)
-        repo_id = f"{username}/{repo_name}"
-        
-        print(f"\n🤗 Pushing to HuggingFace: {repo_id}")
-        
-        # Create repo if it doesn't exist
-        api = HfApi()
-        try:
-            api.create_repo(repo_id=repo_id, token=hf_token, exist_ok=True, repo_type="model")
-            print(f"   Repository ready: https://huggingface.co/{repo_id}")
-        except Exception as e:
-            print(f"   Note: {e}")
-        
-        # Commit message
-        commit_message = f"{stage_name}: epoch {epoch} checkpoint"
-        
-        # Upload checkpoint folder
-        api.upload_folder(
-            folder_path=str(checkpoint_dir),
-            repo_id=repo_id,
-            repo_type="model",
-            commit_message=commit_message,
-            token=hf_token
-        )
-        
-        print(f"✅ Successfully pushed to HuggingFace!")
-        print(f"   Commit: {commit_message}")
-        return True
-        
-    except Exception as e:
-        print(f"❌ Error pushing to HuggingFace: {e}")
-        print("   Continuing training...")
-        return False
 
 
 def main():
