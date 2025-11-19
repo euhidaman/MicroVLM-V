@@ -201,6 +201,10 @@ class AttentionVisualizer(nn.Module):
         query = text_tokens  # (B, seq_len, D)
         key = image_tokens  # (B, k_prefix, D)
         
+        # Ensure dtype consistency for matmul
+        if query.dtype != key.dtype:
+            key = key.to(query.dtype)
+        
         # Simple attention (without multi-head split)
         scores = torch.matmul(query, key.transpose(-2, -1))
         scores = scores / np.sqrt(query.size(-1))
