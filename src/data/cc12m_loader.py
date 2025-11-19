@@ -113,6 +113,21 @@ def download_cc12m_metadata(output_dir):
     output_dir = Path(output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
+    # Check if cc12m.tsv exists (user downloaded manually)
+    manual_file = output_dir / "cc12m.tsv"
+    target_file = output_dir / "cc12m_metadata_0.tsv"
+    
+    if manual_file.exists() and not target_file.exists():
+        print(f"Found manually downloaded file: {manual_file}")
+        print(f"Renaming to: {target_file}")
+        manual_file.rename(target_file)
+        print("Metadata file ready")
+        return
+    
+    if target_file.exists():
+        print(f"Metadata file {target_file} already exists, skipping")
+        return
+    
     # CC12M metadata URLs (split into shards)
     metadata_urls = [
         "https://storage.googleapis.com/conceptual_12m/cc12m.tsv"
@@ -140,6 +155,9 @@ def download_cc12m_metadata(output_dir):
             print(f"Saved to {output_file}")
         except Exception as e:
             print(f"Error downloading {url}: {e}")
+            print("\nAlternative: Download manually from:")
+            print("https://drive.usercontent.google.com/download?id=1mZ_sHAp7jpMfFVY2TFN9wZioYujoYfCL&export=download&authuser=0")
+            print(f"Then save as: {output_file}")
     
     print("Metadata download complete")
 
