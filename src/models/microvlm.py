@@ -316,7 +316,8 @@ class MicroVLM(nn.Module):
                 total_loss = total_loss + memory_weight * mem_kl
         
         if use_memory and 'addressing_kl' in outputs:
-            addr_kl = outputs['addressing_kl']\n            if not torch.isnan(addr_kl) and not torch.isinf(addr_kl):
+            addr_kl = outputs['addressing_kl']
+            if not torch.isnan(addr_kl) and not torch.isinf(addr_kl):
                 total_loss = total_loss + addressing_weight * addr_kl
         
         outputs['loss'] = total_loss
