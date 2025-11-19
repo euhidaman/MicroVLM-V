@@ -339,107 +339,63 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         image_features, text_features, global_step
                     )
                 
-                # Cross-modal attention analysis
+                # Cross-modal attention analysis + side-by-side visualization
                 if visualizer:
                     stats, attention = visualizer.analyze_cross_modal_attention(
                         prefix_tokens, text_embeddings
                     )
                     
-                    # Save attention visualization
-                    save_path = Path(config.output_dir) / "visualizations" / f"attention_step_{global_step}.png"
-                    visualizer.visualize_attention(
-                        attention[0],
-                        save_path=str(save_path),
-                        title=f"Cross-Modal Attention (Step {global_step})"
-                    )
-                    
-                    # Log to wandb via logger
-                    if wandb_logger:
-                        wandb_logger.log_cross_modal_attention(
-                            attention, global_step
-                        )
-                    
-                    # Legacy wandb logging
-                    elif wandb_run:
-                        wandb_run.log({
-                            'attention/mean': stats['mean_attention'],
-                            'attention/max': stats['max_attention'],
-                            'attention/entropy': stats['attention_entropy'],
-                            'attention/sparsity': stats['attention_sparsity'],
-                            'attention/divergence': stats['divergence_statistic']
-                        }, step=global_step)
-                
-                # Enhanced visualization: 3 random images with full attention every 5000 steps
-                viz_save_interval = getattr(config, 'viz_save_interval', 5000)
-                num_viz_images = getattr(config, 'num_viz_images', 3)
-                
-                if global_step % viz_save_interval == 0 and visualizer:
-                    import random
-                    batch_size = images.shape[0]
-                    # Select first 3 images (or random if you prefer)
-                    num_samples = min(num_viz_images, batch_size)
-                    
-                    # Get first num_samples images
-                    selected_images = images[:num_samples]
-                    selected_input_ids = input_ids[:num_samples]
-                    selected_attention_mask = attention_mask[:num_samples]
-                    
-                    print(f"\n=== Enhanced Visualization at Step {global_step} ===")
-                    print(f"Generating side-by-side attention visualization for {num_samples} images...")
-                    
-                    # Encode all selected images and text
-                    selected_prefix, selected_img_feat = model.encode_image(selected_images)
-                    selected_text_emb, selected_text_feat = model.encode_text(
-                        selected_input_ids, selected_attention_mask
-                    )
-                    
-                    # Compute attention for all samples
-                    stats, attention = visualizer.analyze_cross_modal_attention(
-                        selected_prefix, selected_text_emb
-                    )
-                    
-                    # Decode captions from input_ids
-                    from transformers import AutoTokenizer
-                    tokenizer = AutoTokenizer.from_pretrained(config.text_model)
-                    captions = []
-                    for i in range(num_samples):
-                        # Decode the input_ids to get the text caption
-                        caption = tokenizer.decode(selected_input_ids[i], skip_special_tokens=True)
-                        captions.append(caption)
-                    
-                    # Create side-by-side visualization with captions
-                    sbs_path = Path(config.output_dir) / "visualizations" / f"attention_sidebyside_step_{global_step}.png"
-                    sbs_fig = visualizer.visualize_attention_side_by_side(
-                        images=selected_images,
-                        image_tokens=selected_prefix,
-                        text_tokens=selected_text_emb,
-                        attention_weights=attention,
-                        captions=captions,
-                        save_path=str(sbs_path),
-                        title=f"Text-Conditioned Attention (Step {global_step})",
-                        num_images=num_samples
-                    )
-                    
-                    print(f"  Side-by-side visualization saved to {sbs_path}")
-                    print(f"  Average attention entropy: {stats['attention_entropy']:.4f}")
-                    print(f"  Average attention sparsity: {stats['attention_sparsity']:.4f}")
-                    
-                    # Log to WandB if available
-                    if wandb_logger:
-                        wandb_logger.log_metrics({
-                            'enhanced_viz/attention_entropy': stats['attention_entropy'],
-                            'enhanced_viz/attention_sparsity': stats['attention_sparsity'],
-                            'enhanced_viz/divergence': stats['divergence_statistic']
-                        }, step=global_step)
+                    # Prepare captions for the first few samples
+                    num_viz_images = getattr(config, 'num_viz_images', 3)
+                    num_samples = min(num_viz_images, images.size(0))
+                    if num_samples > 0:
+                        if not hasattr(visualizer, '_caption_tokenizer'):
+                            from transformers import AutoTokenizer
+                            visualizer._caption_tokenizer = AutoTokenizer.from_pretrained(config.text_model)
+                        tokenizer = visualizer._caption_tokenizer
+                        captions = []
+                        for i in range(num_samples):
+                            if attention_mask is not None:
+                                valid_len = int(attention_mask[i].sum().item())
+                                token_ids = input_ids[i][:valid_len].tolist()
+                            else:
+                                token_ids = input_ids[i].tolist()
+                            caption = tokenizer.decode(token_ids, skip_special_tokens=True)
+                            captions.append(caption if caption.strip() else "(empty caption)")
                         
-                        # Log the side-by-side image
-                        import wandb
-                        if wandb_logger.wandb_run:
+                        # Create side-by-side visualization with captions
+                        sbs_path = Path(config.output_dir) / "visualizations" / f"attention_sidebyside_step_{global_step}.png"
+                        visualizer.visualize_attention_side_by_side(
+                            images=images[:num_samples],
+                            image_tokens=prefix_tokens[:num_samples],
+                            text_tokens=text_embeddings[:num_samples],
+                            attention_weights=attention[:num_samples],
+                            captions=captions,
+                            save_path=str(sbs_path),
+                            title=f"Text-Conditioned Attention (Step {global_step})",
+                            num_images=num_samples
+                        )
+                        
+                        print(f"Saved side-by-side attention visualization to {sbs_path}")
+                        print(f"  Mean attention entropy: {stats['attention_entropy']:.4f}")
+                        print(f"  Mean attention sparsity: {stats['attention_sparsity']:.4f}")
+                        
+                        if wandb_logger and wandb_logger.wandb_run:
+                            import wandb
                             wandb_logger.wandb_run.log({
-                                'enhanced_viz/attention_sidebyside': wandb.Image(str(sbs_path))
+                                'enhanced_viz/attention_sidebyside': wandb.Image(str(sbs_path)),
+                                'enhanced_viz/attention_entropy': stats['attention_entropy'],
+                                'enhanced_viz/attention_sparsity': stats['attention_sparsity'],
+                                'enhanced_viz/divergence': stats['divergence_statistic']
                             }, step=global_step)
-                    
-                    print("=" * 60 + "\n")
+                        elif wandb_run:
+                            wandb_run.log({
+                                'attention/mean': stats['mean_attention'],
+                                'attention/max': stats['max_attention'],
+                                'attention/entropy': stats['attention_entropy'],
+                                'attention/sparsity': stats['attention_sparsity'],
+                                'attention/divergence': stats['divergence_statistic']
+                            }, step=global_step)
                 
                 # Memory visualizations
                 if config.use_memory and wandb_logger and model.memory_state is not None:
