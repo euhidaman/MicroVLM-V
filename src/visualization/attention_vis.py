@@ -342,6 +342,147 @@ class AttentionVisualizer(nn.Module):
         """Clear stored visualizations"""
         self.visualizations = []
     
+    def visualize_attention_side_by_side(
+        self,
+        images: torch.Tensor,
+        image_tokens: torch.Tensor,
+        text_tokens: torch.Tensor,
+        attention_weights: torch.Tensor,
+        captions: list,
+        save_path: str,
+        title: str = "Text-Conditioned Attention",
+        num_images: int = 3
+    ):
+        """
+        Create a side-by-side visualization of images with their text-conditioned attention heatmaps
+        
+        Layout for each image:
+        - Left: Original image with caption below
+        - Right: Attention heatmap overlay
+        
+        Args:
+            images: (B, 3, H, W) tensor of images
+            image_tokens: (B, k_prefix, D) image token embeddings
+            text_tokens: (B, seq_len, D) text token embeddings  
+            attention_weights: (B, seq_len, k_prefix) attention from text to image tokens
+            captions: list of text captions for each image
+            save_path: path to save the grid image
+            title: title for the visualization
+            num_images: number of images to visualize (default: 3)
+        
+        Returns:
+            fig: matplotlib figure
+        """
+        # Select first num_images
+        num_images = min(num_images, images.size(0), len(captions))
+        images = images[:num_images]
+        attention_weights = attention_weights[:num_images]
+        captions = captions[:num_images]
+        
+        # Convert images to numpy (denormalize if needed)
+        images_np = images.cpu().detach().numpy()
+        
+        # Denormalize from ImageNet mean/std
+        mean = np.array([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1)
+        images_np = images_np * std + mean
+        images_np = np.clip(images_np, 0, 1)
+        
+        # Transpose to (B, H, W, C)
+        images_np = images_np.transpose(0, 2, 3, 1)
+        
+        # Get attention maps: average over text sequence dimension to get (B, k_prefix)
+        attention_maps = attention_weights.mean(dim=1).cpu().detach().numpy()  # (B, k_prefix)
+        
+        # Reshape attention to spatial grid
+        k_prefix = attention_maps.shape[1]
+        grid_size = int(np.sqrt(k_prefix))
+        
+        if grid_size * grid_size != k_prefix:
+            # Handle DeiT-Tiny with 197 tokens (196 patches + 1 CLS)
+            if k_prefix == 197:
+                grid_size = 14  # 14x14 = 196
+                attention_maps = attention_maps[:, 1:]  # Remove CLS token
+            elif k_prefix == 196:
+                grid_size = 14
+            else:
+                grid_size = int(np.ceil(np.sqrt(k_prefix)))
+                pad_size = grid_size * grid_size - k_prefix
+                if pad_size > 0:
+                    attention_maps = np.pad(attention_maps, ((0, 0), (0, pad_size)), mode='constant')
+        
+        attention_maps = attention_maps.reshape(num_images, grid_size, grid_size)
+        
+        # Upsample attention maps to image resolution
+        H, W = images_np.shape[1:3]
+        attention_maps_upsampled = []
+        for i in range(num_images):
+            attn_tensor = torch.from_numpy(attention_maps[i]).unsqueeze(0).unsqueeze(0).float()
+            attn_upsampled = F.interpolate(attn_tensor, size=(H, W), mode='bilinear', align_corners=False)
+            attention_maps_upsampled.append(attn_upsampled.squeeze().numpy())
+        
+        attention_maps_upsampled = np.array(attention_maps_upsampled)
+        
+        # Create figure with num_images rows, 2 columns (original | attention)
+        fig, axes = plt.subplots(num_images, 2, figsize=(12, num_images * 4))
+        
+        if num_images == 1:
+            axes = axes.reshape(1, 2)
+        
+        for i in range(num_images):
+            # Left column: original image with caption
+            axes[i, 0].imshow(images_np[i])
+            axes[i, 0].axis('off')
+            
+            # Add caption below image
+            caption_text = captions[i] if i < len(captions) else ""
+            # Wrap text if too long
+            import textwrap
+            wrapped_caption = "\n".join(textwrap.wrap(caption_text, width=40))
+            axes[i, 0].text(0.5, -0.05, wrapped_caption, 
+                           transform=axes[i, 0].transAxes,
+                           ha='center', va='top', fontsize=10, 
+                           wrap=True, style='italic')
+            
+            if i == 0:
+                axes[i, 0].set_title('Original Image + Caption', fontsize=12, fontweight='bold', pad=10)
+            
+            # Right column: attention heatmap overlay
+            axes[i, 1].imshow(images_np[i])
+            
+            # Create colorful attention overlay
+            attn = attention_maps_upsampled[i]
+            # Normalize attention to [0, 1]
+            attn_norm = (attn - attn.min()) / (attn.max() - attn.min() + 1e-8)
+            
+            # Apply colormap (use 'jet' for vibrant colors)
+            im = axes[i, 1].imshow(attn_norm, cmap='jet', alpha=0.6, 
+                                  interpolation='bilinear')
+            axes[i, 1].axis('off')
+            
+            if i == 0:
+                axes[i, 1].set_title('Text-Conditioned Attention', fontsize=12, fontweight='bold', pad=10)
+        
+        # Add overall title
+        fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+        
+        # Add colorbar on the right
+        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+        cbar = fig.colorbar(im, cax=cbar_ax)
+        cbar.set_label('Attention Weight', rotation=270, labelpad=20)
+        
+        plt.tight_layout(rect=[0, 0, 0.9, 0.96])
+        
+        # Save figure
+        os.makedirs(os.path.dirname(save_path), exist_ok=True)
+        plt.savefig(save_path, dpi=150, bbox_inches='tight')
+        plt.close()
+        
+        self.visualizations.append(save_path)
+        print(f"Saved side-by-side attention visualization to {save_path}")
+        
+        return fig
+    
     def visualize_attention_grid(self, images, image_tokens, text_tokens, 
                                 attention_weights, save_path=None, 
                                 title="Text-Conditioned Attention Grid",

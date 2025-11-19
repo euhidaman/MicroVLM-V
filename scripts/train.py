@@ -385,7 +385,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     selected_attention_mask = attention_mask[:num_samples]
                     
                     print(f"\n=== Enhanced Visualization at Step {global_step} ===")
-                    print(f"Generating attention grid for {num_samples} images...")
+                    print(f"Generating side-by-side attention visualization for {num_samples} images...")
                     
                     # Encode all selected images and text
                     selected_prefix, selected_img_feat = model.encode_image(selected_images)
@@ -398,19 +398,29 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         selected_prefix, selected_text_emb
                     )
                     
-                    # Create grid visualization with attention overlays
-                    grid_path = Path(config.output_dir) / "visualizations" / f"attention_grid_step_{global_step}.png"
-                    grid_fig = visualizer.visualize_attention_grid(
+                    # Decode captions from input_ids
+                    from transformers import AutoTokenizer
+                    tokenizer = AutoTokenizer.from_pretrained(config.text_model)
+                    captions = []
+                    for i in range(num_samples):
+                        # Decode the input_ids to get the text caption
+                        caption = tokenizer.decode(selected_input_ids[i], skip_special_tokens=True)
+                        captions.append(caption)
+                    
+                    # Create side-by-side visualization with captions
+                    sbs_path = Path(config.output_dir) / "visualizations" / f"attention_sidebyside_step_{global_step}.png"
+                    sbs_fig = visualizer.visualize_attention_side_by_side(
                         images=selected_images,
                         image_tokens=selected_prefix,
                         text_tokens=selected_text_emb,
                         attention_weights=attention,
-                        save_path=str(grid_path),
-                        title=f"Text-Conditioned Attention Grid (Step {global_step})",
+                        captions=captions,
+                        save_path=str(sbs_path),
+                        title=f"Text-Conditioned Attention (Step {global_step})",
                         num_images=num_samples
                     )
                     
-                    print(f"  Grid visualization saved to {grid_path}")
+                    print(f"  Side-by-side visualization saved to {sbs_path}")
                     print(f"  Average attention entropy: {stats['attention_entropy']:.4f}")
                     print(f"  Average attention sparsity: {stats['attention_sparsity']:.4f}")
                     
@@ -422,11 +432,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             'enhanced_viz/divergence': stats['divergence_statistic']
                         }, step=global_step)
                         
-                        # Log the grid image
+                        # Log the side-by-side image
                         import wandb
                         if wandb_logger.wandb_run:
                             wandb_logger.wandb_run.log({
-                                'enhanced_viz/attention_grid': wandb.Image(str(grid_path))
+                                'enhanced_viz/attention_sidebyside': wandb.Image(str(sbs_path))
                             }, step=global_step)
                     
                     print("=" * 60 + "\n")
