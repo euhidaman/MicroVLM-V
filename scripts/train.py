@@ -27,14 +27,25 @@ from src.quantization.quantize_4bit import QuantizationConfig
 def setup_wandb(config, run_name):
     """Initialize WandB logging"""
     if config.use_wandb:
-        wandb.init(
-            project=config.wandb_project,
-            entity=config.wandb_username,
-            name=run_name,
-            config=vars(config)
-        )
-        print(f"WandB initialized: {run_name}")
-    return wandb if config.use_wandb else None
+        try:
+            # Initialize with project (will auto-create if doesn't exist)
+            wandb.init(
+                project=config.wandb_project,
+                name=run_name,
+                config=vars(config),
+                resume='allow'  # Allow resuming runs
+            )
+            print(f"WandB initialized: {run_name}")
+            print(f"WandB project: {config.wandb_project}")
+            return wandb
+        except Exception as e:
+            print(f"WARNING: WandB initialization failed: {e}")
+            print("Continuing without WandB logging...")
+            print("To enable WandB:")
+            print("  1. Run: wandb login")
+            print("  2. Or disable in config: use_wandb=False")
+            return None
+    return None
 
 
 def create_optimizer(model, config):
