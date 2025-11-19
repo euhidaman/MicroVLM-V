@@ -6,6 +6,7 @@ Supports small-scale testing and full training stages
 import os
 import sys
 import json
+from datetime import datetime
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader
@@ -13,6 +14,7 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import wandb
+from huggingface_hub import HfApi, create_repo, upload_folder
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -25,6 +27,201 @@ from src.visualization.attention_vis import create_attention_visualizer
 from src.visualization.wandb_logger import WandBLogger
 from src.quantization.quantize_4bit import QuantizationConfig
 from src.quantization.quantized_episodic_memory import get_memory_quantization_stats
+
+
+def count_parameters(model):
+    """Count total and trainable parameters"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    return {
+        'total': total_params,
+        'trainable': trainable_params,
+        'frozen': frozen_params
+    }
+
+def get_model_statistics(model, config):
+    """Get comprehensive model statistics"""
+    stats = {}
+    
+    # Overall parameters
+    overall = count_parameters(model)
+    stats['total_parameters'] = overall['total']
+    stats['trainable_parameters'] = overall['trainable']
+    stats['frozen_parameters'] = overall['frozen']
+    stats['trainable_percentage'] = 100.0 * overall['trainable'] / overall['total'] if overall['total'] > 0 else 0.0
+    
+    # Vision encoder parameters
+    if hasattr(model, 'vision_encoder'):
+        vision_stats = count_parameters(model.vision_encoder)
+        stats['vision_total_params'] = vision_stats['total']
+        stats['vision_trainable_params'] = vision_stats['trainable']
+        stats['vision_frozen_params'] = vision_stats['frozen']
+    
+    # Language model parameters
+    if hasattr(model, 'language_model'):
+        lang_stats = count_parameters(model.language_model)
+        stats['language_total_params'] = lang_stats['total']
+        stats['language_trainable_params'] = lang_stats['trainable']
+        stats['language_frozen_params'] = lang_stats['frozen']
+    
+    # Adapter parameters
+    if hasattr(model, 'multimodal_adapter'):
+        adapter_stats = count_parameters(model.multimodal_adapter)
+        stats['adapter_total_params'] = adapter_stats['total']
+        stats['adapter_trainable_params'] = adapter_stats['trainable']
+    
+    # Memory parameters
+    if hasattr(model, 'episodic_memory'):
+        memory_stats = count_parameters(model.episodic_memory)
+        stats['memory_total_params'] = memory_stats['total']
+        stats['memory_trainable_params'] = memory_stats['trainable']
+    
+    # Quantization info
+    stats['vision_4bit_quantized'] = getattr(config, 'quantize_vision_4bit', False)
+    stats['language_4bit_quantized'] = getattr(config, 'quantize_language_4bit', False)
+    stats['memory_158bit_quantized'] = getattr(config, 'quantize_memory_158bit', False)
+    
+    # Estimate memory size (approximate)
+    # 4-bit: 0.5 bytes per param, 1.58-bit: ~0.2 bytes per param, fp16: 2 bytes, fp32: 4 bytes
+    total_size_mb = 0
+    if stats.get('vision_4bit_quantized'):
+        total_size_mb += stats.get('vision_total_params', 0) * 0.5 / 1e6
+    else:
+        total_size_mb += stats.get('vision_total_params', 0) * 2 / 1e6  # fp16
+    
+    if stats.get('language_4bit_quantized'):
+        total_size_mb += stats.get('language_total_params', 0) * 0.5 / 1e6
+    else:
+        total_size_mb += stats.get('language_total_params', 0) * 2 / 1e6  # fp16
+    
+    if stats.get('memory_158bit_quantized'):
+        total_size_mb += stats.get('memory_total_params', 0) * 0.2 / 1e6
+    else:
+        total_size_mb += stats.get('memory_total_params', 0) * 4 / 1e6  # fp32
+    
+    # Add other components (adapter, etc.)
+    total_size_mb += stats.get('adapter_total_params', 0) * 4 / 1e6
+    
+    stats['estimated_model_size_mb'] = round(total_size_mb, 2)
+    
+    return stats
+
+def print_model_statistics(stats, epoch):
+    """Print model statistics in a formatted way"""
+    print("\n" + "="*80)
+    print(f"MODEL STATISTICS - Epoch {epoch}")
+    print("="*80)
+    
+    print("\n📊 Overall Parameters:")
+    print(f"  Total:      {stats['total_parameters']:>15,}")
+    print(f"  Trainable:  {stats['trainable_parameters']:>15,} ({stats['trainable_percentage']:.2f}%)")
+    print(f"  Frozen:     {stats['frozen_parameters']:>15,}")
+    
+    print("\n🖼️  Vision Encoder:")
+    print(f"  Total:      {stats.get('vision_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('vision_trainable_params', 0):>15,}")
+    print(f"  Frozen:     {stats.get('vision_frozen_params', 0):>15,}")
+    
+    print("\n💬 Language Model:")
+    print(f"  Total:      {stats.get('language_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('language_trainable_params', 0):>15,}")
+    print(f"  Frozen:     {stats.get('language_frozen_params', 0):>15,}")
+    
+    print("\n🔗 Multimodal Adapter:")
+    print(f"  Total:      {stats.get('adapter_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('adapter_trainable_params', 0):>15,}")
+    
+    print("\n🧠 Episodic Memory:")
+    print(f"  Total:      {stats.get('memory_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('memory_trainable_params', 0):>15,}")
+    
+    print("\n⚙️  Quantization:")
+    print(f"  Vision 4-bit:     {'✓' if stats.get('vision_4bit_quantized') else '✗'}")
+    print(f"  Language 4-bit:   {'✓' if stats.get('language_4bit_quantized') else '✗'}")
+    print(f"  Memory 1.58-bit:  {'✓' if stats.get('memory_158bit_quantized') else '✗'}")
+    
+    print("\n💾 Estimated Model Size:")
+    print(f"  ~{stats['estimated_model_size_mb']:.2f} MB")
+    
+    print("="*80 + "\n")
+
+def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_name="default"):
+    """Save model checkpoint after each epoch"""
+    checkpoint_dir = Path(config.output_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+    
+    # Get and print model statistics
+    stats = get_model_statistics(model, config)
+    print_model_statistics(stats, epoch)
+    
+    # Save checkpoint with epoch number
+    checkpoint_path = checkpoint_dir / f"epoch_{epoch}_checkpoint.pt"
+    
+    torch.save({
+        'epoch': epoch,
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'config': vars(config),
+        'model_statistics': stats
+    }, checkpoint_path)
+    
+    print(f"✅ Checkpoint saved: {checkpoint_path}")
+    
+    # Save statistics as JSON
+    stats_path = checkpoint_dir / f"epoch_{epoch}_statistics.json"
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=2)
+    print(f"📊 Statistics saved: {stats_path}")
+    
+    return checkpoint_path, stats
+
+def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
+    """Push model to HuggingFace Hub"""
+    try:
+        # Get HF token from environment
+        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+        if not hf_token:
+            print("⚠️  Warning: No HuggingFace token found. Set HF_TOKEN environment variable.")
+            print("   Skipping HuggingFace push.")
+            return False
+        
+        # Determine repo name
+        repo_name = getattr(config, 'hf_repo_name', 'MicroVLM-V')
+        username = getattr(config, 'hf_username', config.wandb_username)
+        repo_id = f"{username}/{repo_name}"
+        
+        print(f"\n🤗 Pushing to HuggingFace: {repo_id}")
+        
+        # Create repo if it doesn't exist
+        api = HfApi()
+        try:
+            api.create_repo(repo_id=repo_id, token=hf_token, exist_ok=True, repo_type="model")
+            print(f"   Repository ready: https://huggingface.co/{repo_id}")
+        except Exception as e:
+            print(f"   Note: {e}")
+        
+        # Commit message
+        commit_message = f"{stage_name}: epoch {epoch} checkpoint"
+        
+        # Upload checkpoint folder
+        api.upload_folder(
+            folder_path=str(checkpoint_dir),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+        
+        print(f"✅ Successfully pushed to HuggingFace!")
+        print(f"   Commit: {commit_message}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error pushing to HuggingFace: {e}")
+        print("   Continuing training...")
+        return False
 
 
 def setup_wandb(config, run_name):
@@ -435,30 +632,205 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             
             model.train()
         
-        # Save checkpoint
-        if global_step % config.save_interval == 0:
-            save_checkpoint(model, optimizer, epoch, global_step, config)
+        # Remove step-based checkpointing (only save at end of epoch)
     
     avg_loss = total_loss / len(train_loader)
     return avg_loss, global_step
 
 
-def save_checkpoint(model, optimizer, epoch, global_step, config):
-    """Save model checkpoint"""
+def count_parameters(model):
+    """Count total and trainable parameters"""
+    total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    return {
+        'total': total_params,
+        'trainable': trainable_params,
+        'frozen': frozen_params
+    }
+
+def get_model_statistics(model, config):
+    """Get comprehensive model statistics"""
+    stats = {}
+    
+    # Overall parameters
+    overall = count_parameters(model)
+    stats['total_parameters'] = overall['total']
+    stats['trainable_parameters'] = overall['trainable']
+    stats['frozen_parameters'] = overall['frozen']
+    stats['trainable_percentage'] = 100.0 * overall['trainable'] / overall['total'] if overall['total'] > 0 else 0.0
+    
+    # Vision encoder parameters
+    if hasattr(model, 'vision_encoder'):
+        vision_stats = count_parameters(model.vision_encoder)
+        stats['vision_total_params'] = vision_stats['total']
+        stats['vision_trainable_params'] = vision_stats['trainable']
+        stats['vision_frozen_params'] = vision_stats['frozen']
+    
+    # Language model parameters
+    if hasattr(model, 'language_model'):
+        lang_stats = count_parameters(model.language_model)
+        stats['language_total_params'] = lang_stats['total']
+        stats['language_trainable_params'] = lang_stats['trainable']
+        stats['language_frozen_params'] = lang_stats['frozen']
+    
+    # Adapter parameters
+    if hasattr(model, 'multimodal_adapter'):
+        adapter_stats = count_parameters(model.multimodal_adapter)
+        stats['adapter_total_params'] = adapter_stats['total']
+        stats['adapter_trainable_params'] = adapter_stats['trainable']
+    
+    # Memory parameters
+    if hasattr(model, 'episodic_memory'):
+        memory_stats = count_parameters(model.episodic_memory)
+        stats['memory_total_params'] = memory_stats['total']
+        stats['memory_trainable_params'] = memory_stats['trainable']
+    
+    # Quantization info
+    stats['vision_4bit_quantized'] = getattr(config, 'quantize_vision_4bit', False)
+    stats['language_4bit_quantized'] = getattr(config, 'quantize_language_4bit', False)
+    stats['memory_158bit_quantized'] = getattr(config, 'quantize_memory_158bit', False)
+    
+    # Estimate memory size (approximate)
+    # 4-bit: 0.5 bytes per param, 1.58-bit: ~0.2 bytes per param, fp16: 2 bytes, fp32: 4 bytes
+    total_size_mb = 0
+    if stats.get('vision_4bit_quantized'):
+        total_size_mb += stats.get('vision_total_params', 0) * 0.5 / 1e6
+    else:
+        total_size_mb += stats.get('vision_total_params', 0) * 2 / 1e6  # fp16
+    
+    if stats.get('language_4bit_quantized'):
+        total_size_mb += stats.get('language_total_params', 0) * 0.5 / 1e6
+    else:
+        total_size_mb += stats.get('language_total_params', 0) * 2 / 1e6  # fp16
+    
+    if stats.get('memory_158bit_quantized'):
+        total_size_mb += stats.get('memory_total_params', 0) * 0.2 / 1e6
+    else:
+        total_size_mb += stats.get('memory_total_params', 0) * 4 / 1e6  # fp32
+    
+    # Add other components (adapter, etc.)
+    total_size_mb += stats.get('adapter_total_params', 0) * 4 / 1e6
+    
+    stats['estimated_model_size_mb'] = round(total_size_mb, 2)
+    
+    return stats
+
+def print_model_statistics(stats, epoch):
+    """Print model statistics in a formatted way"""
+    print("\n" + "="*80)
+    print(f"MODEL STATISTICS - Epoch {epoch}")
+    print("="*80)
+    
+    print("\n📊 Overall Parameters:")
+    print(f"  Total:      {stats['total_parameters']:>15,}")
+    print(f"  Trainable:  {stats['trainable_parameters']:>15,} ({stats['trainable_percentage']:.2f}%)")
+    print(f"  Frozen:     {stats['frozen_parameters']:>15,}")
+    
+    print("\n🖼️  Vision Encoder:")
+    print(f"  Total:      {stats.get('vision_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('vision_trainable_params', 0):>15,}")
+    print(f"  Frozen:     {stats.get('vision_frozen_params', 0):>15,}")
+    
+    print("\n💬 Language Model:")
+    print(f"  Total:      {stats.get('language_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('language_trainable_params', 0):>15,}")
+    print(f"  Frozen:     {stats.get('language_frozen_params', 0):>15,}")
+    
+    print("\n🔗 Multimodal Adapter:")
+    print(f"  Total:      {stats.get('adapter_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('adapter_trainable_params', 0):>15,}")
+    
+    print("\n🧠 Episodic Memory:")
+    print(f"  Total:      {stats.get('memory_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('memory_trainable_params', 0):>15,}")
+    
+    print("\n⚙️  Quantization:")
+    print(f"  Vision 4-bit:     {'✓' if stats.get('vision_4bit_quantized') else '✗'}")
+    print(f"  Language 4-bit:   {'✓' if stats.get('language_4bit_quantized') else '✗'}")
+    print(f"  Memory 1.58-bit:  {'✓' if stats.get('memory_158bit_quantized') else '✗'}")
+    
+    print("\n💾 Estimated Model Size:")
+    print(f"  ~{stats['estimated_model_size_mb']:.2f} MB")
+    
+    print("="*80 + "\n")
+
+def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_name="default"):
+    """Save model checkpoint after each epoch"""
     checkpoint_dir = Path(config.output_dir) / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
-    checkpoint_path = checkpoint_dir / f"checkpoint_step_{global_step}.pt"
+    # Get and print model statistics
+    stats = get_model_statistics(model, config)
+    print_model_statistics(stats, epoch)
+    
+    # Save checkpoint with epoch number
+    checkpoint_path = checkpoint_dir / f"epoch_{epoch}_checkpoint.pt"
     
     torch.save({
         'epoch': epoch,
         'global_step': global_step,
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
-        'config': vars(config)
+        'config': vars(config),
+        'model_statistics': stats
     }, checkpoint_path)
     
-    print(f"Checkpoint saved: {checkpoint_path}")
+    print(f"✅ Checkpoint saved: {checkpoint_path}")
+    
+    # Save statistics as JSON
+    stats_path = checkpoint_dir / f"epoch_{epoch}_statistics.json"
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=2)
+    print(f"📊 Statistics saved: {stats_path}")
+    
+    return checkpoint_path, stats
+
+def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
+    """Push model to HuggingFace Hub"""
+    try:
+        # Get HF token from environment
+        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+        if not hf_token:
+            print("⚠️  Warning: No HuggingFace token found. Set HF_TOKEN environment variable.")
+            print("   Skipping HuggingFace push.")
+            return False
+        
+        # Determine repo name
+        repo_name = getattr(config, 'hf_repo_name', 'MicroVLM-V')
+        username = getattr(config, 'hf_username', config.wandb_username)
+        repo_id = f"{username}/{repo_name}"
+        
+        print(f"\n🤗 Pushing to HuggingFace: {repo_id}")
+        
+        # Create repo if it doesn't exist
+        api = HfApi()
+        try:
+            api.create_repo(repo_id=repo_id, token=hf_token, exist_ok=True, repo_type="model")
+            print(f"   Repository ready: https://huggingface.co/{repo_id}")
+        except Exception as e:
+            print(f"   Note: {e}")
+        
+        # Commit message
+        commit_message = f"{stage_name}: epoch {epoch} checkpoint"
+        
+        # Upload checkpoint folder
+        api.upload_folder(
+            folder_path=str(checkpoint_dir),
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+        
+        print(f"✅ Successfully pushed to HuggingFace!")
+        print(f"   Commit: {commit_message}")
+        return True
+        
+    except Exception as e:
+        print(f"❌ Error pushing to HuggingFace: {e}")
+        print("   Continuing training...")
+        return False
 
 
 def main():
@@ -606,8 +978,21 @@ def main():
         if wandb_logger and (epoch % max(1, config.num_epochs // 5) == 0):
             wandb_logger.log_model_weights_histogram(model, global_step)
         
-        # Save epoch checkpoint
-        save_checkpoint(model, optimizer, epoch, global_step, config)
+        # Determine stage name for HF commit message
+        stage_name = args.config if hasattr(args, 'config') else 'default'
+        
+        # Save epoch checkpoint with statistics
+        checkpoint_path, stats = save_epoch_checkpoint(
+            model, optimizer, epoch, global_step, config, stage_name
+        )
+        
+        # Log statistics to WandB
+        if wandb_logger:
+            wandb_logger.log_metrics(stats, step=global_step, prefix="model_stats")
+        
+        # Push to HuggingFace
+        checkpoint_dir = Path(config.output_dir) / "checkpoints"
+        push_to_huggingface(checkpoint_dir, epoch, stage_name, config)
     
     # Final save
     final_path = Path(config.output_dir) / "final_model.pt"
