@@ -75,7 +75,7 @@ class EpisodicMemory(nn.Module):
     
     def _get_prior_params(self):
         """Get prior distribution parameters"""
-        prior_var = torch.ones(self.memory_size, device=self.memory_mean.device) * \
+        prior_var = torch.ones(self.memory_size, device=self.memory_mean.device, dtype=self.memory_mean.dtype) * \
                    torch.exp(self.memory_logvar) + EPSILON
         prior_cov = torch.diag(prior_var)
         return self.memory_mean, prior_cov
@@ -187,10 +187,18 @@ class EpisodicMemory(nn.Module):
         """
         episode_size, batch_size = z.shape[:2]
         
+        # Store original dtype and device
+        original_dtype = z.dtype
+        original_device = z.device
+        
         # Apply ordering if enabled
         if self.use_ordering:
-            z, _ = self.lstm_z(z.transpose(0, 1))  # (batch_size, episode_size, code_size)
+            # LSTM requires float32
+            z_for_lstm = z.transpose(0, 1).float()  # (batch_size, episode_size, code_size)
+            z, _ = self.lstm_z(z_for_lstm)  # (batch_size, episode_size, code_size)
             z = z.transpose(0, 1)  # (episode_size, batch_size, code_size)
+            # Convert back to original dtype and ensure device consistency
+            z = z.to(dtype=original_dtype, device=original_device)
         
         # Get prior
         prior_memory = self._get_prior_state(batch_size)
@@ -224,6 +232,9 @@ class EpisodicMemory(nn.Module):
         
         M = memory_state[0]  # (batch_size, memory_size, code_size)
         
+        # Store original dtype for consistency
+        original_dtype = z.dtype
+        
         # Compute addressing weights
         w_mean = self._solve_w_mean(z, M)
         
@@ -238,8 +249,11 @@ class EpisodicMemory(nn.Module):
         # Retrieve: z = w^T * M
         z_retrieved = torch.bmm(w.transpose(0, 1), M).transpose(0, 1)
         
-        # Add observation noise
+        # Add observation noise with correct dtype
         z_retrieved = z_retrieved + self.observation_noise_std * torch.randn_like(z_retrieved)
+        
+        # Ensure retrieved tensor maintains original dtype
+        z_retrieved = z_retrieved.to(original_dtype)
         
         # Compute KL divergence
         dkl_w = self._compute_addressing_kl(w_mean)
