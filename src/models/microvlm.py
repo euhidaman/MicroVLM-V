@@ -12,6 +12,7 @@ from .vision_encoder import DeiTVisionEncoder
 from .language_model import Qwen2LanguageModel
 from .multimodal_adapter import MultimodalAdapter, ContrastiveAlignmentLoss, MultimodalFusion
 from .episodic_memory import EpisodicMemory, ScopeDetector
+from ..quantization.quantized_episodic_memory import apply_158bit_quantization_to_memory
 
 
 class MicroVLM(nn.Module):
@@ -26,11 +27,12 @@ class MicroVLM(nn.Module):
     """
     
     def __init__(self, config, vision_checkpoint=None, language_checkpoint=None, 
-                 quantize_4bit=False):
+                 quantize_4bit=False, quantize_memory_158bit=False):
         super().__init__()
         
         self.config = config
         self.quantize_4bit = quantize_4bit
+        self.quantize_memory_158bit = quantize_memory_158bit
         
         # Vision encoder: DeiT-Tiny
         self.vision_encoder = DeiTVisionEncoder(config, pretrained_path=vision_checkpoint)
@@ -51,8 +53,20 @@ class MicroVLM(nn.Module):
         # Episodic memory
         self.episodic_memory = EpisodicMemory(config)
         
+        # Apply 1.58-bit quantization to episodic memory if requested
+        if quantize_memory_158bit:
+            print("Applying 1.58-bit quantization to episodic memory...")
+            apply_158bit_quantization_to_memory(self.episodic_memory)
+            print("Episodic memory quantization applied!")
+        
         # Scope detector
         self.scope_detector = ScopeDetector(config)
+        
+        # Apply 1.58-bit quantization to scope detector if requested
+        if quantize_memory_158bit:
+            print("Applying 1.58-bit quantization to scope detector...")
+            apply_158bit_quantization_to_memory(self.scope_detector)
+            print("Scope detector quantization applied!")
         
         # Image feature projection for alignment (DeiT 192-dim -> Qwen 896-dim)
         self.image_proj_for_alignment = nn.Linear(

@@ -20,9 +20,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 from src.models import create_microvlm
 from src.data.cc12m_loader import create_dataloaders
 from src.training.config import load_config, create_run_name
+from src.training.staged_config import load_config as load_staged_config
 from src.visualization.attention_vis import create_attention_visualizer
 from src.visualization.wandb_logger import WandBLogger
 from src.quantization.quantize_4bit import QuantizationConfig
+from src.quantization.quantized_episodic_memory import get_memory_quantization_stats
 
 
 def setup_wandb(config, run_name):
@@ -86,6 +88,105 @@ def create_scheduler(optimizer, config, total_steps):
         scheduler = None
     
     return scheduler
+
+
+def compute_gradient_flow_metrics(model):
+    """
+    Compute gradient flow metrics for monitoring training
+    Based on EVO-1 parameter inspection methodology
+    
+    Returns:
+        Dictionary with gradient statistics by module
+    """
+    metrics = {}
+    
+    # Key module groups to monitor
+    module_groups = {
+        'adapter': [],
+        'memory': [],
+        'projection': [],
+        'scope_detector': [],
+        'vision': [],
+        'language': []
+    }
+    
+    # Collect gradients by module group
+    for name, param in model.named_parameters():
+        if param.grad is None:
+            continue
+            
+        grad_norm = param.grad.norm().item()
+        grad_mean = param.grad.mean().item()
+        grad_std = param.grad.std().item()
+        grad_max = param.grad.abs().max().item()
+        
+        # Categorize parameter
+        if 'multimodal_adapter' in name or 'adapter' in name:
+            module_groups['adapter'].append({
+                'name': name,
+                'norm': grad_norm,
+                'mean': grad_mean,
+                'std': grad_std,
+                'max': grad_max
+            })
+        elif 'episodic_memory' in name or 'memory' in name:
+            module_groups['memory'].append({
+                'name': name,
+                'norm': grad_norm,
+                'mean': grad_mean,
+                'std': grad_std,
+                'max': grad_max
+            })
+        elif 'scope_detector' in name:
+            module_groups['scope_detector'].append({
+                'name': name,
+                'norm': grad_norm,
+                'mean': grad_mean,
+                'std': grad_std,
+                'max': grad_max
+            })
+        elif 'proj' in name.lower() or 'projection' in name:
+            module_groups['projection'].append({
+                'name': name,
+                'norm': grad_norm,
+                'mean': grad_mean,
+                'std': grad_std,
+                'max': grad_max
+            })
+        elif 'vision' in name:
+            module_groups['vision'].append({
+                'name': name,
+                'norm': grad_norm,
+                'mean': grad_mean,
+                'std': grad_std,
+                'max': grad_max
+            })
+        elif 'language' in name or 'qwen' in name.lower():
+            module_groups['language'].append({
+                'name': name,
+                'norm': grad_norm,
+                'mean': grad_mean,
+                'std': grad_std,
+                'max': grad_max
+            })
+    
+    # Aggregate statistics per group
+    for group_name, grads in module_groups.items():
+        if not grads:
+            continue
+            
+        total_norm = sum(g['norm'] for g in grads)
+        avg_mean = sum(g['mean'] for g in grads) / len(grads)
+        avg_std = sum(g['std'] for g in grads) / len(grads)
+        max_grad = max(g['max'] for g in grads)
+        
+        metrics[f'grad_flow/{group_name}/total_norm'] = total_norm
+        metrics[f'grad_flow/{group_name}/avg_mean'] = avg_mean
+        metrics[f'grad_flow/{group_name}/avg_std'] = avg_std
+        metrics[f'grad_flow/{group_name}/max_grad'] = max_grad
+        metrics[f'grad_flow/{group_name}/num_params'] = len(grads)
+    
+    return metrics
 
 
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
@@ -189,6 +290,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 # Gradient metrics
                 wandb_logger.log_gradient_metrics(model, global_step)
                 
+                # Gradient flow monitoring (every 50 steps)
+                if global_step % 50 == 0:
+                    grad_flow_metrics = compute_gradient_flow_metrics(model)
+                    wandb_logger.log_metrics(grad_flow_metrics, step=global_step)
+                
                 # Language model metrics
                 wandb_logger.log_language_model_metrics(outputs, input_ids, global_step)
             
@@ -263,6 +369,62 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             'attention/divergence': stats['divergence_statistic']
                         }, step=global_step)
                 
+                # Enhanced visualization: 3 random images with full attention every 5000 steps
+                viz_save_interval = getattr(config, 'viz_save_interval', 5000)
+                num_viz_images = getattr(config, 'num_viz_images', 3)
+                
+                if global_step % viz_save_interval == 0 and wandb_logger:
+                    import random
+                    batch_size = images.shape[0]
+                    # Select random indices (up to num_viz_images)
+                    num_samples = min(num_viz_images, batch_size)
+                    random_indices = random.sample(range(batch_size), num_samples)
+                    
+                    print(f"\n=== Enhanced Visualization at Step {global_step} ===")
+                    print(f"Visualizing {num_samples} random images with full attention analysis...")
+                    
+                    for idx, img_idx in enumerate(random_indices):
+                        # Get single image and text
+                        single_image = images[img_idx:img_idx+1]
+                        single_input_ids = input_ids[img_idx:img_idx+1]
+                        single_attention_mask = attention_mask[img_idx:img_idx+1]
+                        
+                        # Encode
+                        single_prefix, single_img_feat = model.encode_image(single_image)
+                        single_text_emb, single_text_feat = model.encode_text(
+                            single_input_ids, single_attention_mask
+                        )
+                        
+                        # Analyze attention
+                        stats, attention = visualizer.analyze_cross_modal_attention(
+                            single_prefix, single_text_emb
+                        )
+                        
+                        # Save detailed visualization
+                        viz_path = Path(config.output_dir) / "visualizations" / f"detailed_step_{global_step}_img_{idx}.png"
+                        visualizer.visualize_attention(
+                            attention[0],
+                            save_path=str(viz_path),
+                            title=f"Step {global_step} - Image {idx+1}/{num_samples}"
+                        )
+                        
+                        # Log to WandB with prefix for grouping
+                        wandb_logger.log_image(
+                            single_image, 
+                            f"enhanced_viz/image_{idx}", 
+                            global_step
+                        )
+                        wandb_logger.log_cross_modal_attention(
+                            attention, 
+                            global_step, 
+                            prefix=f"enhanced_viz/attention_{idx}"
+                        )
+                        
+                        print(f"  Image {idx+1}: entropy={stats['attention_entropy']:.4f}, "
+                              f"sparsity={stats['attention_sparsity']:.4f}")
+                    
+                    print("=" * 60 + "\n")
+                
                 # Memory visualizations
                 if config.use_memory and wandb_logger and model.memory_state is not None:
                     # Ensure memory_state is valid tuple with data
@@ -309,16 +471,22 @@ def save_checkpoint(model, optimizer, epoch, global_step, config):
 def main():
     parser = argparse.ArgumentParser(description="Train MicroVLM-V")
     parser.add_argument('--config', type=str, default='default',
-                       choices=['test', 'stage1', 'stage2', 'default'],
+                       choices=['test', 'stage1', 'stage2', 'default', 'full_quantized'],
                        help='Training configuration')
     parser.add_argument('--resume', type=str, default=None,
                        help='Path to checkpoint to resume from')
+    parser.add_argument('--use-staged-config', action='store_true',
+                       help='Use staged configuration system')
     
     args = parser.parse_args()
     
-    # Load configuration
-    config = load_config(args.config)
-    print(f"Loaded configuration: {args.config}")
+    # Load configuration - prioritize staged config if requested
+    if args.use_staged_config or args.config in ['stage1', 'stage2', 'full_quantized']:
+        config = load_staged_config(args.config)
+        print(f"Loaded STAGED configuration: {args.config}")
+    else:
+        config = load_config(args.config)
+        print(f"Loaded configuration: {args.config}")
     
     # Create output directories
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -337,6 +505,8 @@ def main():
     
     # Create run name
     run_name, run_counter = create_run_name(args.config)
+    if hasattr(config, 'wandb_run_name') and config.wandb_run_name:
+        run_name = f"{config.wandb_run_name}_{run_counter}"
     config.wandb_run_name = run_name
     
     print(f"Run name: {run_name} (counter: {run_counter})")
@@ -347,14 +517,31 @@ def main():
     # Create WandB comprehensive logger
     wandb_logger = WandBLogger(config, wandb_run) if wandb_run else None
     
-    # Create model
+    # Create model with quantization settings
     print("Creating model...")
+    print(f"  - 4-bit quantization: Vision={getattr(config, 'quantize_vision_4bit', False)}, "
+          f"Language={getattr(config, 'quantize_language_4bit', False)}")
+    print(f"  - 1.58-bit memory quantization: {getattr(config, 'quantize_memory_158bit', False)}")
+    
     model = create_microvlm(
         config=model_config['model_dimensions'],
-        language_checkpoint=config.qwen_model,
-        vision_checkpoint=config.deit_checkpoint,
-        quantize_4bit=config.use_4bit
+        language_checkpoint=getattr(config, 'language_checkpoint', config.qwen_model),
+        vision_checkpoint=getattr(config, 'vision_checkpoint', config.deit_checkpoint),
+        quantize_4bit=(getattr(config, 'quantize_vision_4bit', False) or 
+                      getattr(config, 'quantize_language_4bit', False)),
+        quantize_memory_158bit=getattr(config, 'quantize_memory_158bit', False)
     )
+    
+    # Log quantization statistics if enabled
+    if getattr(config, 'quantize_memory_158bit', False):
+        quant_stats = get_memory_quantization_stats(model.episodic_memory)
+        print("\n=== Memory Quantization Statistics ===")
+        for key, value in quant_stats.items():
+            print(f"  {key}: {value}")
+        print("=" * 40 + "\n")
+        
+        if wandb_logger:
+            wandb_logger.log_metrics(quant_stats, step=0, prefix="quantization")
     
     # Apply freezing strategy
     if config.freeze_vision:

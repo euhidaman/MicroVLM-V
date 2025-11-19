@@ -449,7 +449,7 @@ class WandBLogger:
         plt.close(fig)
     
     def log_cross_modal_attention(self, attention_weights, global_step, 
-                                  text_tokens=None):
+                                  text_tokens=None, prefix="alignment"):
         """
         Log cross-modal attention heatmap
         
@@ -457,6 +457,7 @@ class WandBLogger:
             attention_weights: (seq_len, k_prefix) or (batch, seq_len, k_prefix)
             global_step: global training step
             text_tokens: optional text token strings
+            prefix: metric prefix for WandB grouping (default: "alignment")
         """
         if not self.enabled:
             return
@@ -483,7 +484,7 @@ class WandBLogger:
         plt.tight_layout()
         
         self.wandb_run.log({
-            'alignment/cross_modal_attention': wandb.Image(fig)
+            f'{prefix}/cross_modal_attention': wandb.Image(fig)
         }, step=global_step)
         
         plt.close(fig)
@@ -513,3 +514,53 @@ class WandBLogger:
                 self.wandb_run.log({
                     f'weights/{name}': wandb.Histogram(param.data.cpu().numpy())
                 }, step=global_step)
+    
+    def log_metrics(self, metrics: Dict[str, float], step: int, prefix: str = ""):
+        """
+        Generic method to log arbitrary metrics
+        
+        Args:
+            metrics: dictionary of metric names to values
+            step: global step
+            prefix: optional prefix to add to all metric names
+        """
+        if not self.enabled:
+            return
+        
+        if prefix:
+            metrics = {f"{prefix}/{k}": v for k, v in metrics.items()}
+        
+        self.wandb_run.log(metrics, step=step)
+    
+    def log_image(self, image, name: str, step: int):
+        """
+        Log a single image to WandB
+        
+        Args:
+            image: torch.Tensor (C, H, W) or (1, C, H, W) or PIL Image
+            name: name for the image in WandB
+            step: global step
+        """
+        if not self.enabled:
+            return
+        
+        # Convert tensor to numpy if needed
+        if torch.is_tensor(image):
+            # Handle batch dimension
+            if image.dim() == 4:
+                image = image[0]  # Take first image in batch
+            
+            # Convert to HWC format for WandB
+            if image.shape[0] in [1, 3]:  # CHW format
+                image = image.permute(1, 2, 0)
+            
+            # Denormalize if needed (assume ImageNet normalization)
+            image = image.cpu().numpy()
+            if image.max() <= 1.0 and image.min() >= -1.0:
+                # Denormalize ImageNet
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                image = image * std + mean
+                image = np.clip(image, 0, 1)
+        
+        self.wandb_run.log({name: wandb.Image(image)}, step=step)
