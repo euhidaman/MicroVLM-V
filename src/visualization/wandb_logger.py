@@ -377,13 +377,18 @@ class WandBLogger:
             
             plt.close(fig)
             
-            # Memory statistics
+            # Memory statistics with numerical stability
+            # Clip addressing weights to avoid log(0)
+            avg_addressing_safe = np.clip(avg_addressing, 1e-10, 1.0)
+            # Normalize to ensure it's a valid probability distribution
+            avg_addressing_safe = avg_addressing_safe / np.sum(avg_addressing_safe)
+            
             metrics = {
                 'memory/mean_activation': np.mean(memory_norms),
                 'memory/max_activation': np.max(memory_norms),
                 'memory/min_activation': np.min(memory_norms),
                 'memory/active_slots': np.sum(memory_norms > 0.1),  # Threshold for "active"
-                'memory/addressing_entropy': -np.sum(avg_addressing * np.log(avg_addressing + 1e-10)),
+                'memory/addressing_entropy': -np.sum(avg_addressing_safe * np.log(avg_addressing_safe)),
                 'memory/addressing_sparsity': np.sum(avg_addressing < 0.01) / len(avg_addressing)
             }
             

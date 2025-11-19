@@ -47,8 +47,11 @@ class FastEppsPulley(nn.Module):
             statistic: (*, K) test statistics
         """
         # x: (*, N, K)
+        # Convert to float32 to avoid ComplexHalf warning
+        x_float = x.float()
+        
         # Expand for test points: (*, N, K, n_points)
-        x_expanded = x.unsqueeze(-1)  # (*, N, K, 1)
+        x_expanded = x_float.unsqueeze(-1)  # (*, N, K, 1)
         t_expanded = self.t_points.to(x.device).view(1, 1, 1, -1)  # (1, 1, 1, n_points)
         
         # Compute characteristic function
