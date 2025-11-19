@@ -101,6 +101,9 @@ class EpisodicMemory(nn.Module):
             w_mean: (episode_size, batch_size, memory_size)
         """
         z = z.transpose(0, 1)  # (batch_size, episode_size, code_size)
+        
+        # Ensure M matches z dtype for bmm compatibility
+        M = M.to(z.dtype)
         M_pseudoinv = self._approx_pseudo_inverse(M)  # (batch_size, code_size, memory_size)
         
         # Add observation noise
