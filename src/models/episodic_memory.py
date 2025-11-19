@@ -28,6 +28,7 @@ class EpisodicMemory(nn.Module):
         self.num_layers = config.get('num_layers', 24)
         self.num_heads = config.get('num_heads', 14)
         self.head_dim = config.get('head_dim', 64)
+        self.compute_dtype = torch.float32
         
         # Memory parameters: M of shape (K_mem, C_mem)
         self.memory_mean = nn.Parameter(torch.randn(self.memory_size, self.code_size))
@@ -75,23 +76,24 @@ class EpisodicMemory(nn.Module):
     
     def _get_prior_params(self):
         """Get prior distribution parameters"""
-        dtype = self.memory_mean.dtype
         device = self.memory_mean.device
-        logvar = torch.exp(self.memory_logvar).to(dtype=dtype, device=device)
+        dtype = self.compute_dtype
+        mean = self.memory_mean.to(dtype=dtype, device=device)
+        logvar = torch.exp(self.memory_logvar.to(dtype=dtype, device=device))
         ones = torch.ones(self.memory_size, device=device, dtype=dtype)
         eps = torch.tensor(EPSILON, device=device, dtype=dtype)
         prior_var = ones * logvar + eps
         prior_cov = torch.diag(prior_var)
-        return self.memory_mean, prior_cov
+        return mean, prior_cov
     
     def _get_prior_state(self, batch_size, dtype=None):
         """Initialize prior memory state for batch"""
         prior_mean, prior_cov = self._get_prior_params()
         
-        # Convert to target dtype if specified
-        if dtype is not None:
-            prior_mean = prior_mean.to(dtype)
-            prior_cov = prior_cov.to(dtype)
+        # Convert to target dtype if specified, otherwise use compute dtype
+        target_dtype = dtype or self.compute_dtype
+        prior_mean = prior_mean.to(target_dtype)
+        prior_cov = prior_cov.to(target_dtype)
         
         batch_prior_mean = prior_mean.unsqueeze(0).expand(batch_size, -1, -1)
         batch_prior_cov = prior_cov.unsqueeze(0).expand(batch_size, -1, -1)
@@ -228,6 +230,7 @@ class EpisodicMemory(nn.Module):
         # Store original dtype and device
         original_dtype = z.dtype
         original_device = z.device
+        z = z.to(self.compute_dtype)
         
         # Apply ordering if enabled
         if self.use_ordering:
@@ -235,11 +238,10 @@ class EpisodicMemory(nn.Module):
             z_for_lstm = z.transpose(0, 1).float()  # (batch_size, episode_size, code_size)
             z, _ = self.lstm_z(z_for_lstm)  # (batch_size, episode_size, code_size)
             z = z.transpose(0, 1)  # (episode_size, batch_size, code_size)
-            # Convert back to original dtype and ensure device consistency
-            z = z.to(dtype=original_dtype, device=original_device)
+            z = z.to(self.compute_dtype)
         
         # Get prior with matching dtype
-        prior_memory = self._get_prior_state(batch_size, dtype=original_dtype)
+        prior_memory = self._get_prior_state(batch_size, dtype=self.compute_dtype)
         
         # Sequential write using Sherman-Morrison updates
         new_memory = prior_memory
@@ -251,7 +253,7 @@ class EpisodicMemory(nn.Module):
         # Compute KL divergence
         dkl_M = self._compute_kl_divergence(prior_memory, new_memory)
         
-        return new_memory, dkl_M
+        return new_memory, dkl_M.to(original_dtype)
     
     def read(self, z, memory_state, deterministic=False):
         """
@@ -273,8 +275,11 @@ class EpisodicMemory(nn.Module):
         # Store original dtype for consistency
         original_dtype = z.dtype
         
-        # Ensure M matches z dtype
-        M = M.to(z.dtype)
+        # Perform memory operations in compute dtype
+        z = z.to(self.compute_dtype)
+        M = M.to(self.compute_dtype)
+        cov = memory_state[1].to(self.compute_dtype)
+        memory_state = (M, cov)
         
         # Compute addressing weights
         w_mean = self._solve_w_mean(z, M)
@@ -301,7 +306,7 @@ class EpisodicMemory(nn.Module):
         # Compute KL divergence
         dkl_w = self._compute_addressing_kl(w_mean)
         
-        return z_retrieved, dkl_w
+        return z_retrieved, dkl_w.to(original_dtype)
     
     def _compute_kl_divergence(self, prior_memory, posterior_memory):
         """Compute KL divergence between prior and posterior memory"""
