@@ -49,7 +49,7 @@ class FastEppsPulley(nn.Module):
         # x: (*, N, K)
         # Expand for test points: (*, N, K, n_points)
         x_expanded = x.unsqueeze(-1)  # (*, N, K, 1)
-        t_expanded = self.t_points.view(1, 1, 1, -1)  # (1, 1, 1, n_points)
+        t_expanded = self.t_points.to(x.device).view(1, 1, 1, -1)  # (1, 1, 1, n_points)
         
         # Compute characteristic function
         char_fn = torch.exp(1j * x_expanded * t_expanded)  # (*, N, K, n_points)
