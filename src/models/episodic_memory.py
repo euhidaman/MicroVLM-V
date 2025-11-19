@@ -172,6 +172,7 @@ class EpisodicMemory(nn.Module):
         # sigma_z = wU * w^T + noise_var
         wUw = torch.bmm(wU.transpose(0, 1), w.transpose(0, 1).transpose(1, 2)).transpose(0, 1)
         sigma_z = wUw + self.observation_noise_std ** 2
+        sigma_z = torch.clamp(sigma_z, min=EPSILON)
         
         # c_z = wU / sigma_z
         c_z = wU / sigma_z
@@ -187,6 +188,15 @@ class EpisodicMemory(nn.Module):
             c_z.transpose(0, 1).transpose(1, 2),
             wU.transpose(0, 1)
         )
+
+        # Ensure covariance stays symmetric positive-definite
+        posterior_cov = 0.5 * (posterior_cov + posterior_cov.transpose(-1, -2))
+        identity = torch.eye(
+            self.memory_size,
+            device=posterior_cov.device,
+            dtype=posterior_cov.dtype
+        ).unsqueeze(0)
+        posterior_cov = posterior_cov + EPSILON * identity
         
         return (posterior_mean, posterior_cov)
     
@@ -263,6 +273,7 @@ class EpisodicMemory(nn.Module):
         else:
             # Ensure w_logvar matches w_mean dtype for sampling
             w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0).to(w_mean.dtype)  # (1, 1, memory_size)
+            w_logvar = torch.clamp(w_logvar, min=-10.0, max=10.0)
             std = torch.exp(0.5 * w_logvar)
             w = w_mean + std * torch.randn_like(w_mean)
         
@@ -291,20 +302,31 @@ class EpisodicMemory(nn.Module):
         
         p_diag = torch.diagonal(U_prior, dim1=-2, dim2=-1)
         q_diag = torch.diagonal(U, dim1=-2, dim2=-1)
-        
-        t1 = self.code_size * torch.sum(q_diag / p_diag, dim=-1)
+
+        # Clamp diagonals to avoid division by zero or log of non-positive values
+        p_diag = torch.clamp(p_diag, min=EPSILON)
+        q_diag = torch.clamp(q_diag, min=EPSILON)
+        ratio = q_diag / p_diag
+        ratio = torch.clamp(ratio, min=EPSILON, max=1e6)
+
+        t1 = self.code_size * torch.sum(ratio, dim=-1)
         t2 = torch.sum((R - R_prior) ** 2 / p_diag.unsqueeze(-1), dim=[-2, -1])
         t3 = -self.code_size * self.memory_size
-        t4 = self.code_size * torch.sum(torch.log(p_diag) - torch.log(q_diag), dim=-1)
+        log_term = torch.log(p_diag) - torch.log(q_diag)
+        t4 = self.code_size * torch.sum(log_term, dim=-1)
         
         dkl_M = torch.mean(t1 + t2 + t3 + t4)
+        dkl_M = torch.nan_to_num(dkl_M, nan=0.0, posinf=1e6, neginf=-1e6)
         return dkl_M
     
     def _compute_addressing_kl(self, w_mean):
         """Compute KL divergence of addressing weights"""
         w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0).to(w_mean.dtype)
+        w_logvar = torch.clamp(w_logvar, min=-10.0, max=10.0)
         dkl = 0.5 * (torch.exp(w_logvar) + w_mean ** 2 - 1 - w_logvar)
-        return torch.sum(dkl, dim=-1)
+        dkl = torch.sum(dkl, dim=-1)
+        dkl = torch.nan_to_num(dkl, nan=0.0, posinf=1e6, neginf=-1e6)
+        return dkl
     
     def project_to_kv(self, z_retrieved):
         """
