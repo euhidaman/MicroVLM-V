@@ -381,4 +381,8 @@ class ScopeDetector(nn.Module):
         Returns:
             injection_prob: (batch_size, 1) probability of injecting memory
         """
+        # Convert MLP to match input dtype if needed
+        if context_embedding.dtype != next(self.mlp.parameters()).dtype:
+            self.mlp = self.mlp.to(context_embedding.dtype)
+        
         return self.mlp(context_embedding)
