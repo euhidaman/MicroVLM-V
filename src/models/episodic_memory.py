@@ -304,28 +304,44 @@ class EpisodicMemory(nn.Module):
         q_diag = torch.diagonal(U, dim1=-2, dim2=-1)
 
         # Clamp diagonals to avoid division by zero or log of non-positive values
-        p_diag = torch.clamp(p_diag, min=EPSILON)
-        q_diag = torch.clamp(q_diag, min=EPSILON)
+        p_diag = torch.clamp(p_diag, min=EPSILON, max=1e6)
+        q_diag = torch.clamp(q_diag, min=EPSILON, max=1e6)
         ratio = q_diag / p_diag
-        ratio = torch.clamp(ratio, min=EPSILON, max=1e6)
+        ratio = torch.clamp(ratio, min=EPSILON, max=1e3)
 
         t1 = self.code_size * torch.sum(ratio, dim=-1)
-        t2 = torch.sum((R - R_prior) ** 2 / p_diag.unsqueeze(-1), dim=[-2, -1])
+        t1 = torch.clamp(t1, min=-1e6, max=1e6)
+        
+        # Clamp the squared difference to prevent explosion
+        diff_sq = (R - R_prior) ** 2
+        diff_sq = torch.clamp(diff_sq, max=1e3)
+        t2 = torch.sum(diff_sq / p_diag.unsqueeze(-1), dim=[-2, -1])
+        t2 = torch.clamp(t2, min=-1e6, max=1e6)
+        
         t3 = -self.code_size * self.memory_size
+        
         log_term = torch.log(p_diag) - torch.log(q_diag)
+        log_term = torch.clamp(log_term, min=-10.0, max=10.0)
         t4 = self.code_size * torch.sum(log_term, dim=-1)
+        t4 = torch.clamp(t4, min=-1e6, max=1e6)
         
         dkl_M = torch.mean(t1 + t2 + t3 + t4)
-        dkl_M = torch.nan_to_num(dkl_M, nan=0.0, posinf=1e6, neginf=-1e6)
+        dkl_M = torch.clamp(dkl_M, min=-1e6, max=1e6)
         return dkl_M
     
     def _compute_addressing_kl(self, w_mean):
         """Compute KL divergence of addressing weights"""
+        w_mean = torch.clamp(w_mean, min=-1e3, max=1e3)
         w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0).to(w_mean.dtype)
         w_logvar = torch.clamp(w_logvar, min=-10.0, max=10.0)
-        dkl = 0.5 * (torch.exp(w_logvar) + w_mean ** 2 - 1 - w_logvar)
+        
+        exp_term = torch.exp(w_logvar)
+        exp_term = torch.clamp(exp_term, max=1e3)
+        
+        dkl = 0.5 * (exp_term + w_mean ** 2 - 1 - w_logvar)
+        dkl = torch.clamp(dkl, min=0.0, max=1e3)
         dkl = torch.sum(dkl, dim=-1)
-        dkl = torch.nan_to_num(dkl, nan=0.0, posinf=1e6, neginf=-1e6)
+        dkl = torch.clamp(dkl, min=0.0, max=1e6)
         return dkl
     
     def project_to_kv(self, z_retrieved):
