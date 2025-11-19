@@ -75,8 +75,12 @@ class EpisodicMemory(nn.Module):
     
     def _get_prior_params(self):
         """Get prior distribution parameters"""
-        prior_var = torch.ones(self.memory_size, device=self.memory_mean.device, dtype=self.memory_mean.dtype) * \
-                   torch.exp(self.memory_logvar) + EPSILON
+        dtype = self.memory_mean.dtype
+        device = self.memory_mean.device
+        logvar = torch.exp(self.memory_logvar).to(dtype=dtype, device=device)
+        ones = torch.ones(self.memory_size, device=device, dtype=dtype)
+        eps = torch.tensor(EPSILON, device=device, dtype=dtype)
+        prior_var = ones * logvar + eps
         prior_cov = torch.diag(prior_var)
         return self.memory_mean, prior_cov
     
@@ -298,7 +302,7 @@ class EpisodicMemory(nn.Module):
     
     def _compute_addressing_kl(self, w_mean):
         """Compute KL divergence of addressing weights"""
-        w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0)
+        w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0).to(w_mean.dtype)
         dkl = 0.5 * (torch.exp(w_logvar) + w_mean ** 2 - 1 - w_logvar)
         return torch.sum(dkl, dim=-1)
     
@@ -315,7 +319,12 @@ class EpisodicMemory(nn.Module):
         # Flatten episode and batch dimensions
         original_shape = z_retrieved.shape[:2]
         z_flat = z_retrieved.reshape(-1, self.code_size)
-        
+
+        # Ensure dtype/device match projection weights
+        weight = self.W_M.weight
+        if z_flat.dtype != weight.dtype or z_flat.device != weight.device:
+            z_flat = z_flat.to(device=weight.device, dtype=weight.dtype)
+
         # Project: (N, kv_total_dim)
         kv_projected = self.W_M(z_flat)
         
@@ -381,8 +390,10 @@ class ScopeDetector(nn.Module):
         Returns:
             injection_prob: (batch_size, 1) probability of injecting memory
         """
-        # Convert MLP to match input dtype if needed
-        if context_embedding.dtype != next(self.mlp.parameters()).dtype:
-            self.mlp = self.mlp.to(context_embedding.dtype)
+        current_param = next(self.mlp.parameters())
+        if (context_embedding.dtype != current_param.dtype or
+                context_embedding.device != current_param.device):
+            self.mlp = self.mlp.to(device=context_embedding.device,
+                                   dtype=context_embedding.dtype)
         
         return self.mlp(context_embedding)
