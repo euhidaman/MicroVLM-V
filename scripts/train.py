@@ -246,12 +246,15 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 if config.use_memory and wandb_logger and model.memory_state is not None:
                     # Ensure memory_state is valid tuple with data
                     if isinstance(model.memory_state, tuple) and len(model.memory_state) == 2 and model.memory_state[0] is not None:
-                        # Get current batch memory state
-                        z_for_memory = model.encode_text(input_ids[:4], attention_mask[:4])[0].mean(dim=1).unsqueeze(0)
-                        w_mean = model.episodic_memory._solve_w_mean(z_for_memory, model.memory_state[0])
+                        # Get batch size from memory state
+                        M_batch_size = model.memory_state[0].shape[0]
+                        # Use matching batch size for validation
+                        batch_size_for_vis = min(M_batch_size, len(input_ids))
+                        z_for_memory = model.encode_text(input_ids[:batch_size_for_vis], attention_mask[:batch_size_for_vis])[0].mean(dim=1).unsqueeze(0)
+                        w_mean = model.episodic_memory._solve_w_mean(z_for_memory, model.memory_state[0][:batch_size_for_vis])
                         
                         wandb_logger.log_memory_heatmap(
-                            model.memory_state, w_mean, global_step
+                            (model.memory_state[0][:batch_size_for_vis], model.memory_state[1][:batch_size_for_vis]), w_mean, global_step
                         )
             
             model.train()
