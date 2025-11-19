@@ -111,7 +111,7 @@ class SlicingUnivariateTest(nn.Module):
             # Generate random projections
             g = self._get_generator(x.device, seed)
             proj_shape = (x.size(-1), self.num_slices)
-            A = torch.randn(proj_shape, device=x.device, generator=g)
+            A = torch.randn(proj_shape, device=x.device, generator=g, dtype=x.dtype)
             A = A / A.norm(p=2, dim=0)  # Normalize
             
             self.global_step.add_(1)
