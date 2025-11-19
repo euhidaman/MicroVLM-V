@@ -341,6 +341,132 @@ class AttentionVisualizer(nn.Module):
     def clear_visualizations(self):
         """Clear stored visualizations"""
         self.visualizations = []
+    
+    def visualize_attention_grid(self, images, image_tokens, text_tokens, 
+                                attention_weights, save_path=None, 
+                                title="Text-Conditioned Attention Grid",
+                                num_images=3):
+        """
+        Create a grid visualization of images with attention heatmap overlays
+        Similar to LeJEPA style visualization
+        
+        Args:
+            images: (B, 3, H, W) tensor of images
+            image_tokens: (B, k_prefix, D) image token embeddings
+            text_tokens: (B, seq_len, D) text token embeddings  
+            attention_weights: (B, seq_len, k_prefix) attention from text to image tokens
+            save_path: path to save the grid image
+            title: title for the visualization
+            num_images: number of images to visualize (default: 3)
+        
+        Returns:
+            fig: matplotlib figure
+        """
+        # Select first num_images
+        num_images = min(num_images, images.size(0))
+        images = images[:num_images]
+        attention_weights = attention_weights[:num_images]
+        
+        # Convert images to numpy (denormalize if needed)
+        images_np = images.cpu().detach().numpy()
+        
+        # Denormalize from ImageNet mean/std
+        mean = np.array([0.485, 0.456, 0.406]).reshape(1, 3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225]).reshape(1, 3, 1, 1)
+        images_np = images_np * std + mean
+        images_np = np.clip(images_np, 0, 1)
+        
+        # Transpose to (B, H, W, C)
+        images_np = images_np.transpose(0, 2, 3, 1)
+        
+        # Get attention maps: average over text sequence dimension to get (B, k_prefix)
+        attention_maps = attention_weights.mean(dim=1).cpu().detach().numpy()  # (B, k_prefix)
+        
+        # Reshape attention to spatial grid
+        # Assuming k_prefix tokens come from a square grid of patches
+        k_prefix = attention_maps.shape[1]
+        grid_size = int(np.sqrt(k_prefix))
+        
+        if grid_size * grid_size != k_prefix:
+            # Not a perfect square, use closest approximation
+            # For DeiT-Tiny with 197 tokens (196 patches + 1 CLS), use 196 patches
+            if k_prefix == 197:
+                grid_size = 14  # 14x14 = 196
+                attention_maps = attention_maps[:, 1:]  # Remove CLS token
+            elif k_prefix == 196:
+                grid_size = 14
+            else:
+                grid_size = int(np.ceil(np.sqrt(k_prefix)))
+                # Pad if needed
+                pad_size = grid_size * grid_size - k_prefix
+                if pad_size > 0:
+                    attention_maps = np.pad(attention_maps, ((0, 0), (0, pad_size)), mode='constant')
+        
+        attention_maps = attention_maps.reshape(num_images, grid_size, grid_size)
+        
+        # Upsample attention maps to image resolution
+        H, W = images_np.shape[1:3]
+        attention_maps_upsampled = []
+        for i in range(num_images):
+            # Use bilinear interpolation to upsample
+            attn_tensor = torch.from_numpy(attention_maps[i]).unsqueeze(0).unsqueeze(0).float()
+            attn_upsampled = F.interpolate(attn_tensor, size=(H, W), mode='bilinear', align_corners=False)
+            attention_maps_upsampled.append(attn_upsampled.squeeze().numpy())
+        
+        attention_maps_upsampled = np.array(attention_maps_upsampled)
+        
+        # Create figure with 2 rows: original images and attention overlays
+        fig, axes = plt.subplots(2, num_images, figsize=(num_images * 4, 8))
+        
+        if num_images == 1:
+            axes = axes.reshape(2, 1)
+        
+        for i in range(num_images):
+            # Top row: original images
+            axes[0, i].imshow(images_np[i])
+            axes[0, i].axis('off')
+            if i == num_images // 2:
+                axes[0, i].set_title('Original Images', fontsize=12, fontweight='bold')
+            
+            # Bottom row: attention overlay
+            axes[1, i].imshow(images_np[i])
+            
+            # Create colorful attention overlay (like the example image)
+            attn = attention_maps_upsampled[i]
+            # Normalize attention to [0, 1]
+            attn_norm = (attn - attn.min()) / (attn.max() - attn.min() + 1e-8)
+            
+            # Apply colormap (use 'jet' for vibrant colors like the example)
+            im = axes[1, i].imshow(attn_norm, cmap='jet', alpha=0.6, 
+                                  interpolation='bilinear')
+            axes[1, i].axis('off')
+            if i == num_images // 2:
+                axes[1, i].set_title('Text-Conditioned Attention', fontsize=12, fontweight='bold')
+        
+        # Add colorbar
+        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.3])
+        cbar = fig.colorbar(im, cax=cbar_ax)
+        cbar.set_label('Attention Weight', rotation=270, labelpad=20)
+        
+        # Overall title
+        fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)
+        
+        plt.tight_layout(rect=[0, 0, 0.9, 0.96])
+        
+        if save_path:
+            Path(save_path).parent.mkdir(parents=True, exist_ok=True)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Attention grid visualization saved to {save_path}")
+        
+        self.visualizations.append({
+            'figure': fig,
+            'title': title,
+            'path': save_path
+        })
+        
+        plt.close()
+        
+        return fig
 
 
 def create_attention_visualizer(config):

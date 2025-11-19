@@ -373,6 +373,65 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 viz_save_interval = getattr(config, 'viz_save_interval', 5000)
                 num_viz_images = getattr(config, 'num_viz_images', 3)
                 
+                if global_step % viz_save_interval == 0 and visualizer:
+                    import random
+                    batch_size = images.shape[0]
+                    # Select first 3 images (or random if you prefer)
+                    num_samples = min(num_viz_images, batch_size)
+                    
+                    # Get first num_samples images
+                    selected_images = images[:num_samples]
+                    selected_input_ids = input_ids[:num_samples]
+                    selected_attention_mask = attention_mask[:num_samples]
+                    
+                    print(f"\n=== Enhanced Visualization at Step {global_step} ===")
+                    print(f"Generating attention grid for {num_samples} images...")
+                    
+                    # Encode all selected images and text
+                    selected_prefix, selected_img_feat = model.encode_image(selected_images)
+                    selected_text_emb, selected_text_feat = model.encode_text(
+                        selected_input_ids, selected_attention_mask
+                    )
+                    
+                    # Compute attention for all samples
+                    stats, attention = visualizer.analyze_cross_modal_attention(
+                        selected_prefix, selected_text_emb
+                    )
+                    
+                    # Create grid visualization with attention overlays
+                    grid_path = Path(config.output_dir) / "visualizations" / f"attention_grid_step_{global_step}.png"
+                    grid_fig = visualizer.visualize_attention_grid(
+                        images=selected_images,
+                        image_tokens=selected_prefix,
+                        text_tokens=selected_text_emb,
+                        attention_weights=attention,
+                        save_path=str(grid_path),
+                        title=f"Text-Conditioned Attention Grid (Step {global_step})",
+                        num_images=num_samples
+                    )
+                    
+                    print(f"  Grid visualization saved to {grid_path}")
+                    print(f"  Average attention entropy: {stats['attention_entropy']:.4f}")
+                    print(f"  Average attention sparsity: {stats['attention_sparsity']:.4f}")
+                    
+                    # Log to WandB if available
+                    if wandb_logger:
+                        wandb_logger.log_metrics({
+                            'enhanced_viz/attention_entropy': stats['attention_entropy'],
+                            'enhanced_viz/attention_sparsity': stats['attention_sparsity'],
+                            'enhanced_viz/divergence': stats['divergence_statistic']
+                        }, step=global_step)
+                        
+                        # Log the grid image
+                        import wandb
+                        if wandb_logger.wandb_run:
+                            wandb_logger.wandb_run.log({
+                                'enhanced_viz/attention_grid': wandb.Image(str(grid_path))
+                            }, step=global_step)
+                    
+                    print("=" * 60 + "\n")
+                
+                # Also keep individual visualizations for detailed analysis
                 if global_step % viz_save_interval == 0 and wandb_logger:
                     import random
                     batch_size = images.shape[0]
@@ -380,8 +439,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     num_samples = min(num_viz_images, batch_size)
                     random_indices = random.sample(range(batch_size), num_samples)
                     
-                    print(f"\n=== Enhanced Visualization at Step {global_step} ===")
-                    print(f"Visualizing {num_samples} random images with full attention analysis...")
+                    print(f"Generating individual attention visualizations...")
                     
                     for idx, img_idx in enumerate(random_indices):
                         # Get single image and text
