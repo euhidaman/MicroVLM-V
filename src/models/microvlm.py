@@ -203,6 +203,13 @@ class MicroVLM(nn.Module):
             if fused_embeddings.dtype != model_dtype:
                 fused_embeddings = fused_embeddings.to(model_dtype)
         
+        # Validate embeddings before forward pass
+        if torch.isnan(fused_embeddings).any() or torch.isinf(fused_embeddings).any():
+            import warnings
+            warnings.warn("NaN or Inf detected in fused embeddings before LM forward pass")
+            # Clamp to prevent propagation
+            fused_embeddings = torch.nan_to_num(fused_embeddings, nan=0.0, posinf=1e4, neginf=-1e4)
+        
         # Episodic memory processing
         if use_memory:
             # Reshape for episode processing
@@ -287,19 +294,30 @@ class MicroVLM(nn.Module):
         addressing_weight = _get_training_attr('addressing_kl_weight', 0.001)
         
         device = fused_embeddings.device
-        total_loss = torch.zeros((), device=device)
+        total_loss = None
         
-        if outputs.get('lm_loss') is not None:
-            total_loss = total_loss + lm_weight * outputs['lm_loss']
+        # LM loss (primary component)
+        if outputs.get('lm_loss') is not None and not torch.isnan(outputs['lm_loss']):
+            total_loss = lm_weight * outputs['lm_loss']
+        else:
+            # If LM loss is invalid, create a zero tensor with gradient
+            total_loss = torch.tensor(0.0, device=device, requires_grad=True)
         
+        # Add alignment loss if valid
         if 'alignment_loss' in outputs:
-            total_loss = total_loss + alignment_weight * outputs['alignment_loss']
+            align_loss = outputs['alignment_loss']
+            if not torch.isnan(align_loss) and not torch.isinf(align_loss):
+                total_loss = total_loss + alignment_weight * align_loss
         
+        # Add memory losses if valid
         if use_memory and 'memory_kl' in outputs:
-            total_loss = total_loss + memory_weight * outputs['memory_kl']
+            mem_kl = outputs['memory_kl']
+            if not torch.isnan(mem_kl) and not torch.isinf(mem_kl):
+                total_loss = total_loss + memory_weight * mem_kl
         
         if use_memory and 'addressing_kl' in outputs:
-            total_loss = total_loss + addressing_weight * outputs['addressing_kl']
+            addr_kl = outputs['addressing_kl']\n            if not torch.isnan(addr_kl) and not torch.isinf(addr_kl):
+                total_loss = total_loss + addressing_weight * addr_kl
         
         outputs['loss'] = total_loss
         

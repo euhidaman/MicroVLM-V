@@ -24,19 +24,19 @@ class TrainingConfig:
     # Training
     batch_size: int = 32
     num_epochs: int = 10
-    learning_rate: float = 1e-4
+    learning_rate: float = 5e-5
     warmup_steps: int = 1000
     weight_decay: float = 0.01
-    gradient_clip: float = 1.0
+    gradient_clip: float = 0.5
     
     # Episode settings for memory
     episode_size: int = 4
     
     # Loss weights
     lm_loss_weight: float = 1.0
-    alignment_loss_weight: float = 0.3
-    memory_kl_weight: float = 0.05
-    addressing_kl_weight: float = 0.01
+    alignment_loss_weight: float = 0.2
+    memory_kl_weight: float = 0.02
+    addressing_kl_weight: float = 0.005
     
     # Quantization
     use_4bit: bool = False

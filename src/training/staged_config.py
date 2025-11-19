@@ -30,10 +30,10 @@ class TrainingConfig:
     # Memory
     use_memory: bool = True
     episode_size: int = 1
-    memory_kl_weight: float = 0.05
-    addressing_kl_weight: float = 0.01
+    memory_kl_weight: float = 0.02
+    addressing_kl_weight: float = 0.005
     lm_loss_weight: float = 1.0
-    alignment_loss_weight: float = 0.3
+    alignment_loss_weight: float = 0.2
     
     # Alignment
     use_alignment: bool = True
@@ -133,8 +133,8 @@ class Stage2Config(TrainingConfig):
     memory_size: int = 512
     observation_noise_std: float = 0.000001
     pseudoinverse_steps: int = 15
-    memory_kl_weight: float = 0.05
-    addressing_kl_weight: float = 0.01
+    memory_kl_weight: float = 0.02
+    addressing_kl_weight: float = 0.005
     
     # Visualization
     visualize_interval: int = 100
