@@ -287,10 +287,11 @@ def create_optimizer(model, config):
 
 def create_scheduler(optimizer, config, total_steps):
     """Create learning rate scheduler"""
-    if config.scheduler == "cosine":
+    scheduler_name = getattr(config, 'scheduler', getattr(config, 'lr_scheduler', 'cosine'))
+    if scheduler_name == "cosine":
         from torch.optim.lr_scheduler import CosineAnnealingLR
         scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
-    elif config.scheduler == "linear":
+    elif scheduler_name == "linear":
         from torch.optim.lr_scheduler import LinearLR
         scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1, 
                            total_iters=total_steps)
