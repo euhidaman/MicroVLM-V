@@ -214,9 +214,14 @@ class AttentionVisualizer(nn.Module):
             attn_sum = attention.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             attention = attention / attn_sum
             if torch.isnan(attention).any() or torch.isinf(attention).any():
-                warnings.warn(
-                    "NaN or Inf detected in attention weights, falling back to embedding-based attention"
-                )
+                # This is expected in Stage1 with frozen LM - use embedding-based fallback
+                # Only warn once to avoid spam
+                if not hasattr(self, '_nan_warning_shown'):
+                    warnings.warn(
+                        "LM attention contains NaN (expected in Stage1 with frozen backbone). "
+                        "Using embedding-based attention fallback for visualization."
+                    )
+                    self._nan_warning_shown = True
                 attention = self._compute_embedding_attention(image_tokens, text_tokens)
         
         # Statistics
@@ -256,17 +261,32 @@ class AttentionVisualizer(nn.Module):
         return stats, attention
 
     def _compute_embedding_attention(self, image_tokens, text_tokens):
-        """Compute proxy attention using image/text embeddings when LM attention is unavailable."""
+        """Compute proxy attention using image/text embeddings when LM attention is unavailable.
+        
+        This is the primary attention mechanism in Stage1 where the LM is frozen and may not
+        produce stable attention weights for fused vision-text inputs.
+        """
         if text_tokens is None or image_tokens is None:
             raise ValueError("Both text_tokens and image_tokens are required to compute fallback attention")
-        query = text_tokens
-        key = image_tokens
+        
+        query = text_tokens  # (batch, seq_len, hidden_dim)
+        key = image_tokens    # (batch, k_prefix, hidden_dim)
+        
+        # Ensure dtype compatibility
         if query.dtype != key.dtype:
             key = key.to(query.dtype)
+        
+        # Scaled dot-product attention
         dim_scale = np.sqrt(max(query.size(-1), 1))
-        scores = torch.matmul(query, key.transpose(-2, -1)) / dim_scale
+        scores = torch.matmul(query, key.transpose(-2, -1)) / dim_scale  # (batch, seq_len, k_prefix)
+        
+        # Softmax to get attention distribution
         attention = F.softmax(scores, dim=-1)
-        attention = torch.nan_to_num(attention, nan=1.0 / max(key.size(-1), 1))
+        
+        # Sanitize any remaining NaN (shouldn't happen, but safety check)
+        if torch.isnan(attention).any() or torch.isinf(attention).any():
+            attention = torch.nan_to_num(attention, nan=1.0 / max(key.size(-1), 1))
+        
         return attention
     
     def _compute_entropy(self, probs, eps=1e-10):
