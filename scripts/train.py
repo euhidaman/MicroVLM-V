@@ -180,14 +180,22 @@ def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_na
 def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
     """Push model to HuggingFace Hub"""
     try:
-        # Get HF token from environment
+        # Get HF token from environment or huggingface_hub cache
         hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+        
+        # Try to get token from huggingface_hub if not in env
+        if not hf_token:
+            try:
+                from huggingface_hub import HfFolder
+                hf_token = HfFolder.get_token()
+            except:
+                pass
+        
         if not hf_token:
             print("⚠️  Warning: No HuggingFace token found.")
-            print("   Set HF_TOKEN environment variable to enable auto-push:")
-            print("   - Linux/Mac: export HF_TOKEN=your_token")
-            print("   - Windows: $env:HF_TOKEN=\"your_token\"")
-            print("   - Or get token from: https://huggingface.co/settings/tokens")
+            print("   Run: huggingface-cli login")
+            print("   Or set HF_TOKEN environment variable")
+            print("   Get token from: https://huggingface.co/settings/tokens")
             return False
         
         # Get repo config

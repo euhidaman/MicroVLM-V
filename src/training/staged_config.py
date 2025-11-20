@@ -146,16 +146,21 @@ class Stage2Config(TrainingConfig):
 @dataclass
 class TestConfig(TrainingConfig):
     """Quick test configuration for debugging"""
-    batch_size: int = 4
-    num_epochs: int = 1
-    learning_rate: float = 1e-4
+    batch_size: int = 8
+    num_epochs: int = 2
+    learning_rate: float = 5e-5
     use_memory: bool = True
     enable_quantization: bool = False  # Disable for faster testing
     log_interval: int = 10
-    visualize_interval: int = 20
-    viz_save_interval: int = 50
-    num_viz_images: int = 2
+    visualize_interval: int = 50
+    viz_save_interval: int = 200
+    num_viz_images: int = 3
     wandb_run_name: str = "test_run"
+    
+    # Limit to downloaded samples
+    data_dir: str = "./data/cc12m"
+    train_metadata: str = "train_metadata.json"
+    val_metadata: str = "val_metadata.json"
 
 
 @dataclass
