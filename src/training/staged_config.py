@@ -22,6 +22,7 @@ class TrainingConfig:
     batch_size: int = 8
     num_workers: int = 4
     max_samples: Optional[int] = None
+    max_val_samples: Optional[int] = None
     
     # Computed paths (will be set from data_dir)
     @property
@@ -176,6 +177,7 @@ class TestConfig(TrainingConfig):
     
     # Limit to 5000 samples for quick testing
     max_samples: int = 5000
+    max_val_samples: int = 5000
     
     # Override output dir for test
     output_dir: str = "./checkpoints"

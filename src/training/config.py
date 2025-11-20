@@ -20,6 +20,7 @@ class TrainingConfig:
     train_metadata_file: str = "./data/cc12m/train_metadata.json"
     val_metadata_file: str = "./data/cc12m/val_metadata.json"
     max_samples: Optional[int] = None  # None for full dataset
+    max_val_samples: Optional[int] = None
     
     # Training
     batch_size: int = 32
@@ -85,7 +86,8 @@ class SmallScaleTestConfig(TrainingConfig):
     
     train_metadata_file: str = "./data/cc12m/train_metadata.json"
     val_metadata_file: str = "./data/cc12m/val_metadata.json"
-    max_samples: int = None  # Use all downloaded images
+    max_samples: int = 5000  # Limit for quick validation runs
+    max_val_samples: int = 5000
     batch_size: int = 16
     num_epochs: int = 5
     log_interval: int = 10

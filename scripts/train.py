@@ -946,7 +946,8 @@ def main():
         tokenizer=model.language_model.tokenizer,
         batch_size=config.batch_size,
         num_workers=config.num_workers,
-        max_samples=config.max_samples
+        max_samples=config.max_samples,
+        max_val_samples=getattr(config, 'max_val_samples', None)
     )
     
     # Create optimizer and scheduler

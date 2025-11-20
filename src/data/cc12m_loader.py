@@ -283,7 +283,7 @@ def create_small_test_dataset(metadata_file, output_metadata, num_samples=1000):
 
 
 def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer, 
-                       batch_size=32, num_workers=4, max_samples=None):
+                       batch_size=32, num_workers=4, max_samples=None, max_val_samples=None):
     """
     Create train and validation dataloaders
     
@@ -308,7 +308,7 @@ def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer,
     val_dataset = CC12MDataset(
         metadata_file=val_metadata_file,
         tokenizer=tokenizer,
-        max_samples=None  # Use all validation data
+        max_samples=max_val_samples
     )
     
     # Create loaders
