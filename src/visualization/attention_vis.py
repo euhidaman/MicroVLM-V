@@ -4,6 +4,7 @@ Integrates LeJEPA statistical testing for attention analysis
 """
 
 import os
+import warnings
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -203,17 +204,7 @@ class AttentionVisualizer(nn.Module):
         batch_size = image_tokens.size(0)
         
         if attention_weights is None:
-            # Compute approximate attention from embeddings if true weights not provided
-            query = text_tokens  # (B, seq_len, D)
-            key = image_tokens  # (B, k_prefix, D)
-            
-            # Ensure dtype consistency for matmul
-            if query.dtype != key.dtype:
-                key = key.to(query.dtype)
-            
-            scores = torch.matmul(query, key.transpose(-2, -1))
-            scores = scores / np.sqrt(query.size(-1))
-            attention = F.softmax(scores, dim=-1)  # (B, seq_len, k_prefix)
+            attention = self._compute_embedding_attention(image_tokens, text_tokens)
         else:
             attention = attention_weights
             if attention.dim() == 4:
@@ -222,12 +213,11 @@ class AttentionVisualizer(nn.Module):
             # Renormalize over prefix tokens to interpret as probability
             attn_sum = attention.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             attention = attention / attn_sum
-        
-        # Check for NaN/Inf and sanitize
-        if torch.isnan(attention).any() or torch.isinf(attention).any():
-            import warnings
-            warnings.warn("NaN or Inf detected in attention weights, using uniform distribution")
-            attention = torch.ones_like(attention) / attention.size(-1)
+            if torch.isnan(attention).any() or torch.isinf(attention).any():
+                warnings.warn(
+                    "NaN or Inf detected in attention weights, falling back to embedding-based attention"
+                )
+                attention = self._compute_embedding_attention(image_tokens, text_tokens)
         
         # Statistics
         entropy = self._compute_entropy(attention)
@@ -264,6 +254,18 @@ class AttentionVisualizer(nn.Module):
         stats['divergence_statistic'] = test_stat.item()
         
         return stats, attention
+        """Compute proxy attention using image/text embeddings when LM attention is unavailable."""
+        if text_tokens is None or image_tokens is None:
+            raise ValueError("Both text_tokens and image_tokens are required to compute fallback attention")
+        query = text_tokens
+        key = image_tokens
+        if query.dtype != key.dtype:
+            key = key.to(query.dtype)
+        dim_scale = np.sqrt(max(query.size(-1), 1))
+        scores = torch.matmul(query, key.transpose(-2, -1)) / dim_scale
+        attention = F.softmax(scores, dim=-1)
+        attention = torch.nan_to_num(attention, nan=1.0 / key.size(-1))
+        return attention
     
     def _compute_entropy(self, probs, eps=1e-10):
         """Compute entropy of probability distribution"""
