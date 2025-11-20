@@ -277,7 +277,23 @@ class MicroVLM(nn.Module):
             return_dict=True
         )
         
-        outputs['lm_loss'] = lm_outputs.loss
+        # Validate LM loss before assignment
+        if lm_outputs.loss is not None and (torch.isnan(lm_outputs.loss) or torch.isinf(lm_outputs.loss)):
+            # Debug: print what caused NaN
+            if torch.isnan(fused_embeddings).any():
+                print(f"⚠️  NaN in fused_embeddings despite sanitization")
+            if adjusted_labels is not None:
+                if torch.isnan(adjusted_labels.float()).any():
+                    print(f"⚠️  NaN in adjusted_labels")
+                # Check label range
+                valid_labels = adjusted_labels[adjusted_labels != -100]
+                if len(valid_labels) > 0:
+                    if valid_labels.min() < 0 or valid_labels.max() >= self.language_model.vocab_size:
+                        print(f"⚠️  Invalid label range: [{valid_labels.min()}, {valid_labels.max()}] (vocab: {self.language_model.vocab_size})")
+            outputs['lm_loss'] = None
+        else:
+            outputs['lm_loss'] = lm_outputs.loss
+        
         outputs['logits'] = lm_outputs.logits
         outputs['hidden_states'] = lm_outputs.hidden_states
         

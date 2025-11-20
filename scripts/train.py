@@ -484,10 +484,12 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         
         # Update progress bar
         lm_loss_display = outputs.get('lm_loss')
-        lm_display_val = 'nan'
-        if lm_loss_display is not None:
-            if not torch.isnan(lm_loss_display):
-                lm_display_val = f"{lm_loss_display.item():.3f}"
+        if lm_loss_display is None:
+            lm_display_val = 'none'
+        elif torch.isnan(lm_loss_display) or torch.isinf(lm_loss_display):
+            lm_display_val = 'nan'
+        else:
+            lm_display_val = f"{lm_loss_display.item():.3f}"
         
         pbar.set_postfix({
             'loss': f"{loss.item():.3f}",
