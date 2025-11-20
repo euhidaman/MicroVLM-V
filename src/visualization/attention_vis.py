@@ -254,6 +254,8 @@ class AttentionVisualizer(nn.Module):
         stats['divergence_statistic'] = test_stat.item()
         
         return stats, attention
+
+    def _compute_embedding_attention(self, image_tokens, text_tokens):
         """Compute proxy attention using image/text embeddings when LM attention is unavailable."""
         if text_tokens is None or image_tokens is None:
             raise ValueError("Both text_tokens and image_tokens are required to compute fallback attention")
@@ -264,7 +266,7 @@ class AttentionVisualizer(nn.Module):
         dim_scale = np.sqrt(max(query.size(-1), 1))
         scores = torch.matmul(query, key.transpose(-2, -1)) / dim_scale
         attention = F.softmax(scores, dim=-1)
-        attention = torch.nan_to_num(attention, nan=1.0 / key.size(-1))
+        attention = torch.nan_to_num(attention, nan=1.0 / max(key.size(-1), 1))
         return attention
     
     def _compute_entropy(self, probs, eps=1e-10):
