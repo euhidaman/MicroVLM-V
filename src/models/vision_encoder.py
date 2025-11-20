@@ -57,7 +57,11 @@ class DeiTVisionEncoder(nn.Module):
             batch_first=True,
             norm_first=False
         )
-        self.transformer = nn.TransformerEncoder(encoder_layer, num_layers=12)
+        self.transformer = nn.TransformerEncoder(
+            encoder_layer, 
+            num_layers=12,
+            enable_nested_tensor=False  # Disable to avoid warning with odd nhead
+        )
         
         # Layer norm
         self.norm = nn.LayerNorm(self.hidden_size)

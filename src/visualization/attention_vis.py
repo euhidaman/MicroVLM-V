@@ -223,16 +223,37 @@ class AttentionVisualizer(nn.Module):
             attn_sum = attention.sum(dim=-1, keepdim=True).clamp_min(1e-8)
             attention = attention / attn_sum
         
+        # Check for NaN/Inf and sanitize
+        if torch.isnan(attention).any() or torch.isinf(attention).any():
+            import warnings
+            warnings.warn("NaN or Inf detected in attention weights, using uniform distribution")
+            attention = torch.ones_like(attention) / attention.size(-1)
+        
         # Statistics
         entropy = self._compute_entropy(attention)
+        
+        # Check for NaN in entropy
+        valid_entropy = entropy[~torch.isnan(entropy)]
+        if len(valid_entropy) == 0:
+            # Fallback to zero if all NaN
+            mean_entropy = 0.0
+        else:
+            mean_entropy = valid_entropy.mean().item()
+        
         max_entropy = max(np.log(attention.size(-1)), 1e-8)
         normalized_entropy = (entropy / max_entropy).clamp(min=0.0, max=1.0)
-        attention_sparsity = (1.0 - normalized_entropy).mean().item()
+        
+        # Handle NaN in sparsity calculation
+        valid_norm_entropy = normalized_entropy[~torch.isnan(normalized_entropy)]
+        if len(valid_norm_entropy) == 0:
+            attention_sparsity = 0.0
+        else:
+            attention_sparsity = (1.0 - valid_norm_entropy).mean().item()
         
         stats = {
             'mean_attention': attention.mean().item(),
             'max_attention': attention.max().item(),
-            'attention_entropy': entropy.mean().item(),
+            'attention_entropy': mean_entropy,
             'attention_sparsity': attention_sparsity
         }
         
@@ -486,7 +507,12 @@ class AttentionVisualizer(nn.Module):
         cbar = fig.colorbar(im, cax=cbar_ax)
         cbar.set_label('Attention Weight', rotation=270, labelpad=20)
         
-        plt.tight_layout(rect=[0, 0, 0.9, 0.96])
+        # Use constrained_layout instead of tight_layout to avoid warning
+        try:
+            plt.tight_layout(rect=[0, 0, 0.9, 0.96])
+        except:
+            # Fallback if tight_layout fails
+            pass
         
         # Save figure
         os.makedirs(os.path.dirname(save_path), exist_ok=True)

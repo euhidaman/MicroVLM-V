@@ -12,6 +12,8 @@ class TrainingConfig:
     # Model paths
     vision_checkpoint: Optional[str] = None
     language_checkpoint: Optional[str] = "Qwen/Qwen2.5-0.5B"
+    qwen_model: str = "Qwen/Qwen2.5-0.5B"  # Alias for compatibility
+    deit_checkpoint: Optional[str] = None
     
     # Data
     data_dir: str = "./data/cc12m"
@@ -19,6 +21,16 @@ class TrainingConfig:
     val_metadata: str = "val_metadata.json"
     batch_size: int = 8
     num_workers: int = 4
+    max_samples: Optional[int] = None
+    
+    # Computed paths (will be set from data_dir)
+    @property
+    def train_metadata_file(self):
+        return f"{self.data_dir}/{self.train_metadata}"
+    
+    @property
+    def val_metadata_file(self):
+        return f"{self.data_dir}/{self.val_metadata}"
     
     # Training
     num_epochs: int = 5
@@ -64,7 +76,12 @@ class TrainingConfig:
     # WandB
     use_wandb: bool = True
     wandb_project: str = "MicroVLM-V"
+    wandb_username: str = "aman-derax20"
     wandb_run_name: Optional[str] = None
+    
+    # HuggingFace
+    hf_username: str = "euhidaman"
+    hf_repo_name: str = "MicroVLM-V"
     
     # Paths
     output_dir: str = "./checkpoints"
@@ -157,8 +174,12 @@ class TestConfig(TrainingConfig):
     num_viz_images: int = 3
     wandb_run_name: str = "test_run"
     
-    # Limit to 5000 samples for testing
-    data_dir: str = "./data/cc12m"
+    # Limit to 5000 samples for quick testing
+    max_samples: int = 5000
+    
+    # Override output dir for test
+    output_dir: str = "./checkpoints"
+    device: str = "cuda"
     train_metadata: str = "train_metadata.json"
     val_metadata: str = "val_metadata.json"
     max_samples: int = 5000
