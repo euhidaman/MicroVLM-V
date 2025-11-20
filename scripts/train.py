@@ -459,9 +459,21 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         optimizer.zero_grad()
         loss.backward()
         
+        # Compute gradient norm before clipping
+        total_norm = 0.0
+        for p in model.parameters():
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2)
+                total_norm += param_norm.item() ** 2
+        total_norm = total_norm ** 0.5
+        
         # Gradient clipping
         if config.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+        
+        # Log gradient norm periodically
+        if global_step % 100 == 0:
+            print(f"\n  [Step {global_step}] Gradient norm: {total_norm:.4f}")
         
         optimizer.step()
         
@@ -492,9 +504,17 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         else:
             lm_display_val = f"{lm_loss_display.item():.3f}"
         
+        # Show alignment loss if present (critical for Stage1)
+        align_loss_display = outputs.get('alignment_loss')
+        if align_loss_display is not None:
+            align_display_val = f"{align_loss_display.item():.3f}"
+        else:
+            align_display_val = 'none'
+        
         pbar.set_postfix({
             'loss': f"{loss.item():.3f}",
             'lm': lm_display_val,
+            'align': align_display_val,
             'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
         })
         
@@ -952,6 +972,15 @@ def main():
         max_samples=config.max_samples,
         max_val_samples=getattr(config, 'max_val_samples', None)
     )
+    
+    # Validate first batch to check data quality
+    print("\nValidating first training batch...")
+    first_batch = next(iter(train_loader))
+    print(f"  Image shape: {first_batch['image'].shape}")
+    print(f"  Input IDs shape: {first_batch['input_ids'].shape}")
+    print(f"  Caption samples: {first_batch['caption'][:2]}")
+    print(f"  Caption lengths: min={first_batch['attention_mask'].sum(dim=1).min().item()}, max={first_batch['attention_mask'].sum(dim=1).max().item()}")
+    del first_batch
     
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)

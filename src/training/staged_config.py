@@ -38,7 +38,7 @@ class TrainingConfig:
     learning_rate: float = 1e-4
     warmup_steps: int = 1000
     weight_decay: float = 0.01
-    gradient_clip: float = 1.0
+    gradient_clip: float = 0.5
     
     # Memory
     use_memory: bool = True
@@ -46,7 +46,7 @@ class TrainingConfig:
     memory_kl_weight: float = 0.02
     addressing_kl_weight: float = 0.005
     lm_loss_weight: float = 1.0
-    alignment_loss_weight: float = 0.2
+    alignment_loss_weight: float = 1.0
     
     # Alignment
     use_alignment: bool = True
@@ -98,11 +98,13 @@ class Stage1Config(TrainingConfig):
     """
     # Override defaults for Stage 1
     use_memory: bool = False  # Disable memory in Stage 1
-    num_epochs: int = 3
-    learning_rate: float = 3e-4  # Higher LR for adapter training
-    warmup_steps: int = 500
+    num_epochs: int = 15  # Increased for stable alignment convergence
+    learning_rate: float = 5e-5  # Lower LR for contrastive learning stability
+    warmup_steps: int = 3000  # ~5-10% of total steps for gradual warmup
     batch_size: int = 64
     num_workers: int = 12
+    gradient_clip: float = 0.3  # Tighter clipping for alignment-only training
+    alignment_loss_weight: float = 1.0  # Full weight since it's the only loss
     
     # Adapter-focused training
     freeze_vision: bool = True
