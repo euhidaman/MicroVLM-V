@@ -14,7 +14,7 @@ from pathlib import Path
 import argparse
 from tqdm import tqdm
 import wandb
-from huggingface_hub import HfApi, create_repo, upload_folder
+from huggingface_hub import HfApi, create_repo, upload_file
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
@@ -177,8 +177,285 @@ def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_na
     
     return checkpoint_path, stats
 
-def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
-    """Push model to HuggingFace Hub"""
+def generate_model_card(stats, epoch, total_epochs, stage_name, config, training_history=None):
+    """Generate comprehensive model card with technical details and training progress"""
+    
+    # Helper to format large numbers
+    def format_params(n):
+        if n >= 1e9:
+            return f"{n/1e9:.2f}B"
+        elif n >= 1e6:
+            return f"{n/1e6:.2f}M"
+        elif n >= 1e3:
+            return f"{n/1e3:.2f}K"
+        return str(n)
+    
+    # Calculate percentages
+    total = stats.get('total_parameters', 0)
+    vision_pct = 100.0 * stats.get('vision_total_params', 0) / total if total > 0 else 0
+    lang_pct = 100.0 * stats.get('language_total_params', 0) / total if total > 0 else 0
+    adapter_pct = 100.0 * stats.get('adapter_total_params', 0) / total if total > 0 else 0
+    memory_pct = 100.0 * stats.get('memory_total_params', 0) / total if total > 0 else 0
+    
+    card = f"""---
+license: apache-2.0
+tags:
+- vision-language
+- multimodal
+- episodic-memory
+- 1.58-bit
+- pytorch
+library_name: transformers
+---
+
+# MicroVLM-V: Vision-Language Model with Episodic Memory
+
+## 🔄 Training Progress: {stage_name}
+
+**Current Status:** Epoch {epoch}/{total_epochs}
+
+> ⚠️ **Note:** This repository contains ONLY the latest checkpoint. Each epoch overwrites previous weights.
+
+---
+
+## 📊 Model Architecture
+
+### Parameter Distribution
+
+| Component | Total Parameters | Trainable | Percentage |
+|-----------|-----------------|-----------|------------|
+| **Total Model** | **{format_params(total)}** | **{format_params(stats.get('trainable_parameters', 0))}** | **{stats.get('trainable_percentage', 0):.1f}%** |
+| Vision Encoder | {format_params(stats.get('vision_total_params', 0))} | {format_params(stats.get('vision_trainable_params', 0))} | {vision_pct:.1f}% |
+| Language Model | {format_params(stats.get('language_total_params', 0))} | {format_params(stats.get('language_trainable_params', 0))} | {lang_pct:.1f}% |
+| Multimodal Adapter | {format_params(stats.get('adapter_total_params', 0))} | {format_params(stats.get('adapter_trainable_params', 0))} | {adapter_pct:.1f}% |
+| Episodic Memory | {format_params(stats.get('memory_total_params', 0))} | {format_params(stats.get('memory_trainable_params', 0))} | {memory_pct:.1f}% |
+
+### Technical Specifications
+
+- **Vision Encoder:** DeiT-Tiny (192-dim embeddings)
+  - Quantization: {'4-bit' if stats.get('vision_4bit_quantized') else 'FP16'}
+  - Status: {'Frozen' if stats.get('vision_frozen_params', 0) > 0 else 'Trainable'}
+  
+- **Language Model:** Qwen2.5-0.5B (896-dim embeddings)
+  - Quantization: {'4-bit' if stats.get('language_4bit_quantized') else 'FP16'}
+  - Trainable Layers: {stats.get('language_trainable_params', 0) // 1000}K params
+  
+- **Multimodal Adapter:**
+  - Architecture: Linear projection + Layer Norm
+  - Mapping: 192-dim (vision) → 896-dim (language)
+  - Parameters: {format_params(stats.get('adapter_total_params', 0))}
+  
+- **Episodic Memory:**
+  - Type: BitLinear 1.58-bit quantized
+  - Quantization: {'Enabled' if stats.get('memory_158bit_quantized') else 'Disabled'}
+  - Parameters: {format_params(stats.get('memory_total_params', 0))}
+
+### Model Size
+
+- **Estimated Size:** {stats.get('estimated_model_size_mb', 0):.2f} MB
+- **Memory Footprint:** ~{stats.get('estimated_model_size_mb', 0) * 1.5:.0f} MB (with activation)
+
+---
+
+## 🎯 Training Methodology
+
+### {stage_name} Configuration
+
+"""
+    
+    # Add stage-specific details
+    if 'Stage 1' in stage_name or 'stage1' in stage_name.lower():
+        card += f"""**Focus:** Contrastive alignment learning (vision ↔ language)
+
+**Training Strategy:**
+- Vision encoder: **Frozen** (pretrained DeiT weights preserved)
+- Language model: **Frozen** (pretrained Qwen weights preserved)  
+- Multimodal adapter: **Trainable** (learning alignment mapping)
+- Episodic memory: **Disabled** (not used in Stage 1)
+
+**Loss Function:** Contrastive alignment loss only
+- Aligns vision and language embeddings in shared space
+- InfoNCE-style loss for image-text matching
+
+"""
+    elif 'Stage 2' in stage_name or 'stage2' in stage_name.lower():
+        card += f"""**Focus:** Episodic memory integration
+
+**Training Strategy:**
+- Vision encoder: **Frozen**
+- Language model: **Partially unfrozen** (last 2 layers)
+- Multimodal adapter: **Trainable** (initialized from Stage 1)
+- Episodic memory: **Enabled** (1.58-bit quantization)
+
+**Loss Function:** Alignment + Memory losses
+- Continues alignment refinement
+- Adds memory read/write/retrieval objectives
+
+"""
+    elif 'Stage 3' in stage_name or 'stage3' in stage_name.lower():
+        card += f"""**Focus:** Full fine-tuning with all components
+
+**Training Strategy:**
+- Vision encoder: **Frozen** (preserves pretrained features)
+- Language model: **Fully unfrozen** (all layers trainable)
+- Multimodal adapter: **Trainable**
+- Episodic memory: **Enabled** (1.58-bit quantization)
+
+**Loss Function:** Language modeling + Alignment + Memory
+- Full next-token prediction
+- Maintains vision-language alignment
+- Memory-enhanced generation
+
+"""
+    
+    card += f"""**Hyperparameters:**
+- Learning Rate: {getattr(config, 'learning_rate', 'N/A')}
+- Batch Size: {getattr(config, 'batch_size', 'N/A')}
+- Warmup Steps: {getattr(config, 'warmup_steps', 'N/A')}
+- Gradient Clipping: {getattr(config, 'gradient_clip', 'N/A')}
+- Optimizer: {getattr(config, 'optimizer', 'adamw').upper()}
+- Scheduler: {getattr(config, 'scheduler', getattr(config, 'lr_scheduler', 'cosine'))}
+
+**Hardware:**
+- GPU: NVIDIA RTX 6000 Ada (48GB)
+- Precision: Mixed FP16/FP32
+- Distributed: Single GPU
+
+---
+
+## 📈 Training Statistics (Epoch {epoch})
+
+"""
+    
+    # Add training history if available
+    if training_history and len(training_history) > 0:
+        latest = training_history[-1]
+        card += f"""**Latest Metrics:**
+- Training Loss: {latest.get('train_loss', 'N/A'):.4f}
+- Alignment Loss: {latest.get('alignment_loss', 'N/A'):.4f}
+- Learning Rate: {latest.get('learning_rate', 'N/A'):.2e}
+- Gradient Norm: {latest.get('gradient_norm', 'N/A'):.4f}
+
+"""
+    
+    card += f"""**Timestamp:** {datetime.now().strftime('%Y-%m-%d %H:%M:%S UTC')}
+
+---
+
+## 💻 Usage
+
+### Loading the Model
+
+```python
+import torch
+from pathlib import Path
+
+# Download model weights
+checkpoint = torch.load('model.pt', map_location='cpu')
+
+# Load model state
+model.load_state_dict(checkpoint['model_state_dict'])
+model.eval()
+
+# Move to GPU if available
+device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+model = model.to(device)
+```
+
+### Inference Example
+
+```python
+from PIL import Image
+import torchvision.transforms as transforms
+
+# Prepare image
+image = Image.open('example.jpg').convert('RGB')
+transform = transforms.Compose([
+    transforms.Resize((224, 224)),
+    transforms.ToTensor(),
+    transforms.Normalize(mean=[0.485, 0.456, 0.406],
+                       std=[0.229, 0.224, 0.225])
+])
+image_tensor = transform(image).unsqueeze(0).to(device)
+
+# Prepare text
+text = "A photo of a cat"
+tokens = tokenizer(text, return_tensors='pt', padding=True).to(device)
+
+# Forward pass
+with torch.no_grad():
+    outputs = model(
+        images=image_tensor,
+        input_ids=tokens['input_ids'],
+        attention_mask=tokens['attention_mask']
+    )
+```
+
+### Model Input/Output Format
+
+**Inputs:**
+- `images`: Tensor [B, 3, 224, 224] - RGB images normalized
+- `input_ids`: Tensor [B, seq_len] - Tokenized text
+- `attention_mask`: Tensor [B, seq_len] - Attention mask
+
+**Outputs:**
+- `lm_loss`: Language modeling loss (if labels provided)
+- `alignment_loss`: Vision-language alignment loss
+- `memory_loss`: Episodic memory loss (Stage 2/3 only)
+- `logits`: Next token predictions [B, seq_len, vocab_size]
+
+---
+
+## ⚙️ Requirements
+
+```bash
+pip install torch>=2.0.0
+pip install transformers>=4.30.0
+pip install timm  # For DeiT vision encoder
+pip install Pillow  # For image processing
+```
+
+---
+
+## 📜 License
+
+Apache 2.0 License
+
+---
+
+## 🔗 Links
+
+- **GitHub Repository:** [euhidaman/MicroVLM-V](https://github.com/euhidaman/MicroVLM-V)
+- **Paper:** Coming soon
+- **Demo:** Coming soon
+
+---
+
+## ⚠️ Limitations
+
+- **Training in Progress:** This model is still under active training
+- **Checkpoint Volatility:** Only latest epoch is preserved - download if needed
+- **Stage-Specific:** Capabilities depend on training stage
+  - Stage 1: Alignment only, no generation
+  - Stage 2: Basic generation with memory
+  - Stage 3: Full capabilities
+
+---
+
+## 📧 Contact
+
+For questions or issues, please open an issue on GitHub.
+
+---
+
+*Last updated: Epoch {epoch}/{total_epochs} - {datetime.now().strftime('%Y-%m-%d')}*
+"""
+    
+    return card
+
+
+def push_to_huggingface(checkpoint_path, stats, epoch, total_epochs, stage_name, config, training_history=None):
+    """Push ONLY latest model weights and statistics to HuggingFace Hub (replaces previous)"""
     try:
         # Get HF token from environment or huggingface_hub cache
         hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
@@ -203,7 +480,8 @@ def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
         username = getattr(config, 'hf_username', 'euhidaman')
         repo_id = f"{username}/{repo_name}"
         
-        print(f"\n🤗 Pushing to HuggingFace: {repo_id}")
+        print(f"\n🤗 Uploading latest checkpoint to HuggingFace: {repo_id}")
+        print(f"   📝 This will REPLACE previous epoch files")
         
         # Create repo if it doesn't exist
         api = HfApi()
@@ -213,26 +491,79 @@ def push_to_huggingface(checkpoint_dir, epoch, stage_name, config):
         except Exception as e:
             print(f"   ℹ Repository check: {e}")
         
-        # Commit message
-        commit_message = f"{stage_name}: epoch {epoch} checkpoint"
+        # Generate comprehensive model card
+        model_card = generate_model_card(stats, epoch, total_epochs, stage_name, config, training_history)
         
-        # Upload checkpoint folder
-        print(f"   ⏳ Uploading checkpoint files...")
-        api.upload_folder(
-            folder_path=str(checkpoint_dir),
+        # Save model card locally
+        readme_path = Path(checkpoint_path).parent / "README.md"
+        with open(readme_path, 'w', encoding='utf-8') as f:
+            f.write(model_card)
+        print(f"   ✓ Generated comprehensive model card")
+        
+        # Save statistics to JSON with consistent filename
+        stats_json_path = Path(checkpoint_path).parent / "statistics.json"
+        with open(stats_json_path, 'w') as f:
+            json.dump({
+                **stats,
+                'epoch': epoch,
+                'total_epochs': total_epochs,
+                'stage': stage_name,
+                'timestamp': datetime.now().isoformat(),
+                'training_history': training_history[-10:] if training_history else []  # Last 10 epochs
+            }, f, indent=2)
+        print(f"   ✓ Prepared statistics.json")
+        
+        # Create temporary model.pt (copy of checkpoint with consistent name)
+        model_pt_path = Path(checkpoint_path).parent / "model.pt"
+        import shutil
+        shutil.copy(checkpoint_path, model_pt_path)
+        
+        # Upload files sequentially (will replace previous versions)
+        commit_message = f"{stage_name}: Epoch {epoch}/{total_epochs} - Latest checkpoint"
+        
+        print(f"   ⏳ Uploading model.pt...")
+        api.upload_file(
+            path_or_fileobj=str(model_pt_path),
+            path_in_repo="model.pt",
             repo_id=repo_id,
             repo_type="model",
             commit_message=commit_message,
             token=hf_token
         )
         
-        print(f"   ✅ Successfully pushed!")
+        print(f"   ⏳ Uploading statistics.json...")
+        api.upload_file(
+            path_or_fileobj=str(stats_json_path),
+            path_in_repo="statistics.json",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+        
+        print(f"   ⏳ Uploading README.md...")
+        api.upload_file(
+            path_or_fileobj=str(readme_path),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+        
+        # Cleanup temporary files
+        model_pt_path.unlink(missing_ok=True)
+        
+        print(f"   ✅ Successfully uploaded latest checkpoint!")
         print(f"   📝 Commit: \"{commit_message}\"")
         print(f"   🔗 View at: https://huggingface.co/{repo_id}")
+        print(f"   ℹ️  Repository contains ONLY epoch {epoch} (previous epochs replaced)")
         return True
         
     except Exception as e:
         print(f"❌ Error pushing to HuggingFace: {e}")
+        import traceback
+        traceback.print_exc()
         print("   Continuing training...")
         return False
 
@@ -1002,6 +1333,9 @@ def main():
     # Training loop
     print(f"Starting training for {config.num_epochs} epochs...")
     
+    # Track training history for model card
+    training_history = []
+    
     for epoch in range(start_epoch, config.num_epochs):
         avg_loss, global_step = train_epoch(
             model=model,
@@ -1030,13 +1364,29 @@ def main():
             model, optimizer, epoch, global_step, config, stage_name
         )
         
+        # Add to training history (for model card)
+        training_history.append({
+            'epoch': epoch,
+            'train_loss': avg_loss,
+            'alignment_loss': stats.get('alignment_loss', 0),
+            'learning_rate': optimizer.param_groups[0]['lr'],
+            'gradient_norm': stats.get('gradient_norm', 0)
+        })
+        
         # Log statistics to WandB
         if wandb_logger:
             wandb_logger.log_metrics(stats, step=global_step, prefix="model_stats")
         
-        # Push to HuggingFace
-        checkpoint_dir = Path(config.output_dir) / "checkpoints"
-        push_to_huggingface(checkpoint_dir, epoch, stage_name, config)
+        # Push ONLY latest checkpoint to HuggingFace (replaces previous)
+        push_to_huggingface(
+            checkpoint_path=checkpoint_path,
+            stats=stats,
+            epoch=epoch,
+            total_epochs=config.num_epochs,
+            stage_name=stage_name,
+            config=config,
+            training_history=training_history
+        )
     
     # Final save
     final_path = Path(config.output_dir) / "final_model.pt"
