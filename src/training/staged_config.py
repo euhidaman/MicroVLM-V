@@ -19,8 +19,8 @@ class TrainingConfig:
     data_dir: str = "./data/cc12m"
     train_metadata: str = "train_metadata.json"
     val_metadata: str = "val_metadata.json"
-    batch_size: int = 8
-    num_workers: int = 4
+    batch_size: int = 64
+    num_workers: int = 12
     max_samples: Optional[int] = None
     max_val_samples: Optional[int] = None
     
@@ -101,6 +101,8 @@ class Stage1Config(TrainingConfig):
     num_epochs: int = 3
     learning_rate: float = 3e-4  # Higher LR for adapter training
     warmup_steps: int = 500
+    batch_size: int = 64
+    num_workers: int = 12
     
     # Adapter-focused training
     freeze_vision: bool = True
@@ -108,10 +110,10 @@ class Stage1Config(TrainingConfig):
     train_adapter_only: bool = True
     unfreeze_last_n_layers: int = 0
     
-    # Quantization - Enable for efficiency
-    enable_quantization: bool = True
-    quantize_vision_4bit: bool = True
-    quantize_language_4bit: bool = True
+    # Quantization - Disabled for higher GPU compute load
+    enable_quantization: bool = False
+    quantize_vision_4bit: bool = False
+    quantize_language_4bit: bool = False
     
     # More frequent monitoring during alignment learning
     visualize_interval: int = 50
@@ -133,6 +135,8 @@ class Stage2Config(TrainingConfig):
     num_epochs: int = 5
     learning_rate: float = 1e-4  # Lower LR with memory
     warmup_steps: int = 1000
+    batch_size: int = 64
+    num_workers: int = 12
     
     # Keep vision/language frozen, train adapter + memory
     freeze_vision: bool = False
@@ -141,11 +145,11 @@ class Stage2Config(TrainingConfig):
     train_memory: bool = True
     unfreeze_last_n_layers: int = 4
     
-    # Full quantization
+    # Disable quantization for higher compute (memory still uses 1.58-bit)
     enable_quantization: bool = True
     quantize_memory_158bit: bool = True
-    quantize_vision_4bit: bool = True
-    quantize_language_4bit: bool = True
+    quantize_vision_4bit: bool = False
+    quantize_language_4bit: bool = False
     
     # Memory-specific settings (from Larimar)
     memory_size: int = 512
