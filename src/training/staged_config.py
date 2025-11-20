@@ -157,10 +157,11 @@ class TestConfig(TrainingConfig):
     num_viz_images: int = 3
     wandb_run_name: str = "test_run"
     
-    # Limit to downloaded samples
+    # Limit to 5000 samples for testing
     data_dir: str = "./data/cc12m"
     train_metadata: str = "train_metadata.json"
     val_metadata: str = "val_metadata.json"
+    max_samples: int = 5000
 
 
 @dataclass

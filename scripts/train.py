@@ -484,10 +484,15 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         
         # Update progress bar
         lm_loss_display = outputs.get('lm_loss')
+        lm_display_val = 'nan'
+        if lm_loss_display is not None:
+            if not torch.isnan(lm_loss_display):
+                lm_display_val = f"{lm_loss_display.item():.3f}"
+        
         pbar.set_postfix({
-            'loss': loss.item(),
-            'lm': lm_loss_display.item() if lm_loss_display is not None else 0.0,
-            'lr': optimizer.param_groups[0]['lr']
+            'loss': f"{loss.item():.3f}",
+            'lm': lm_display_val,
+            'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
         })
         
         # Logging
@@ -576,6 +581,12 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         viz_text_embeddings, _ = model.encode_text(viz_input_ids, viz_attention_mask)
                         attention_from_lm = None
                         try:
+                            # Temporarily set attention implementation to eager for visualization
+                            original_attn_impl = None
+                            if hasattr(model.language_model, 'model') and hasattr(model.language_model.model, 'config'):
+                                original_attn_impl = getattr(model.language_model.model.config, '_attn_implementation', None)
+                                model.language_model.model.config._attn_implementation = 'eager'
+                            
                             fused_embeddings, fused_mask = model.fusion(
                                 viz_prefix_tokens, viz_text_embeddings, viz_attention_mask
                             )
@@ -599,6 +610,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                                 attn = attentions[-1].detach()
                                 prefix_len = viz_prefix_tokens.size(1)
                                 attention_from_lm = attn[:, :, prefix_len:, :prefix_len]
+                            
+                            # Restore original attention implementation
+                            if original_attn_impl is not None and hasattr(model.language_model, 'model'):
+                                model.language_model.model.config._attn_implementation = original_attn_impl
                         except Exception as exc:
                             print(f"Warning: unable to compute attention maps from LM: {exc}")
                             attention_from_lm = None
