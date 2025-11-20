@@ -511,8 +511,17 @@ class WandBLogger:
         
         for name, param in model.named_parameters():
             if param.requires_grad:
+                tensor = param.detach().cpu()
+                weights = tensor.numpy()
+                if not np.isfinite(weights).all():
+                    # Log the count of invalid values for easier debugging
+                    invalid = np.logical_not(np.isfinite(weights))
+                    self.wandb_run.log({
+                        f'weights/{name}_invalid_count': int(invalid.sum())
+                    }, step=global_step)
+                    weights = np.nan_to_num(weights, nan=0.0, posinf=0.0, neginf=0.0)
                 self.wandb_run.log({
-                    f'weights/{name}': wandb.Histogram(param.data.cpu().numpy())
+                    f'weights/{name}': wandb.Histogram(weights)
                 }, step=global_step)
     
     def log_metrics(self, metrics: Dict[str, float], step: int, prefix: str = ""):
