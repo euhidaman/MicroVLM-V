@@ -104,11 +104,11 @@ class Stage1Config(TrainingConfig):
     num_epochs: int = 15  # Increased for stable alignment convergence
     learning_rate: float = 5e-5  # Lower LR for contrastive learning stability
     warmup_steps: int = 3000  # ~5-10% of total steps for gradual warmup
-    batch_size: int = 8  # Reduced for 12GB GPU (was 64)
+    batch_size: int = 12  # Optimized for 12GB GPU with AMP (was 64)
     num_workers: int = 4  # Reduced to save RAM
     gradient_clip: float = 0.3  # Tighter clipping for alignment-only training
     alignment_loss_weight: float = 1.0  # Full weight since it's the only loss
-    gradient_accumulation_steps: int = 8  # Effective batch = 8*8=64
+    gradient_accumulation_steps: int = 6  # Effective batch = 12*6=72
     
     # Adapter-focused training
     freeze_vision: bool = True
@@ -141,9 +141,9 @@ class Stage2Config(TrainingConfig):
     num_epochs: int = 5
     learning_rate: float = 1e-4  # Lower LR with memory
     warmup_steps: int = 1000
-    batch_size: int = 4  # Reduced for memory component (was 64)
+    batch_size: int = 6  # Optimized for 12GB GPU with memory (was 64)
     num_workers: int = 4
-    gradient_accumulation_steps: int = 16  # Effective batch = 4*16=64
+    gradient_accumulation_steps: int = 12  # Effective batch = 6*12=72
     
     # Keep vision/language frozen, train adapter + memory
     freeze_vision: bool = False
@@ -180,8 +180,8 @@ class TestConfig(TrainingConfig):
     learning_rate: float = 5e-5
     use_memory: bool = False  # Disable memory for testing to save VRAM
     enable_quantization: bool = False  # Disable for faster testing
-    batch_size: int = 1  # Minimum batch size for 12GB GPU
-    gradient_accumulation_steps: int = 8  # Effective batch = 1*8=8
+    batch_size: int = 2  # Optimized for 12GB GPU with ~3GB headroom
+    gradient_accumulation_steps: int = 4  # Effective batch = 2*4=8
     log_interval: int = 10
     visualize_interval: int = 50
     viz_save_interval: int = 200

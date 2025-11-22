@@ -22,20 +22,20 @@ Solutions Implemented:
 
 2. REDUCED BATCH SIZES (src/training/staged_config.py)
    Stage1Config:
-   - batch_size: 64 → 8 (8x reduction)
-   - gradient_accumulation_steps: 8
-   - Effective batch size: 8 × 8 = 64 (same as before)
+   - batch_size: 64 → 12 (optimized for 8GB usage with AMP+checkpointing)
+   - gradient_accumulation_steps: 6
+   - Effective batch size: 12 × 6 = 72 (slightly higher for better convergence)
    - use_amp: True (FP16 training enabled)
    
    Stage2Config:
-   - batch_size: 64 → 4 (16x reduction)
-   - gradient_accumulation_steps: 16
-   - Effective batch size: 4 × 16 = 64 (same as before)
+   - batch_size: 64 → 6 (optimized with memory component)
+   - gradient_accumulation_steps: 12
+   - Effective batch size: 6 × 12 = 72 (same as Stage1)
    
    TestConfig:
-   - batch_size: 2 → 1 (minimum for 12GB GPU)
-   - gradient_accumulation_steps: 8
-   - Effective batch size: 1 × 8 = 8 (same as before)
+   - batch_size: 8 → 2 (optimized for 8GB usage)
+   - gradient_accumulation_steps: 4
+   - Effective batch size: 2 × 4 = 8 (same as before)
 
 3. GRADIENT CHECKPOINTING (src/models/language_model.py)
    - Enabled for Qwen2.5-0.5B model
@@ -61,18 +61,20 @@ Solutions Implemented:
 
 Expected Memory Usage:
 ---------------------
-Original: ~9.7GB with batch_size=64
-After optimizations: ~4-5GB with batch_size=1-8 + all optimizations
+Current observed: ~8.1GB with batch_size=2 (test config)
+After batch size increase: ~8.5-9GB with optimized batch sizes
 
 Memory savings breakdown:
 - Gradient accumulation: No direct savings, but allows smaller batches
-- Smaller batches (64→1-8): ~6-7x reduction in activation memory
+- Smaller batches (64→2-12): ~5-6x reduction in activation memory
 - Gradient checkpointing: ~40-50% reduction in activation memory
 - AMP (FP16): ~30-40% reduction in memory bandwidth and storage
-- Combined: From 9.7GB → ~4-5GB estimated
+- Combined: From 9.7GB → ~8.1GB actual usage (3GB headroom on 11.26GB GPU)
 
-Effective batch size remains 64 for Stage1/Stage2, so training dynamics
-should be nearly identical but with lower memory footprint.
+Effective batch sizes optimized for faster training:
+- TestConfig: 8 (2×4) - quick testing
+- Stage1: 72 (12×6) - faster convergence than original 64
+- Stage2: 72 (6×12) - same as Stage1 for consistency
 
 Training Impact:
 ---------------
