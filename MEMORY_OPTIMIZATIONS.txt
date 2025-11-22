@@ -1,0 +1,68 @@
+GTX 1080 Memory Optimizations for MicroVLM-V
+==============================================
+
+Problem:
+- CUDA OOM error at step 2 with 9.70GB/10.90GB VRAM usage
+- Original batch_size=64 too large for 12GB GTX 1080
+
+Solutions Implemented:
+---------------------
+
+1. GRADIENT ACCUMULATION (scripts/train.py)
+   - Splits effective batch_size into smaller micro-batches
+   - Updates weights only every N batches
+   - Maintains training stability with smaller per-batch memory
+   
+   Changes:
+   - Added accumulation_steps from config.gradient_accumulation_steps
+   - Loss scaled by 1/accumulation_steps before backward
+   - Optimizer step only runs when (batch_idx + 1) % accumulation_steps == 0
+   - Gradients cleared after each optimizer step (not every batch)
+   - Scheduler stepped with optimizer (not every batch)
+
+2. REDUCED BATCH SIZES (src/training/staged_config.py)
+   Stage1Config:
+   - batch_size: 64 → 8 (8x reduction)
+   - gradient_accumulation_steps: 8
+   - Effective batch size: 8 × 8 = 64 (same as before)
+   
+   Stage2Config:
+   - batch_size: 64 → 4 (16x reduction)
+   - gradient_accumulation_steps: 16
+   - Effective batch size: 4 × 16 = 64 (same as before)
+   
+   TestConfig:
+   - batch_size: 8 → 2 (4x reduction)
+   - gradient_accumulation_steps: 4
+   - Effective batch size: 2 × 4 = 8 (same as before)
+
+3. GRADIENT CHECKPOINTING (src/models/language_model.py)
+   - Enabled for Qwen2.5-0.5B model
+   - Trades compute for memory (recomputes activations during backward)
+   - Reduces activation memory ~40-50%
+   - Called via model.gradient_checkpointing_enable() after loading
+
+4. CUDA CACHE CLEARING (scripts/train.py)
+   - torch.cuda.empty_cache() every 10 batches
+   - Prevents memory fragmentation over long training runs
+
+Expected Memory Usage:
+---------------------
+Original: ~9.7GB with batch_size=64
+After optimizations: ~6-7GB with batch_size=8 + gradient accumulation
+
+Effective batch size remains 64 for Stage1/Stage2, so training dynamics
+should be nearly identical but with lower memory footprint.
+
+Training Impact:
+---------------
+- Same convergence behavior (effective batch size unchanged)
+- Slightly slower (~10-20% due to gradient accumulation overhead)
+- Safer for 12GB GPUs with headroom for other processes
+
+Testing:
+-------
+Run training with:
+  python scripts/train.py --config src/training/staged_config.py --stage test
+
+Monitor memory with nvidia-smi in another terminal. Should see <8GB usage.

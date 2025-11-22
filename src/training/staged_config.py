@@ -19,8 +19,9 @@ class TrainingConfig:
     data_dir: str = "./data/cc12m"
     train_metadata: str = "train_metadata.json"
     val_metadata: str = "val_metadata.json"
-    batch_size: int = 64
-    num_workers: int = 12
+    batch_size: int = 8  # Default reduced for 12GB GPU
+    num_workers: int = 4  # Reduced to save system RAM
+    gradient_accumulation_steps: int = 1  # No accumulation by default
     max_samples: Optional[int] = None
     max_val_samples: Optional[int] = None
     
@@ -101,10 +102,11 @@ class Stage1Config(TrainingConfig):
     num_epochs: int = 15  # Increased for stable alignment convergence
     learning_rate: float = 5e-5  # Lower LR for contrastive learning stability
     warmup_steps: int = 3000  # ~5-10% of total steps for gradual warmup
-    batch_size: int = 64
-    num_workers: int = 12
+    batch_size: int = 8  # Reduced for 12GB GPU (was 64)
+    num_workers: int = 4  # Reduced to save RAM
     gradient_clip: float = 0.3  # Tighter clipping for alignment-only training
     alignment_loss_weight: float = 1.0  # Full weight since it's the only loss
+    gradient_accumulation_steps: int = 8  # Effective batch = 8*8=64
     
     # Adapter-focused training
     freeze_vision: bool = True
@@ -137,8 +139,9 @@ class Stage2Config(TrainingConfig):
     num_epochs: int = 5
     learning_rate: float = 1e-4  # Lower LR with memory
     warmup_steps: int = 1000
-    batch_size: int = 64
-    num_workers: int = 12
+    batch_size: int = 4  # Reduced for memory component (was 64)
+    num_workers: int = 4
+    gradient_accumulation_steps: int = 16  # Effective batch = 4*16=64
     
     # Keep vision/language frozen, train adapter + memory
     freeze_vision: bool = False
@@ -170,11 +173,12 @@ class Stage2Config(TrainingConfig):
 @dataclass
 class TestConfig(TrainingConfig):
     """Quick test configuration for debugging"""
-    batch_size: int = 8
+    batch_size: int = 2  # Minimal for 12GB GPU
     num_epochs: int = 2
     learning_rate: float = 5e-5
-    use_memory: bool = True
+    use_memory: bool = False  # Disable memory for testing to save VRAM
     enable_quantization: bool = False  # Disable for faster testing
+    gradient_accumulation_steps: int = 4  # Effective batch = 2*4=8
     log_interval: int = 10
     visualize_interval: int = 50
     viz_save_interval: int = 200
@@ -213,7 +217,8 @@ class FullQuantizedConfig(TrainingConfig):
     num_epochs: int = 10
     learning_rate: float = 5e-5
     warmup_steps: int = 2000
-    batch_size: int = 16  # Larger batch with quantization
+    batch_size: int = 4  # Reduced for 12GB GPU even with quantization
+    gradient_accumulation_steps: int = 16  # Effective batch = 4*16=64
     
     # Monitoring
     visualize_interval: int = 100

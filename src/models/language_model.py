@@ -154,6 +154,11 @@ class Qwen2LanguageModel(nn.Module):
 
         self.quantize_4bit = quantize_4bit
         
+        # Enable gradient checkpointing to reduce memory usage
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            print("Gradient checkpointing enabled for Qwen2 model")
+        
         # Extract model components
         self.embed_tokens = self.model.model.embed_tokens
         self.layers = self.model.model.layers

@@ -741,6 +741,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
     alignment_loss_total = 0
     memory_kl_total = 0
     
+    # Gradient accumulation setup
+    accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+    
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
     
     for batch_idx, batch in enumerate(pbar):
@@ -765,6 +768,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         
         loss = outputs['loss']
         
+        # Scale loss for gradient accumulation
+        loss = loss / accumulation_steps
+        
         # Debug: Check for NaN/Inf in loss components
         if torch.isnan(loss) or torch.isinf(loss):
             print(f"\n⚠️ Invalid loss detected at step {global_step}:")
@@ -787,32 +793,40 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             continue
         
         # Backward pass
-        optimizer.zero_grad()
         loss.backward()
         
-        # Compute gradient norm before clipping
-        total_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
+        # Only update weights every accumulation_steps
+        if (batch_idx + 1) % accumulation_steps == 0:
+            # Compute gradient norm before clipping
+            total_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            
+            # Gradient clipping
+            if config.gradient_clip > 0:
+                torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+            
+            # Log gradient norm periodically
+            if global_step % 100 == 0:
+                print(f"\n  [Step {global_step}] Gradient norm: {total_norm:.4f}")
+            
+            optimizer.step()
+            optimizer.zero_grad()
+            
+            if scheduler is not None:
+                scheduler.step()
+            
+            global_step += 1
         
-        # Gradient clipping
-        if config.gradient_clip > 0:
-            torch.nn.utils.clip_grad_norm_(model.parameters(), config.gradient_clip)
+        # Clear CUDA cache periodically to prevent fragmentation
+        if batch_idx % 10 == 0 and torch.cuda.is_available():
+            torch.cuda.empty_cache()
         
-        # Log gradient norm periodically
-        if global_step % 100 == 0:
-            print(f"\n  [Step {global_step}] Gradient norm: {total_norm:.4f}")
-        
-        optimizer.step()
-        
-        if scheduler is not None:
-            scheduler.step()
-        
-        # Accumulate losses
-        total_loss += loss.item()
+        # Accumulate losses (unscaled for logging)
+        total_loss += loss.item() * accumulation_steps
         
         # Safely extract loss values
         lm_loss_val = outputs.get('lm_loss')
