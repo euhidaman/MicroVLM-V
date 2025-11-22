@@ -7,6 +7,7 @@ import torch
 import torch.nn as nn
 from transformers import AutoModelForCausalLM, AutoTokenizer
 import json
+import warnings
 
 
 class Qwen2LanguageModel(nn.Module):
@@ -22,7 +23,8 @@ class Qwen2LanguageModel(nn.Module):
         self.num_layers = config.get('num_layers', 24)
         self.vocab_size = config.get('vocab_size', 151936)
         
-        self.quantize_4bit = quantize_4bit
+        self.quantize_4bit = False
+        self._quantization_disabled_reason = None
         
         # Load tokenizer
         self.tokenizer = None
@@ -39,6 +41,38 @@ class Qwen2LanguageModel(nn.Module):
         else:
             # Initialize from scratch (for testing)
             self._init_from_scratch(config)
+
+    @staticmethod
+    def _select_runtime_dtype():
+        """Pick a torch dtype that is safe for the current accelerator."""
+        if torch.cuda.is_available():
+            return torch.float16
+
+        # Apple MPS also expects float16 tensors for best perf
+        if hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            return torch.float16
+
+        # Prefer bfloat16 on CPU if compiled in, otherwise fall back to fp32
+        if hasattr(torch, "bfloat16"):
+            return torch.bfloat16
+        return torch.float32
+
+    @staticmethod
+    def _check_4bit_support():
+        """Return (is_supported, reason) for 4-bit quantization."""
+        if not torch.cuda.is_available():
+            return False, "CUDA is not available"
+
+        try:
+            import bitsandbytes  # noqa: F401
+        except ImportError:
+            return False, "bitsandbytes is not installed"
+
+        major, minor = torch.cuda.get_device_capability()
+        if major < 6:
+            return False, f"GPU compute capability sm{major}{minor} lacks 4-bit kernels"
+
+        return True, None
     
     def _init_from_scratch(self, config):
         """Initialize model components from scratch"""
@@ -77,17 +111,23 @@ class Qwen2LanguageModel(nn.Module):
             trust_remote_code=True
         )
         
+        requested_quant = quantize_4bit
+        quantize_4bit, disable_reason = self._check_4bit_support() if quantize_4bit else (False, None)
+        if requested_quant and not quantize_4bit and disable_reason:
+            warnings.warn(f"4-bit quantization disabled: {disable_reason}")
+            self._quantization_disabled_reason = disable_reason
+
         # Load model with optional quantization
         if quantize_4bit:
             from transformers import BitsAndBytesConfig
-            
+
             bnb_config = BitsAndBytesConfig(
                 load_in_4bit=True,
                 bnb_4bit_compute_dtype=torch.float16,
                 bnb_4bit_use_double_quant=True,
                 bnb_4bit_quant_type="nf4"
             )
-            
+
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
                 quantization_config=bnb_config,
@@ -95,11 +135,24 @@ class Qwen2LanguageModel(nn.Module):
                 device_map="auto"
             )
         else:
+            torch_dtype = self._select_runtime_dtype()
+            load_kwargs = {
+                'torch_dtype': torch_dtype,
+                'trust_remote_code': True
+            }
+            if torch.cuda.is_available():
+                load_kwargs['device_map'] = 'auto'
+
+            # Root cause: AutoModelForCausalLM on transformers<=4.38 ignores arbitrary
+            # kwargs and raised `TypeError: Qwen2ForCausalLM.__init__() got an unexpected
+            # keyword argument "dtype"` on GTX1080/Python3.12 setups. The stable
+            # cross-version knob is `torch_dtype`, so we now rely on it.
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
-                dtype=torch.float16,
-                trust_remote_code=True
+                **load_kwargs
             )
+
+        self.quantize_4bit = quantize_4bit
         
         # Extract model components
         self.embed_tokens = self.model.model.embed_tokens

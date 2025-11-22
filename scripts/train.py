@@ -1216,6 +1216,11 @@ def main():
     else:
         config = load_config(args.config)
         print(f"Loaded configuration: {args.config}")
+
+    requested_device = getattr(config, 'device', 'cuda')
+    if isinstance(requested_device, str) and requested_device.startswith('cuda') and not torch.cuda.is_available():
+        print("⚠️  CUDA was requested but is not available. Falling back to CPU to keep training runnable.")
+        config.device = 'cpu'
     
     # Create output directories
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
