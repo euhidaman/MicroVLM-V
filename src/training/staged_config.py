@@ -65,6 +65,7 @@ class TrainingConfig:
     # Optimization
     optimizer: str = "adamw"
     lr_scheduler: str = "cosine"
+    use_amp: bool = False  # Automatic Mixed Precision (FP16) training
     
     # Logging
     log_interval: int = 50
@@ -99,6 +100,7 @@ class Stage1Config(TrainingConfig):
     """
     # Override defaults for Stage 1
     use_memory: bool = False  # Disable memory in Stage 1
+    use_amp: bool = True  # Enable automatic mixed precision
     num_epochs: int = 15  # Increased for stable alignment convergence
     learning_rate: float = 5e-5  # Lower LR for contrastive learning stability
     warmup_steps: int = 3000  # ~5-10% of total steps for gradual warmup
@@ -178,7 +180,8 @@ class TestConfig(TrainingConfig):
     learning_rate: float = 5e-5
     use_memory: bool = False  # Disable memory for testing to save VRAM
     enable_quantization: bool = False  # Disable for faster testing
-    gradient_accumulation_steps: int = 4  # Effective batch = 2*4=8
+    batch_size: int = 1  # Minimum batch size for 12GB GPU
+    gradient_accumulation_steps: int = 8  # Effective batch = 1*8=8
     log_interval: int = 10
     visualize_interval: int = 50
     viz_save_interval: int = 200

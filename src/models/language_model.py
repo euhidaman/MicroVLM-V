@@ -195,6 +195,9 @@ class Qwen2LanguageModel(nn.Module):
         """
         if self.model is not None:
             # Use HuggingFace model
+            # Force use_cache=False during training to enable gradient checkpointing
+            if self.training:
+                use_cache = False
             return self.model(
                 input_ids=input_ids,
                 inputs_embeds=inputs_embeds,

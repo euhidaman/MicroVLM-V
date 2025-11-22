@@ -732,7 +732,7 @@ def compute_gradient_flow_metrics(model):
 
 
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
-                epoch, global_step, wandb_run=None, wandb_logger=None):
+                epoch, global_step, wandb_run=None, wandb_logger=None, scaler=None):
     """Train for one epoch"""
     model.train()
     
@@ -743,6 +743,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
     
     # Gradient accumulation setup
     accumulation_steps = getattr(config, 'gradient_accumulation_steps', 1)
+    use_amp = scaler is not None
     
     pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
     
@@ -755,13 +756,14 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # Labels for language modeling (shifted in model)
         labels = input_ids.clone()
         
-        # Forward pass
-        outputs = model(
-            images=images,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            use_memory=config.use_memory,
+        # Forward pass with AMP
+        with torch.cuda.amp.autocast(enabled=use_amp):
+            outputs = model(
+                images=images,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                use_memory=config.use_memory,
             use_alignment=config.use_alignment,
             episode_size=config.episode_size
         )
@@ -792,11 +794,18 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             print("  Skipping this batch...")
             continue
         
-        # Backward pass
-        loss.backward()
+        # Backward pass with AMP scaling
+        if use_amp:
+            scaler.scale(loss).backward()
+        else:
+            loss.backward()
         
         # Only update weights every accumulation_steps
         if (batch_idx + 1) % accumulation_steps == 0:
+            # Unscale gradients for clipping if using AMP
+            if use_amp:
+                scaler.unscale_(optimizer)
+            
             # Compute gradient norm before clipping
             total_norm = 0.0
             for p in model.parameters():
@@ -813,7 +822,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             if global_step % 100 == 0:
                 print(f"\n  [Step {global_step}] Gradient norm: {total_norm:.4f}")
             
-            optimizer.step()
+            # Optimizer step with AMP scaling
+            if use_amp:
+                scaler.step(optimizer)
+                scaler.update()
+            else:
+                optimizer.step()
+            
             optimizer.zero_grad()
             
             if scheduler is not None:
@@ -1336,6 +1351,12 @@ def main():
     optimizer = create_optimizer(model, config)
     total_steps = len(train_loader) * config.num_epochs
     scheduler = create_scheduler(optimizer, config, total_steps)
+    
+    # Initialize AMP scaler if enabled
+    use_amp = getattr(config, 'use_amp', False) and config.device != 'cpu'
+    scaler = torch.cuda.amp.GradScaler() if use_amp else None
+    if use_amp:
+        print("Automatic Mixed Precision (AMP) enabled")
     
     # Resume from checkpoint if specified
     start_epoch = 0

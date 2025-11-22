@@ -274,6 +274,7 @@ class MicroVLM(nn.Module):
             attention_mask=fused_mask,
             labels=adjusted_labels,
             output_hidden_states=True,
+            use_cache=False,
             return_dict=True
         )
         

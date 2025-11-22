@@ -25,6 +25,7 @@ Solutions Implemented:
    - batch_size: 64 → 8 (8x reduction)
    - gradient_accumulation_steps: 8
    - Effective batch size: 8 × 8 = 64 (same as before)
+   - use_amp: True (FP16 training enabled)
    
    Stage2Config:
    - batch_size: 64 → 4 (16x reduction)
@@ -32,24 +33,43 @@ Solutions Implemented:
    - Effective batch size: 4 × 16 = 64 (same as before)
    
    TestConfig:
-   - batch_size: 8 → 2 (4x reduction)
-   - gradient_accumulation_steps: 4
-   - Effective batch size: 2 × 4 = 8 (same as before)
+   - batch_size: 2 → 1 (minimum for 12GB GPU)
+   - gradient_accumulation_steps: 8
+   - Effective batch size: 1 × 8 = 8 (same as before)
 
 3. GRADIENT CHECKPOINTING (src/models/language_model.py)
    - Enabled for Qwen2.5-0.5B model
    - Trades compute for memory (recomputes activations during backward)
    - Reduces activation memory ~40-50%
    - Called via model.gradient_checkpointing_enable() after loading
+   - Force use_cache=False during training (required for checkpointing to work)
 
-4. CUDA CACHE CLEARING (scripts/train.py)
+4. AUTOMATIC MIXED PRECISION (scripts/train.py)
+   - Uses FP16 for forward/backward passes, FP32 for optimizer updates
+   - Reduces memory usage by ~30-40%
+   - Maintains numerical stability with gradient scaling
+   - Enabled via use_amp=True in Stage1Config
+   - Uses torch.cuda.amp.autocast() and GradScaler
+
+5. CUDA CACHE CLEARING (scripts/train.py)
    - torch.cuda.empty_cache() every 10 batches
    - Prevents memory fragmentation over long training runs
+
+6. CACHE DISABLED FOR LM (src/models/microvlm.py)
+   - Explicitly set use_cache=False in language model forward
+   - Prevents KV cache from consuming memory during training
 
 Expected Memory Usage:
 ---------------------
 Original: ~9.7GB with batch_size=64
-After optimizations: ~6-7GB with batch_size=8 + gradient accumulation
+After optimizations: ~4-5GB with batch_size=1-8 + all optimizations
+
+Memory savings breakdown:
+- Gradient accumulation: No direct savings, but allows smaller batches
+- Smaller batches (64→1-8): ~6-7x reduction in activation memory
+- Gradient checkpointing: ~40-50% reduction in activation memory
+- AMP (FP16): ~30-40% reduction in memory bandwidth and storage
+- Combined: From 9.7GB → ~4-5GB estimated
 
 Effective batch size remains 64 for Stage1/Stage2, so training dynamics
 should be nearly identical but with lower memory footprint.
@@ -57,12 +77,14 @@ should be nearly identical but with lower memory footprint.
 Training Impact:
 ---------------
 - Same convergence behavior (effective batch size unchanged)
-- Slightly slower (~10-20% due to gradient accumulation overhead)
+- Slightly slower (~15-25% due to gradient accumulation + checkpointing overhead)
 - Safer for 12GB GPUs with headroom for other processes
 
 Testing:
 -------
 Run training with:
-  python scripts/train.py --config src/training/staged_config.py --stage test
+  python scripts/train.py --config test
 
-Monitor memory with nvidia-smi in another terminal. Should see <8GB usage.
+Monitor memory with nvidia-smi in another terminal. Should see <6GB usage.
+
+If still OOM, further reduce batch_size in TestConfig to 1 (already done).
