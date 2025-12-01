@@ -943,17 +943,19 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # Visualization (main process only)
         if is_main_process and global_step % config.visualize_interval == 0 and (visualizer is not None or wandb_logger):
             model.eval()
+            # Get underlying model for DDP/DP wrapped models
+            viz_model = model.module if hasattr(model, 'module') else model
             with torch.no_grad():
                 # Extract features for visualization
-                prefix_tokens, image_features = model.encode_image(images[:4])
-                text_embeddings, text_features = model.encode_text(
+                prefix_tokens, image_features = viz_model.encode_image(images[:4])
+                text_embeddings, text_features = viz_model.encode_text(
                     input_ids[:4], attention_mask[:4]
                 )
 
                 # Vision encoder visualizations
                 if wandb_logger:
                     wandb_logger.log_vision_encoder_metrics(
-                        model, images, global_step)
+                        viz_model, images, global_step)
 
                 # Alignment visualizations
                 if wandb_logger and 'alignment_loss' in outputs:
@@ -988,31 +990,31 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             viz_attention_mask = fixed_samples['attention_mask'][:num_samples].to(
                                 text_device)
 
-                        viz_prefix_tokens, _ = model.encode_image(viz_images)
-                        viz_text_embeddings, _ = model.encode_text(
+                        viz_prefix_tokens, _ = viz_model.encode_image(viz_images)
+                        viz_text_embeddings, _ = viz_model.encode_text(
                             viz_input_ids, viz_attention_mask)
                         attention_from_lm = None
                         try:
                             # Temporarily set attention implementation to eager for visualization
                             original_attn_impl = None
-                            if hasattr(model.language_model, 'model') and hasattr(model.language_model.model, 'config'):
+                            if hasattr(viz_model.language_model, 'model') and hasattr(viz_model.language_model.model, 'config'):
                                 original_attn_impl = getattr(
-                                    model.language_model.model.config, '_attn_implementation', None)
-                                model.language_model.model.config._attn_implementation = 'eager'
+                                    viz_model.language_model.model.config, '_attn_implementation', None)
+                                viz_model.language_model.model.config._attn_implementation = 'eager'
 
-                            fused_embeddings, fused_mask = model.fusion(
+                            fused_embeddings, fused_mask = viz_model.fusion(
                                 viz_prefix_tokens, viz_text_embeddings, viz_attention_mask
                             )
                             model_dtype = None
-                            if hasattr(model.language_model, 'model') and model.language_model.model is not None:
+                            if hasattr(viz_model.language_model, 'model') and viz_model.language_model.model is not None:
                                 model_dtype = next(
-                                    model.language_model.model.parameters()).dtype
-                            elif hasattr(model.language_model, 'embed_tokens') and model.language_model.embed_tokens is not None:
-                                model_dtype = model.language_model.embed_tokens.weight.dtype
+                                    viz_model.language_model.model.parameters()).dtype
+                            elif hasattr(viz_model.language_model, 'embed_tokens') and viz_model.language_model.embed_tokens is not None:
+                                model_dtype = viz_model.language_model.embed_tokens.weight.dtype
                             if model_dtype is not None and fused_embeddings.dtype != model_dtype:
                                 fused_embeddings = fused_embeddings.to(
                                     model_dtype)
-                            lm_viz_outputs = model.language_model(
+                            lm_viz_outputs = viz_model.language_model(
                                 inputs_embeds=fused_embeddings,
                                 attention_mask=fused_mask,
                                 output_attentions=True,
@@ -1029,8 +1031,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                                                          :, prefix_len:, :prefix_len]
 
                             # Restore original attention implementation
-                            if original_attn_impl is not None and hasattr(model.language_model, 'model'):
-                                model.language_model.model.config._attn_implementation = original_attn_impl
+                            if original_attn_impl is not None and hasattr(viz_model.language_model, 'model'):
+                                viz_model.language_model.model.config._attn_implementation = original_attn_impl
                         except Exception as exc:
                             print(
                                 f"Warning: unable to compute attention maps from LM: {exc}")
@@ -1101,21 +1103,21 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             }, step=global_step)
 
                 # Memory visualizations
-                if config.use_memory and wandb_logger and model.memory_state is not None:
+                if config.use_memory and wandb_logger and viz_model.memory_state is not None:
                     # Ensure memory_state is valid tuple with data
-                    if isinstance(model.memory_state, tuple) and len(model.memory_state) == 2 and model.memory_state[0] is not None:
+                    if isinstance(viz_model.memory_state, tuple) and len(viz_model.memory_state) == 2 and viz_model.memory_state[0] is not None:
                         # Get batch size from memory state
-                        M_batch_size = model.memory_state[0].shape[0]
+                        M_batch_size = viz_model.memory_state[0].shape[0]
                         # Use matching batch size for validation
                         batch_size_for_vis = min(M_batch_size, len(input_ids))
-                        z_for_memory = model.encode_text(input_ids[:batch_size_for_vis], attention_mask[:batch_size_for_vis])[
+                        z_for_memory = viz_model.encode_text(input_ids[:batch_size_for_vis], attention_mask[:batch_size_for_vis])[
                             0].mean(dim=1).unsqueeze(0)
-                        w_mean = model.episodic_memory._solve_w_mean(
-                            z_for_memory, model.memory_state[0][:batch_size_for_vis])
+                        w_mean = viz_model.episodic_memory._solve_w_mean(
+                            z_for_memory, viz_model.memory_state[0][:batch_size_for_vis])
 
                         wandb_logger.log_memory_heatmap(
-                            (model.memory_state[0][:batch_size_for_vis],
-                             model.memory_state[1][:batch_size_for_vis]), w_mean, global_step
+                            (viz_model.memory_state[0][:batch_size_for_vis],
+                             viz_model.memory_state[1][:batch_size_for_vis]), w_mean, global_step
                         )
 
             model.train()
@@ -1382,13 +1384,15 @@ def main():
         run_name = f"{config.wandb_run_name}_{run_counter}"
     config.wandb_run_name = run_name
 
-    print(f"Run name: {run_name} (counter: {run_counter})")
+    if is_main_process:
+        print(f"Run name: {run_name} (counter: {run_counter})")
 
-    # Setup WandB
-    wandb_run = setup_wandb(config, run_name)
-
-    # Create WandB comprehensive logger
-    wandb_logger = WandBLogger(config, wandb_run) if wandb_run else None
+    # Setup WandB (main process only to avoid duplicate logging)
+    wandb_run = None
+    wandb_logger = None
+    if is_main_process:
+        wandb_run = setup_wandb(config, run_name)
+        wandb_logger = WandBLogger(config, wandb_run) if wandb_run else None
 
     # Create model with quantization settings
     print("Creating model...")
