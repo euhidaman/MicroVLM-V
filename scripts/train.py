@@ -33,9 +33,11 @@ sys.path.insert(0, str(Path(__file__).parent.parent))
 
 def count_parameters(model):
     """Count total and trainable parameters"""
-    total_params = sum(p.numel() for p in model.parameters())
+    # Handle DDP/DataParallel wrapped models
+    base_model = model.module if hasattr(model, 'module') else model
+    total_params = sum(p.numel() for p in base_model.parameters())
     trainable_params = sum(p.numel()
-                           for p in model.parameters() if p.requires_grad)
+                           for p in base_model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     return {
         'total': total_params,
@@ -46,10 +48,13 @@ def count_parameters(model):
 
 def get_model_statistics(model, config):
     """Get comprehensive model statistics"""
+    # Unwrap DDP model if necessary
+    base_model = model.module if hasattr(model, 'module') else model
+    
     stats = {}
 
-    # Overall parameters
-    overall = count_parameters(model)
+    # Overall parameters (use base_model for accurate counting)
+    overall = count_parameters(base_model)
     stats['total_parameters'] = overall['total']
     stats['trainable_parameters'] = overall['trainable']
     stats['frozen_parameters'] = overall['frozen']
@@ -57,28 +62,28 @@ def get_model_statistics(model, config):
         overall['total'] if overall['total'] > 0 else 0.0
 
     # Vision encoder parameters
-    if hasattr(model, 'vision_encoder'):
-        vision_stats = count_parameters(model.vision_encoder)
+    if hasattr(base_model, 'vision_encoder'):
+        vision_stats = count_parameters(base_model.vision_encoder)
         stats['vision_total_params'] = vision_stats['total']
         stats['vision_trainable_params'] = vision_stats['trainable']
         stats['vision_frozen_params'] = vision_stats['frozen']
 
     # Language model parameters
-    if hasattr(model, 'language_model'):
-        lang_stats = count_parameters(model.language_model)
+    if hasattr(base_model, 'language_model'):
+        lang_stats = count_parameters(base_model.language_model)
         stats['language_total_params'] = lang_stats['total']
         stats['language_trainable_params'] = lang_stats['trainable']
         stats['language_frozen_params'] = lang_stats['frozen']
 
     # Adapter parameters
-    if hasattr(model, 'multimodal_adapter'):
-        adapter_stats = count_parameters(model.multimodal_adapter)
+    if hasattr(base_model, 'multimodal_adapter'):
+        adapter_stats = count_parameters(base_model.multimodal_adapter)
         stats['adapter_total_params'] = adapter_stats['total']
         stats['adapter_trainable_params'] = adapter_stats['trainable']
 
     # Memory parameters
-    if hasattr(model, 'episodic_memory'):
-        memory_stats = count_parameters(model.episodic_memory)
+    if hasattr(base_model, 'episodic_memory'):
+        memory_stats = count_parameters(base_model.episodic_memory)
         stats['memory_total_params'] = memory_stats['total']
         stats['memory_trainable_params'] = memory_stats['trainable']
 
@@ -1130,9 +1135,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
 def count_parameters(model):
     """Count total and trainable parameters"""
-    total_params = sum(p.numel() for p in model.parameters())
+    # Handle DDP/DataParallel wrapped models
+    base_model = model.module if hasattr(model, 'module') else model
+    total_params = sum(p.numel() for p in base_model.parameters())
     trainable_params = sum(p.numel()
-                           for p in model.parameters() if p.requires_grad)
+                           for p in base_model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     return {
         'total': total_params,
@@ -1143,10 +1150,13 @@ def count_parameters(model):
 
 def get_model_statistics(model, config):
     """Get comprehensive model statistics"""
+    # Unwrap DDP model if necessary
+    base_model = model.module if hasattr(model, 'module') else model
+    
     stats = {}
 
-    # Overall parameters
-    overall = count_parameters(model)
+    # Overall parameters (use base_model for accurate counting)
+    overall = count_parameters(base_model)
     stats['total_parameters'] = overall['total']
     stats['trainable_parameters'] = overall['trainable']
     stats['frozen_parameters'] = overall['frozen']
@@ -1154,28 +1164,28 @@ def get_model_statistics(model, config):
         overall['total'] if overall['total'] > 0 else 0.0
 
     # Vision encoder parameters
-    if hasattr(model, 'vision_encoder'):
-        vision_stats = count_parameters(model.vision_encoder)
+    if hasattr(base_model, 'vision_encoder'):
+        vision_stats = count_parameters(base_model.vision_encoder)
         stats['vision_total_params'] = vision_stats['total']
         stats['vision_trainable_params'] = vision_stats['trainable']
         stats['vision_frozen_params'] = vision_stats['frozen']
 
     # Language model parameters
-    if hasattr(model, 'language_model'):
-        lang_stats = count_parameters(model.language_model)
+    if hasattr(base_model, 'language_model'):
+        lang_stats = count_parameters(base_model.language_model)
         stats['language_total_params'] = lang_stats['total']
         stats['language_trainable_params'] = lang_stats['trainable']
         stats['language_frozen_params'] = lang_stats['frozen']
 
     # Adapter parameters
-    if hasattr(model, 'multimodal_adapter'):
-        adapter_stats = count_parameters(model.multimodal_adapter)
+    if hasattr(base_model, 'multimodal_adapter'):
+        adapter_stats = count_parameters(base_model.multimodal_adapter)
         stats['adapter_total_params'] = adapter_stats['total']
         stats['adapter_trainable_params'] = adapter_stats['trainable']
 
     # Memory parameters
-    if hasattr(model, 'episodic_memory'):
-        memory_stats = count_parameters(model.episodic_memory)
+    if hasattr(base_model, 'episodic_memory'):
+        memory_stats = count_parameters(base_model.episodic_memory)
         stats['memory_total_params'] = memory_stats['total']
         stats['memory_trainable_params'] = memory_stats['trainable']
 

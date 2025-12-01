@@ -101,7 +101,7 @@ class Stage1Config(TrainingConfig):
     num_epochs: int = 15  # Increased for stable alignment convergence
     learning_rate: float = 5e-5  # Lower LR for contrastive learning stability
     warmup_steps: int = 3000  # ~5-10% of total steps for gradual warmup
-    batch_size: int = 64
+    batch_size: int = 128  # Increased for A100 80GB GPUs (was 64)
     num_workers: int = 12
     gradient_clip: float = 0.3  # Tighter clipping for alignment-only training
     alignment_loss_weight: float = 1.0  # Full weight since it's the only loss
