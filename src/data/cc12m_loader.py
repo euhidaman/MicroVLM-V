@@ -283,7 +283,8 @@ def create_small_test_dataset(metadata_file, output_metadata, num_samples=1000):
 
 
 def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer, 
-                       batch_size=32, num_workers=4, max_samples=None, max_val_samples=None):
+                       batch_size=32, num_workers=4, max_samples=None, max_val_samples=None,
+                       distributed=False, world_size=1, rank=0):
     """
     Create train and validation dataloaders
     
@@ -294,10 +295,16 @@ def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer,
         batch_size: batch size
         num_workers: number of workers
         max_samples: limit samples for testing
+        max_val_samples: limit val samples
+        distributed: whether to use distributed training
+        world_size: number of processes for distributed training
+        rank: current process rank for distributed training
     
     Returns:
-        train_loader, val_loader
+        train_loader, val_loader, train_sampler (or None if not distributed)
     """
+    from torch.utils.data.distributed import DistributedSampler
+    
     # Create datasets
     train_dataset = CC12MDataset(
         metadata_file=train_metadata_file,
@@ -311,13 +318,32 @@ def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer,
         max_samples=max_val_samples
     )
     
+    # Create samplers for distributed training
+    train_sampler = None
+    val_sampler = None
+    
+    if distributed:
+        train_sampler = DistributedSampler(
+            train_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=True
+        )
+        val_sampler = DistributedSampler(
+            val_dataset,
+            num_replicas=world_size,
+            rank=rank,
+            shuffle=False
+        )
+    
     # Create loaders
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
-        shuffle=True,
+        shuffle=(train_sampler is None),  # Only shuffle if not using sampler
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        sampler=train_sampler
     )
     
     val_loader = DataLoader(
@@ -325,12 +351,15 @@ def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer,
         batch_size=batch_size,
         shuffle=False,
         num_workers=num_workers,
-        pin_memory=True
+        pin_memory=True,
+        sampler=val_sampler
     )
     
     print(f"Created dataloaders: {len(train_dataset)} train, {len(val_dataset)} val")
+    if distributed:
+        print(f"  Distributed: world_size={world_size}, rank={rank}")
     
-    return train_loader, val_loader
+    return train_loader, val_loader, train_sampler
 
 
 if __name__ == "__main__":

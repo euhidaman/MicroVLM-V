@@ -17,7 +17,10 @@ import json
 from datetime import datetime
 import torch
 import torch.nn as nn
+import torch.distributed as dist
+from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
+from torch.utils.data.distributed import DistributedSampler
 from pathlib import Path
 import argparse
 from tqdm import tqdm
@@ -755,8 +758,24 @@ def compute_gradient_flow_metrics(model):
 
 
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
-                epoch, global_step, wandb_run=None, wandb_logger=None):
-    """Train for one epoch"""
+                epoch, global_step, wandb_run=None, wandb_logger=None,
+                is_distributed=False, is_main_process=True):
+    """Train for one epoch
+    
+    Args:
+        model: The model (may be wrapped in DDP/DP)
+        train_loader: Training dataloader
+        optimizer: Optimizer
+        scheduler: Learning rate scheduler
+        config: Training configuration
+        visualizer: Attention visualizer
+        epoch: Current epoch number
+        global_step: Current global step
+        wandb_run: WandB run object
+        wandb_logger: WandB logger object
+        is_distributed: Whether using distributed training
+        is_main_process: Whether this is the main process (rank 0)
+    """
     model.train()
 
     total_loss = 0
@@ -764,7 +783,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
     alignment_loss_total = 0
     memory_kl_total = 0
 
-    pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+    # Only show progress bar on main process
+    if is_main_process:
+        pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
+    else:
+        pbar = train_loader
 
     for batch_idx, batch in enumerate(pbar):
         # Move to device
@@ -790,23 +813,24 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         # Debug: Check for NaN/Inf in loss components
         if torch.isnan(loss) or torch.isinf(loss):
-            print(f"\n⚠️ Invalid loss detected at step {global_step}:")
-            print(f"  Total loss: {loss.item()}")
-            if 'lm_loss' in outputs and outputs['lm_loss'] is not None:
-                print(f"  LM loss: {outputs['lm_loss'].item()}")
-            if 'alignment_loss' in outputs:
-                print(f"  Alignment loss: {outputs['alignment_loss'].item()}")
-            if 'memory_kl' in outputs:
-                print(f"  Memory KL: {outputs['memory_kl'].item()}")
-            if 'addressing_kl' in outputs:
-                print(f"  Addressing KL: {outputs['addressing_kl'].item()}")
+            if is_main_process:
+                print(f"\n⚠️ Invalid loss detected at step {global_step}:")
+                print(f"  Total loss: {loss.item()}")
+                if 'lm_loss' in outputs and outputs['lm_loss'] is not None:
+                    print(f"  LM loss: {outputs['lm_loss'].item()}")
+                if 'alignment_loss' in outputs:
+                    print(f"  Alignment loss: {outputs['alignment_loss'].item()}")
+                if 'memory_kl' in outputs:
+                    print(f"  Memory KL: {outputs['memory_kl'].item()}")
+                if 'addressing_kl' in outputs:
+                    print(f"  Addressing KL: {outputs['addressing_kl'].item()}")
 
-            # Check for NaN in model parameters
-            for name, param in model.named_parameters():
-                if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                    print(f"  NaN/Inf gradient in: {name}")
+                # Check for NaN in model parameters
+                for name, param in model.named_parameters():
+                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
+                        print(f"  NaN/Inf gradient in: {name}")
 
-            print("  Skipping this batch...")
+                print("  Skipping this batch...")
             continue
 
         # Backward pass
@@ -826,8 +850,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), config.gradient_clip)
 
-        # Log gradient norm periodically
-        if global_step % 100 == 0:
+        # Log gradient norm periodically (main process only)
+        if is_main_process and global_step % 100 == 0:
             print(f"\n  [Step {global_step}] Gradient norm: {total_norm:.4f}")
 
         optimizer.step()
@@ -850,31 +874,32 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         global_step += 1
 
-        # Update progress bar
-        lm_loss_display = outputs.get('lm_loss')
-        if lm_loss_display is None:
-            lm_display_val = 'none'
-        elif torch.isnan(lm_loss_display) or torch.isinf(lm_loss_display):
-            lm_display_val = 'nan'
-        else:
-            lm_display_val = f"{lm_loss_display.item():.3f}"
+        # Update progress bar (main process only)
+        if is_main_process:
+            lm_loss_display = outputs.get('lm_loss')
+            if lm_loss_display is None:
+                lm_display_val = 'none'
+            elif torch.isnan(lm_loss_display) or torch.isinf(lm_loss_display):
+                lm_display_val = 'nan'
+            else:
+                lm_display_val = f"{lm_loss_display.item():.3f}"
 
-        # Show alignment loss if present (critical for Stage1)
-        align_loss_display = outputs.get('alignment_loss')
-        if align_loss_display is not None:
-            align_display_val = f"{align_loss_display.item():.3f}"
-        else:
-            align_display_val = 'none'
+            # Show alignment loss if present (critical for Stage1)
+            align_loss_display = outputs.get('alignment_loss')
+            if align_loss_display is not None:
+                align_display_val = f"{align_loss_display.item():.3f}"
+            else:
+                align_display_val = 'none'
 
-        pbar.set_postfix({
-            'loss': f"{loss.item():.3f}",
-            'lm': lm_display_val,
-            'align': align_display_val,
-            'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
-        })
+            pbar.set_postfix({
+                'loss': f"{loss.item():.3f}",
+                'lm': lm_display_val,
+                'align': align_display_val,
+                'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
+            })
 
-        # Logging
-        if global_step % config.log_interval == 0:
+        # Logging (main process only)
+        if is_main_process and global_step % config.log_interval == 0:
             # Use comprehensive WandB logger
             if wandb_logger:
                 # Core training metrics
@@ -915,8 +940,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
                 wandb_run.log(metrics, step=global_step)
 
-        # Visualization
-        if global_step % config.visualize_interval == 0 and (visualizer is not None or wandb_logger):
+        # Visualization (main process only)
+        if is_main_process and global_step % config.visualize_interval == 0 and (visualizer is not None or wandb_logger):
             model.eval()
             with torch.no_grad():
                 # Extract features for visualization
@@ -1279,16 +1304,61 @@ def main():
                              'E.g., --num_images=2000000 uses 1.9M train, 100K val.')
     parser.add_argument('--val_split', type=float, default=0.05,
                         help='Validation split ratio when using --num_images (default: 0.05)')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of DataLoader workers (default: 4, max: 32)')
+    parser.add_argument('--multi_gpu', action='store_true',
+                        help='Enable multi-GPU training with DistributedDataParallel')
+    parser.add_argument('--local_rank', type=int, default=-1,
+                        help='Local rank for distributed training (set automatically by torchrun)')
 
     args = parser.parse_args()
+
+    # Cap num_workers at 32
+    args.num_workers = min(max(args.num_workers, 0), 32)
+
+    # ========== Multi-GPU / DDP Setup ==========
+    is_distributed = False
+    local_rank = 0
+    world_size = 1
+    
+    # Check for torchrun environment variables (preferred method)
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        is_distributed = True
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ['WORLD_SIZE'])
+        rank = int(os.environ['RANK'])
+        
+        # Initialize distributed process group
+        dist.init_process_group(backend='nccl', init_method='env://')
+        torch.cuda.set_device(local_rank)
+        
+        if rank == 0:
+            print(f"\n{'='*60}")
+            print(f"  DISTRIBUTED TRAINING ENABLED")
+            print(f"  World size: {world_size} GPUs")
+            print(f"  Backend: NCCL")
+            print(f"{'='*60}\n")
+    elif args.multi_gpu and torch.cuda.device_count() > 1:
+        # Fallback: DataParallel mode (simpler but less efficient)
+        print(f"\n{'='*60}")
+        print(f"  MULTI-GPU MODE (DataParallel)")
+        print(f"  Available GPUs: {torch.cuda.device_count()}")
+        print(f"  NOTE: For best performance, use torchrun:")
+        print(f"    torchrun --nproc_per_node={torch.cuda.device_count()} scripts/train.py ...")
+        print(f"{'='*60}\n")
+    
+    # Helper to check if current process is main
+    is_main_process = (not is_distributed) or (dist.get_rank() == 0)
 
     # Load configuration - prioritize staged config if requested
     if args.use_staged_config or args.config in ['stage1', 'stage2', 'full_quantized']:
         config = load_staged_config(args.config)
-        print(f"Loaded STAGED configuration: {args.config}")
+        if is_main_process:
+            print(f"Loaded STAGED configuration: {args.config}")
     else:
         config = load_config(args.config)
-        print(f"Loaded configuration: {args.config}")
+        if is_main_process:
+            print(f"Loaded configuration: {args.config}")
 
     # Create output directories
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -1363,11 +1433,31 @@ def main():
     # Print trainable parameters
     trainable_params = model.get_trainable_params()
     total_params = sum(p.numel() for p in model.parameters())
-    print(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
-          f"({100*trainable_params/total_params:.2f}%)")
+    if is_main_process:
+        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
+              f"({100*trainable_params/total_params:.2f}%)")
 
-    # Move to device
-    model = model.to(config.device)
+    # Move to device (use local_rank for DDP, otherwise config.device)
+    if is_distributed:
+        device = torch.device(f'cuda:{local_rank}')
+        model = model.to(device)
+        # Wrap model with DDP
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True)
+        if is_main_process:
+            print(f"Model wrapped with DistributedDataParallel on GPU {local_rank}")
+    elif args.multi_gpu and torch.cuda.device_count() > 1:
+        # DataParallel fallback
+        device = torch.device('cuda:0')
+        model = model.to(device)
+        model = nn.DataParallel(model)
+        print(f"Model wrapped with DataParallel across {torch.cuda.device_count()} GPUs")
+    else:
+        device = torch.device(config.device)
+        model = model.to(device)
+    
+    # Update config device for consistency
+    config.device = device
 
     # Create visualizer
     visualizer = create_attention_visualizer(model_config['model_dimensions'])
@@ -1379,37 +1469,52 @@ def main():
         num_train = args.num_images - num_val
         effective_max_samples = num_train
         effective_max_val_samples = num_val
-        print(f"\n=== Dataset Limiting (--num_images={args.num_images:,}) ===")
-        print(f"  Train samples: {num_train:,}")
-        print(f"  Val samples:   {num_val:,}")
-        print(f"  Val split:     {args.val_split:.1%}")
-        print("=" * 50 + "\n")
+        if is_main_process:
+            print(f"\n=== Dataset Limiting (--num_images={args.num_images:,}) ===")
+            print(f"  Train samples: {num_train:,}")
+            print(f"  Val samples:   {num_val:,}")
+            print(f"  Val split:     {args.val_split:.1%}")
+            print("=" * 50 + "\n")
     else:
         # Use config values
         effective_max_samples = config.max_samples
         effective_max_val_samples = getattr(config, 'max_val_samples', None)
 
-    # Create dataloaders
-    print("Creating dataloaders...")
-    train_loader, val_loader = create_dataloaders(
+    # Determine effective num_workers (CLI takes precedence)
+    effective_num_workers = args.num_workers
+    if is_main_process:
+        print(f"Using {effective_num_workers} DataLoader workers (max: 32)")
+
+    # Get the underlying model for tokenizer access (handles DDP/DP wrapping)
+    base_model = model.module if hasattr(model, 'module') else model
+
+    # Create dataloaders with distributed support
+    if is_main_process:
+        print("Creating dataloaders...")
+    
+    train_loader, val_loader, train_sampler = create_dataloaders(
         train_metadata_file=config.train_metadata_file,
         val_metadata_file=config.val_metadata_file,
-        tokenizer=model.language_model.tokenizer,
+        tokenizer=base_model.language_model.tokenizer,
         batch_size=config.batch_size,
-        num_workers=config.num_workers,
+        num_workers=effective_num_workers,
         max_samples=effective_max_samples,
-        max_val_samples=effective_max_val_samples
+        max_val_samples=effective_max_val_samples,
+        distributed=is_distributed,
+        world_size=world_size,
+        rank=local_rank if is_distributed else 0
     )
 
-    # Validate first batch to check data quality
-    print("\nValidating first training batch...")
-    first_batch = next(iter(train_loader))
-    print(f"  Image shape: {first_batch['image'].shape}")
-    print(f"  Input IDs shape: {first_batch['input_ids'].shape}")
-    print(f"  Caption samples: {first_batch['caption'][:2]}")
-    print(
-        f"  Caption lengths: min={first_batch['attention_mask'].sum(dim=1).min().item()}, max={first_batch['attention_mask'].sum(dim=1).max().item()}")
-    del first_batch
+    # Validate first batch to check data quality (main process only)
+    if is_main_process:
+        print("\nValidating first training batch...")
+        first_batch = next(iter(train_loader))
+        print(f"  Image shape: {first_batch['image'].shape}")
+        print(f"  Input IDs shape: {first_batch['input_ids'].shape}")
+        print(f"  Caption samples: {first_batch['caption'][:2]}")
+        print(
+            f"  Caption lengths: min={first_batch['attention_mask'].sum(dim=1).min().item()}, max={first_batch['attention_mask'].sum(dim=1).max().item()}")
+        del first_batch
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
@@ -1421,20 +1526,30 @@ def main():
     global_step = 0
 
     if args.resume:
-        print(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        if is_main_process:
+            print(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=config.device)
+        # Handle DDP/DP wrapped models
+        if hasattr(model, 'module'):
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         start_epoch = checkpoint['epoch']
         global_step = checkpoint['global_step']
 
     # Training loop
-    print(f"Starting training for {config.num_epochs} epochs...")
+    if is_main_process:
+        print(f"Starting training for {config.num_epochs} epochs...")
 
     # Track training history for model card
     training_history = []
 
     for epoch in range(start_epoch, config.num_epochs):
+        # Set epoch for distributed sampler (ensures proper shuffling)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+        
         avg_loss, global_step = train_epoch(
             model=model,
             train_loader=train_loader,
@@ -1445,56 +1560,68 @@ def main():
             epoch=epoch,
             global_step=global_step,
             wandb_run=wandb_run,
-            wandb_logger=wandb_logger
+            wandb_logger=wandb_logger,
+            is_distributed=is_distributed,
+            is_main_process=is_main_process
         )
 
-        print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+        if is_main_process:
+            print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
 
-        # Log weight histograms at end of epoch (if wandb_logger available)
-        if wandb_logger and (epoch % max(1, config.num_epochs // 5) == 0):
-            wandb_logger.log_model_weights_histogram(model, global_step)
+            # Log weight histograms at end of epoch (if wandb_logger available)
+            if wandb_logger and (epoch % max(1, config.num_epochs // 5) == 0):
+                wandb_logger.log_model_weights_histogram(model, global_step)
 
-        # Determine stage name for HF commit message
-        stage_name = args.config if hasattr(args, 'config') else 'default'
+            # Determine stage name for HF commit message
+            stage_name = args.config if hasattr(args, 'config') else 'default'
 
-        # Save epoch checkpoint with statistics
-        checkpoint_path, stats = save_epoch_checkpoint(
-            model, optimizer, epoch, global_step, config, stage_name
-        )
+            # Save epoch checkpoint with statistics
+            checkpoint_path, stats = save_epoch_checkpoint(
+                model, optimizer, epoch, global_step, config, stage_name
+            )
 
-        # Add to training history (for model card)
-        training_history.append({
-            'epoch': epoch,
-            'train_loss': avg_loss,
-            'alignment_loss': stats.get('alignment_loss', 0),
-            'learning_rate': optimizer.param_groups[0]['lr'],
-            'gradient_norm': stats.get('gradient_norm', 0)
-        })
+            # Add to training history (for model card)
+            training_history.append({
+                'epoch': epoch,
+                'train_loss': avg_loss,
+                'alignment_loss': stats.get('alignment_loss', 0),
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                'gradient_norm': stats.get('gradient_norm', 0)
+            })
 
-        # Log statistics to WandB
-        if wandb_logger:
-            wandb_logger.log_metrics(
-                stats, step=global_step, prefix="model_stats")
+            # Log statistics to WandB
+            if wandb_logger:
+                wandb_logger.log_metrics(
+                    stats, step=global_step, prefix="model_stats")
 
-        # Push ONLY latest checkpoint to HuggingFace (replaces previous)
-        push_to_huggingface(
-            checkpoint_path=checkpoint_path,
-            stats=stats,
-            epoch=epoch,
-            total_epochs=config.num_epochs,
-            stage_name=stage_name,
-            config=config,
-            training_history=training_history
-        )
+            # Push ONLY latest checkpoint to HuggingFace (replaces previous)
+            push_to_huggingface(
+                checkpoint_path=checkpoint_path,
+                stats=stats,
+                epoch=epoch,
+                total_epochs=config.num_epochs,
+                stage_name=stage_name,
+                config=config,
+                training_history=training_history
+            )
+        
+        # Synchronize all processes before next epoch
+        if is_distributed:
+            dist.barrier()
 
-    # Final save
-    final_path = Path(config.output_dir) / "final_model.pt"
-    model.save_checkpoint(str(final_path))
+    # Final save (main process only)
+    if is_main_process:
+        final_path = Path(config.output_dir) / "final_model.pt"
+        base_model = model.module if hasattr(model, 'module') else model
+        base_model.save_checkpoint(str(final_path))
+        print(f"Training complete! Final model saved to {final_path}")
 
-    print(f"Training complete! Final model saved to {final_path}")
-
-    if wandb_run:
-        wandb_run.finish()
+        if wandb_run:
+            wandb_run.finish()
+    
+    # Clean up distributed training
+    if is_distributed:
+        dist.destroy_process_group()
 
 
 if __name__ == "__main__":
