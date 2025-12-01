@@ -16,8 +16,12 @@ from pathlib import Path
 
 
 def all_reduce(x, op="AVG"):
-    """Distributed all-reduce helper"""
-    if dist.is_available() and dist.is_initialized():
+    """Distributed all-reduce helper
+    
+    Note: For visualization which only runs on main process,
+    we skip distributed sync to avoid CPU tensor issues.
+    """
+    if dist.is_available() and dist.is_initialized() and x.is_cuda:
         return functional_all_reduce(x, op.lower(), dist.group.WORLD)
     else:
         return x
