@@ -231,9 +231,9 @@ class WandBLogger:
         
         metrics = {}
         
-        # Logits statistics
-        if 'logits' in outputs:
-            logits = outputs['logits']
+        # Logits statistics (skip if LM was not run, e.g., Stage 1 alignment-only)
+        logits = outputs.get('logits')
+        if logits is not None:
             metrics['language/logits_mean'] = logits.mean().item()
             metrics['language/logits_std'] = logits.std().item()
             metrics['language/logits_max'] = logits.max().item()
@@ -250,13 +250,16 @@ class WandBLogger:
             metrics['language/unique_predicted_tokens'] = unique_tokens
         
         # Hidden states statistics (if available)
-        if 'hidden_states' in outputs and outputs['hidden_states']:
-            last_hidden = outputs['hidden_states'][-1]
+        hidden_states = outputs.get('hidden_states')
+        if hidden_states is not None and len(hidden_states) > 0:
+            last_hidden = hidden_states[-1]
             metrics['language/hidden_state_mean'] = last_hidden.mean().item()
             metrics['language/hidden_state_std'] = last_hidden.std().item()
             metrics['language/hidden_state_norm'] = torch.norm(last_hidden, dim=-1).mean().item()
         
-        self.wandb_run.log(metrics, step=global_step)
+        # Only log if we have metrics to log
+        if metrics:
+            self.wandb_run.log(metrics, step=global_step)
     
     def log_alignment_metrics(self, image_features, text_features, global_step, 
                              num_samples=4):
