@@ -274,6 +274,14 @@ class MicroVLM(nn.Module):
         skip_lm_loss = _get_training_attr('skip_lm_loss', False)
         lm_weight = _get_training_attr('lm_loss_weight', 1.0)
         
+        # Debug: Print once at the start of training
+        if not hasattr(self, '_lm_skip_logged'):
+            print(f"\n🔧 LM Loss Config: skip_lm_loss={skip_lm_loss}, lm_weight={lm_weight}")
+            print(f"   training_config type: {type(self.training_config)}")
+            if self.training_config is not None:
+                print(f"   skip_lm_loss attr exists: {hasattr(self.training_config, 'skip_lm_loss')}")
+            self._lm_skip_logged = True
+        
         # Skip LM forward pass if lm_weight is 0 or skip_lm_loss is True
         # This saves significant compute when LM is frozen
         if skip_lm_loss or lm_weight == 0.0:
