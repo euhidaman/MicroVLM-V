@@ -47,6 +47,7 @@ class TrainingConfig:
     addressing_kl_weight: float = 0.005
     lm_loss_weight: float = 1.0
     alignment_loss_weight: float = 1.0
+    skip_lm_loss: bool = False  # Skip LM forward pass (for alignment-only training)
 
     # Alignment
     use_alignment: bool = True
@@ -95,16 +96,25 @@ class Stage1Config(TrainingConfig):
     Stage 1: Alignment Training Without Memory
     Focus on learning image-text alignment before introducing memory
     Based on EVO-1 methodology
+    
+    KEY INSIGHT: Since both vision and language models are FROZEN,
+    we only train the multimodal adapter using contrastive alignment loss.
+    LM loss is disabled because a frozen LM cannot improve.
     """
     # Override defaults for Stage 1
     use_memory: bool = False  # Disable memory in Stage 1
     num_epochs: int = 15  # Increased for stable alignment convergence
-    learning_rate: float = 5e-5  # Lower LR for contrastive learning stability
-    warmup_steps: int = 3000  # ~5-10% of total steps for gradual warmup
-    batch_size: int = 128  # Increased for A100 80GB GPUs (was 64)
+    learning_rate: float = 1e-4  # Slightly higher LR for adapter-only training
+    warmup_steps: int = 1000  # Faster warmup for smaller trainable params
+    batch_size: int = 128  # Large batches critical for contrastive learning
     num_workers: int = 12
-    gradient_clip: float = 0.3  # Tighter clipping for alignment-only training
-    alignment_loss_weight: float = 1.0  # Full weight since it's the only loss
+    gradient_clip: float = 1.0  # Relaxed clipping - adapter gradients are well-behaved
+    
+    # Loss weights for Stage 1 - ALIGNMENT ONLY
+    # LM is frozen so LM loss is constant and provides no learning signal
+    lm_loss_weight: float = 0.0  # DISABLED - frozen LM can't improve
+    alignment_loss_weight: float = 1.0  # Full weight - this is the ONLY trainable objective
+    skip_lm_loss: bool = True  # Flag to skip LM forward pass entirely (saves compute)
 
     # Adapter-focused training
     freeze_vision: bool = True

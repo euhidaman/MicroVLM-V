@@ -263,50 +263,6 @@ class MicroVLM(nn.Module):
         else:
             kv_memory = None
 
-        # Language model forward pass
-        # Adjust labels to match fused_embeddings length if we added prefix tokens
-        adjusted_labels = labels
-        if labels is not None and prefix_tokens is not None:
-            # Pad labels with -100 (ignore_index) for prefix tokens
-            batch_size = labels.size(0)
-            prefix_len = prefix_tokens.size(1)
-            prefix_labels = torch.full(
-                (batch_size, prefix_len),
-                -100,
-                dtype=labels.dtype,
-                device=labels.device
-            )
-            adjusted_labels = torch.cat([prefix_labels, labels], dim=1)
-
-        lm_outputs = self.language_model(
-            inputs_embeds=fused_embeddings,
-            attention_mask=fused_mask,
-            labels=adjusted_labels,
-            output_hidden_states=True,
-            return_dict=True
-        )
-
-        # Validate LM loss before assignment
-        if lm_outputs.loss is not None and (torch.isnan(lm_outputs.loss) or torch.isinf(lm_outputs.loss)):
-            # Debug: print what caused NaN
-            if torch.isnan(fused_embeddings).any():
-                print(f"⚠️  NaN in fused_embeddings despite sanitization")
-            if adjusted_labels is not None:
-                if torch.isnan(adjusted_labels.float()).any():
-                    print(f"⚠️  NaN in adjusted_labels")
-                # Check label range
-                valid_labels = adjusted_labels[adjusted_labels != -100]
-                if len(valid_labels) > 0:
-                    if valid_labels.min() < 0 or valid_labels.max() >= self.language_model.vocab_size:
-                        print(
-                            f"⚠️  Invalid label range: [{valid_labels.min()}, {valid_labels.max()}] (vocab: {self.language_model.vocab_size})")
-            outputs['lm_loss'] = None
-        else:
-            outputs['lm_loss'] = lm_outputs.loss
-
-        outputs['logits'] = lm_outputs.logits
-        outputs['hidden_states'] = lm_outputs.hidden_states
-
         def _get_training_attr(name, default):
             if self.training_config is None:
                 return default
@@ -314,8 +270,62 @@ class MicroVLM(nn.Module):
                 return self.training_config.get(name, default)
             return getattr(self.training_config, name, default)
 
+        # Check if we should skip LM loss (for Stage 1 alignment-only training)
+        skip_lm_loss = _get_training_attr('skip_lm_loss', False)
         lm_weight = _get_training_attr('lm_loss_weight', 1.0)
-        alignment_weight = _get_training_attr('alignment_loss_weight', 0.1)
+        
+        # Skip LM forward pass if lm_weight is 0 or skip_lm_loss is True
+        # This saves significant compute when LM is frozen
+        if skip_lm_loss or lm_weight == 0.0:
+            outputs['lm_loss'] = None
+            outputs['logits'] = None
+            outputs['hidden_states'] = None
+        else:
+            # Language model forward pass
+            # Adjust labels to match fused_embeddings length if we added prefix tokens
+            adjusted_labels = labels
+            if labels is not None and prefix_tokens is not None:
+                # Pad labels with -100 (ignore_index) for prefix tokens
+                batch_size = labels.size(0)
+                prefix_len = prefix_tokens.size(1)
+                prefix_labels = torch.full(
+                    (batch_size, prefix_len),
+                    -100,
+                    dtype=labels.dtype,
+                    device=labels.device
+                )
+                adjusted_labels = torch.cat([prefix_labels, labels], dim=1)
+
+            lm_outputs = self.language_model(
+                inputs_embeds=fused_embeddings,
+                attention_mask=fused_mask,
+                labels=adjusted_labels,
+                output_hidden_states=True,
+                return_dict=True
+            )
+
+            # Validate LM loss before assignment
+            if lm_outputs.loss is not None and (torch.isnan(lm_outputs.loss) or torch.isinf(lm_outputs.loss)):
+                # Debug: print what caused NaN
+                if torch.isnan(fused_embeddings).any():
+                    print(f"⚠️  NaN in fused_embeddings despite sanitization")
+                if adjusted_labels is not None:
+                    if torch.isnan(adjusted_labels.float()).any():
+                        print(f"⚠️  NaN in adjusted_labels")
+                    # Check label range
+                    valid_labels = adjusted_labels[adjusted_labels != -100]
+                    if len(valid_labels) > 0:
+                        if valid_labels.min() < 0 or valid_labels.max() >= self.language_model.vocab_size:
+                            print(
+                                f"⚠️  Invalid label range: [{valid_labels.min()}, {valid_labels.max()}] (vocab: {self.language_model.vocab_size})")
+                outputs['lm_loss'] = None
+            else:
+                outputs['lm_loss'] = lm_outputs.loss
+
+            outputs['logits'] = lm_outputs.logits
+            outputs['hidden_states'] = lm_outputs.hidden_states
+
+        alignment_weight = _get_training_attr('alignment_loss_weight', 1.0)
         memory_weight = _get_training_attr('memory_kl_weight', 0.01)
         addressing_weight = _get_training_attr('addressing_kl_weight', 0.001)
 
