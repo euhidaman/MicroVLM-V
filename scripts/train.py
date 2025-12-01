@@ -647,16 +647,34 @@ def create_optimizer(model, config):
 
 
 def create_scheduler(optimizer, config, total_steps):
-    """Create learning rate scheduler"""
+    """Create learning rate scheduler with warmup for stable contrastive learning"""
+    from torch.optim.lr_scheduler import LambdaLR
+    
+    warmup_steps = getattr(config, 'warmup_steps', 1000)
     scheduler_name = getattr(config, 'scheduler', getattr(
         config, 'lr_scheduler', 'cosine'))
+    
     if scheduler_name == "cosine":
-        from torch.optim.lr_scheduler import CosineAnnealingLR
-        scheduler = CosineAnnealingLR(optimizer, T_max=total_steps)
+        # Cosine annealing with linear warmup (CLIP-style)
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                # Linear warmup
+                return float(current_step) / float(max(1, warmup_steps))
+            # Cosine decay after warmup
+            import math
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
+        
+        scheduler = LambdaLR(optimizer, lr_lambda)
     elif scheduler_name == "linear":
-        from torch.optim.lr_scheduler import LinearLR
-        scheduler = LinearLR(optimizer, start_factor=1.0, end_factor=0.1,
-                             total_iters=total_steps)
+        # Linear decay with warmup
+        def lr_lambda(current_step):
+            if current_step < warmup_steps:
+                return float(current_step) / float(max(1, warmup_steps))
+            progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
+            return max(0.0, 1.0 - progress)
+        
+        scheduler = LambdaLR(optimizer, lr_lambda)
     else:
         scheduler = None
 

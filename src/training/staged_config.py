@@ -95,26 +95,35 @@ class Stage1Config(TrainingConfig):
     """
     Stage 1: Alignment Training Without Memory
     Focus on learning image-text alignment before introducing memory
-    Based on EVO-1 methodology
+    Based on CLIP/EVO-1 methodology
     
     KEY INSIGHT: Since both vision and language models are FROZEN,
     we only train the multimodal adapter using contrastive alignment loss.
     LM loss is disabled because a frozen LM cannot improve.
+    
+    HYPERPARAMETERS tuned for stable contrastive learning:
+    - Lower LR (5e-5) with proper warmup prevents oscillation
+    - Large batch size (256) for better negative sampling
+    - Label smoothing in loss helps generalization
+    - Learnable temperature adapts to data
     """
     # Override defaults for Stage 1
     use_memory: bool = False  # Disable memory in Stage 1
-    num_epochs: int = 15  # Increased for stable alignment convergence
-    learning_rate: float = 1e-4  # Slightly higher LR for adapter-only training
-    warmup_steps: int = 1000  # Faster warmup for smaller trainable params
-    batch_size: int = 128  # Large batches critical for contrastive learning
-    num_workers: int = 12
-    gradient_clip: float = 1.0  # Relaxed clipping - adapter gradients are well-behaved
+    num_epochs: int = 10  # Reduced - contrastive learning converges faster
+    learning_rate: float = 5e-5  # Lower LR for stable contrastive learning (CLIP uses 5e-4 for full model)
+    warmup_steps: int = 2000  # ~10% of epoch, critical for contrastive stability
+    batch_size: int = 256  # Larger batches = more negatives = better contrastive learning
+    num_workers: int = 16
+    gradient_clip: float = 1.0  # Standard clipping
+    weight_decay: float = 0.1  # Higher weight decay for regularization
     
     # Loss weights for Stage 1 - ALIGNMENT ONLY
-    # LM is frozen so LM loss is constant and provides no learning signal
     lm_loss_weight: float = 0.0  # DISABLED - frozen LM can't improve
     alignment_loss_weight: float = 1.0  # Full weight - this is the ONLY trainable objective
-    skip_lm_loss: bool = True  # Flag to skip LM forward pass entirely (saves compute)
+    skip_lm_loss: bool = True  # Skip LM forward pass (saves compute)
+    
+    # Contrastive learning specific
+    alignment_temperature: float = 0.07  # Initial temperature (will be learned)
 
     # Adapter-focused training
     freeze_vision: bool = True
@@ -122,13 +131,14 @@ class Stage1Config(TrainingConfig):
     train_adapter_only: bool = True
     unfreeze_last_n_layers: int = 0
 
-    # Quantization - Disabled for higher GPU compute load
+    # Quantization - Disabled for full precision training
     enable_quantization: bool = False
     quantize_vision_4bit: bool = False
     quantize_language_4bit: bool = False
 
-    # More frequent monitoring during alignment learning
-    visualize_interval: int = 50
+    # Monitoring
+    log_interval: int = 25  # More frequent logging to track loss
+    visualize_interval: int = 100
     viz_save_interval: int = 2000
 
     wandb_run_name: str = "stage1_alignment"

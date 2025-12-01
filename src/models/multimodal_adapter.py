@@ -106,14 +106,24 @@ class MultimodalAdapter(nn.Module):
 
 class ContrastiveAlignmentLoss(nn.Module):
     """
-    EVO-1 style contrastive alignment loss
-    Implements image-text alignment learning
+    CLIP-style contrastive alignment loss with learnable temperature
+    Implements image-text alignment learning with improved stability
     """
     
-    def __init__(self, temperature=0.07):
+    def __init__(self, temperature=0.07, learnable_temperature=True, label_smoothing=0.1):
         super().__init__()
-        self.temperature = temperature
-        self.cross_entropy = nn.CrossEntropyLoss()
+        self.learnable_temperature = learnable_temperature
+        self.label_smoothing = label_smoothing
+        
+        if learnable_temperature:
+            # Learnable log temperature (CLIP style) - initialized to log(1/0.07) ≈ 2.66
+            # Clamped to prevent instability
+            self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / temperature))
+        else:
+            self.register_buffer('logit_scale', torch.ones([]) * math.log(1 / temperature))
+        
+        # Use label smoothing for better generalization
+        self.cross_entropy = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
     
     def forward(self, image_features, text_features):
         """
@@ -126,20 +136,25 @@ class ContrastiveAlignmentLoss(nn.Module):
         Returns:
             loss: scalar tensor
         """
-        # Normalize features
+        # Normalize features (L2 normalization)
         image_features = F.normalize(image_features, p=2, dim=-1)
         text_features = F.normalize(text_features, p=2, dim=-1)
         
-        # Compute similarity matrix
-        logits = torch.matmul(image_features, text_features.t()) / self.temperature
+        # Clamp logit_scale to prevent NaN/explosion (CLIP uses 0-100 range)
+        logit_scale = torch.clamp(self.logit_scale, min=0, max=4.6052)  # max = log(100)
+        
+        # Compute similarity matrix with learnable temperature
+        # shape: (batch_size, batch_size)
+        logits_per_image = logit_scale.exp() * torch.matmul(image_features, text_features.t())
+        logits_per_text = logits_per_image.t()
         
         # Labels: diagonal elements are positive pairs
         batch_size = image_features.size(0)
         labels = torch.arange(batch_size, device=image_features.device)
         
-        # Bidirectional loss
-        loss_i2t = self.cross_entropy(logits, labels)
-        loss_t2i = self.cross_entropy(logits.t(), labels)
+        # Bidirectional loss (image->text and text->image)
+        loss_i2t = self.cross_entropy(logits_per_image, labels)
+        loss_t2i = self.cross_entropy(logits_per_text, labels)
         
         loss = (loss_i2t + loss_t2i) / 2
         
