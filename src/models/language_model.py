@@ -96,9 +96,11 @@ class Qwen2LanguageModel(nn.Module):
                 device_map="auto"
             )
         else:
+            # Load in float32 for consistent dtype handling across all environments
+            # Mixed precision should be handled by torch.cuda.amp.autocast, not model loading
             self.model = AutoModelForCausalLM.from_pretrained(
                 model_name_or_path,
-                dtype=torch.float16,
+                torch_dtype=torch.float32,
                 trust_remote_code=True
             )
 
