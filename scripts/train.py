@@ -1,6 +1,6 @@
 """
 Main Training Script for MicroVLM-V
-Supports small-scale testing and full training stages
+Supports small-scale testing, full training stages, and FIBER-style training
 """
 
 from src.quantization.quantized_episodic_memory import get_memory_quantization_stats
@@ -10,7 +10,7 @@ from src.visualization.attention_vis import create_attention_visualizer
 from src.training.staged_config import load_config as load_staged_config
 from src.training.config import load_config, create_run_name
 from src.data.cc12m_loader import create_dataloaders
-from src.models import create_microvlm
+from src.models import create_microvlm, create_microvlm_fiber, MicroVLMFIBER
 import os
 import sys
 import json
@@ -805,6 +805,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
     lm_loss_total = 0
     alignment_loss_total = 0
     memory_kl_total = 0
+    itc_loss_total = 0
+    itm_loss_total = 0
+
+    # Check if using FIBER mode
+    use_fiber = getattr(config, 'alignment_mode', 'baseline') == 'fiber'
 
     # Only show progress bar on main process
     if is_main_process:
@@ -821,16 +826,30 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # Labels for language modeling (shifted in model)
         labels = input_ids.clone()
 
-        # Forward pass
-        outputs = model(
-            images=images,
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            labels=labels,
-            use_memory=config.use_memory,
-            use_alignment=config.use_alignment,
-            episode_size=config.episode_size
-        )
+        # Forward pass - different path for FIBER vs baseline
+        # Get base model (unwrap DDP/DP if needed)
+        base_model = model.module if hasattr(model, 'module') else model
+        
+        if use_fiber and isinstance(base_model, MicroVLMFIBER):
+            # FIBER forward pass with ITC + ITM losses
+            outputs = model(
+                images=images,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                mode='fiber'  # Use FIBER training mode
+            )
+        else:
+            # Baseline forward pass
+            outputs = model(
+                images=images,
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                labels=labels,
+                use_memory=config.use_memory,
+                use_alignment=config.use_alignment,
+                episode_size=config.episode_size
+            )
 
         loss = outputs['loss']
 
@@ -843,6 +862,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     print(f"  LM loss: {outputs['lm_loss'].item()}")
                 if 'alignment_loss' in outputs:
                     print(f"  Alignment loss: {outputs['alignment_loss'].item()}")
+                if 'itc_loss' in outputs:
+                    print(f"  ITC loss: {outputs['itc_loss'].item()}")
+                if 'itm_loss' in outputs:
+                    print(f"  ITM loss: {outputs['itm_loss'].item()}")
                 if 'memory_kl' in outputs:
                     print(f"  Memory KL: {outputs['memory_kl'].item()}")
                 if 'addressing_kl' in outputs:
@@ -894,6 +917,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         memory_kl_val = outputs.get('memory_kl')
         memory_kl_total += memory_kl_val.item() if memory_kl_val is not None else 0
+        
+        # FIBER-specific losses
+        itc_loss_val = outputs.get('itc_loss')
+        itc_loss_total += itc_loss_val.item() if itc_loss_val is not None else 0
+        
+        itm_loss_val = outputs.get('itm_loss')
+        itm_loss_total += itm_loss_val.item() if itm_loss_val is not None else 0
 
         global_step += 1
 
@@ -913,13 +943,26 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 align_display_val = f"{align_loss_display.item():.3f}"
             else:
                 align_display_val = 'none'
-
-            pbar.set_postfix({
-                'loss': f"{loss.item():.3f}",
-                'lm': lm_display_val,
-                'align': align_display_val,
-                'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
-            })
+            
+            # Build postfix dict based on training mode
+            if use_fiber:
+                # FIBER mode: show ITC and ITM losses
+                itc_val = outputs.get('itc_loss')
+                itm_val = outputs.get('itm_loss')
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.3f}",
+                    'itc': f"{itc_val.item():.3f}" if itc_val is not None else 'none',
+                    'itm': f"{itm_val.item():.3f}" if itm_val is not None else 'none',
+                    'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
+                })
+            else:
+                # Baseline mode: show LM and alignment losses
+                pbar.set_postfix({
+                    'loss': f"{loss.item():.3f}",
+                    'lm': lm_display_val,
+                    'align': align_display_val,
+                    'lr': f"{optimizer.param_groups[0]['lr']:.2e}"
+                })
 
         # Logging (main process only)
         if is_main_process and global_step % config.log_interval == 0:
@@ -1358,8 +1401,20 @@ def main():
                         help='Enable multi-GPU training with DistributedDataParallel')
     parser.add_argument('--local_rank', type=int, default=-1,
                         help='Local rank for distributed training (set automatically by torchrun)')
+    parser.add_argument('--alignment_mode', type=str, default='baseline',
+                        choices=['baseline', 'fiber'],
+                        help='Alignment mode: baseline (prefix-only) or fiber (fusion-in-backbone)')
+    parser.add_argument('--fiber_layers', type=str, default='6,8,10',
+                        help='Comma-separated list of vision encoder layers for FIBER fusion (default: 6,8,10)')
+    parser.add_argument('--itc_weight', type=float, default=1.0,
+                        help='Weight for ITC (image-text contrastive) loss in FIBER mode')
+    parser.add_argument('--itm_weight', type=float, default=0.5,
+                        help='Weight for ITM (image-text matching) loss in FIBER mode')
 
     args = parser.parse_args()
+
+    # Parse FIBER layers
+    fiber_fusion_layers = [int(x.strip()) for x in args.fiber_layers.split(',')]
 
     # Cap num_workers at 32
     args.num_workers = min(max(args.num_workers, 0), 32)
@@ -1441,27 +1496,60 @@ def main():
         wandb_logger = WandBLogger(config, wandb_run) if wandb_run else None
 
     # Create model with quantization settings
-    print("Creating model...")
-    print(f"  - 4-bit quantization: Vision={getattr(config, 'quantize_vision_4bit', False)}, "
-          f"Language={getattr(config, 'quantize_language_4bit', False)}")
-    print(
-        f"  - 1.58-bit memory quantization: {getattr(config, 'quantize_memory_158bit', False)}")
+    if is_main_process:
+        print("Creating model...")
+        print(f"  - Alignment mode: {args.alignment_mode}")
+        if args.alignment_mode == 'fiber':
+            print(f"  - FIBER fusion layers: {fiber_fusion_layers}")
+            print(f"  - ITC weight: {args.itc_weight}, ITM weight: {args.itm_weight}")
+        print(f"  - 4-bit quantization: Vision={getattr(config, 'quantize_vision_4bit', False)}, "
+              f"Language={getattr(config, 'quantize_language_4bit', False)}")
+        print(
+            f"  - 1.58-bit memory quantization: {getattr(config, 'quantize_memory_158bit', False)}")
 
-    model = create_microvlm(
-        config=model_config['model_dimensions'],
-        language_checkpoint=getattr(
-            config, 'language_checkpoint', config.qwen_model),
-        vision_checkpoint=getattr(
-            config, 'vision_checkpoint', config.deit_checkpoint),
-        quantize_4bit=(getattr(config, 'quantize_vision_4bit', False) or
-                       getattr(config, 'quantize_language_4bit', False)),
-        quantize_memory_158bit=getattr(
-            config, 'quantize_memory_158bit', False),
-        training_config=config
-    )
+    if args.alignment_mode == 'fiber':
+        # Create FIBER model with fusion-in-backbone alignment
+        # Build FIBER config
+        fiber_config = {
+            'fiber_fusion_layers': fiber_fusion_layers,
+            'cross_attention_heads': 4,
+            'cross_attention_dim': model_config['model_dimensions'].get('vision_hidden_size', 192),
+            'use_bidirectional': True,
+            'alpha_init': 0.0,
+            'embed_dim': 256,
+            'itc_weight': args.itc_weight,
+            'itm_weight': args.itm_weight,
+        }
+        
+        model = create_microvlm_fiber(
+            config=model_config['model_dimensions'],
+            vision_checkpoint=getattr(
+                config, 'vision_checkpoint', config.deit_checkpoint),
+            language_checkpoint=getattr(
+                config, 'language_checkpoint', config.qwen_model),
+            training_config=config,
+            fiber_config=fiber_config
+        )
+        
+        if is_main_process:
+            print(f"  ✓ Created MicroVLMFIBER model with fusion at layers {fiber_fusion_layers}")
+    else:
+        # Create baseline MicroVLM model
+        model = create_microvlm(
+            config=model_config['model_dimensions'],
+            language_checkpoint=getattr(
+                config, 'language_checkpoint', config.qwen_model),
+            vision_checkpoint=getattr(
+                config, 'vision_checkpoint', config.deit_checkpoint),
+            quantize_4bit=(getattr(config, 'quantize_vision_4bit', False) or
+                           getattr(config, 'quantize_language_4bit', False)),
+            quantize_memory_158bit=getattr(
+                config, 'quantize_memory_158bit', False),
+            training_config=config
+        )
 
     # Log quantization statistics if enabled
-    if getattr(config, 'quantize_memory_158bit', False):
+    if getattr(config, 'quantize_memory_158bit', False) and hasattr(model, 'episodic_memory'):
         quant_stats = get_memory_quantization_stats(model.episodic_memory)
         print("\n=== Memory Quantization Statistics ===")
         for key, value in quant_stats.items():
@@ -1472,13 +1560,26 @@ def main():
             wandb_logger.log_metrics(
                 quant_stats, step=0, prefix="quantization")
 
-    # Apply freezing strategy
-    if config.freeze_vision:
-        model.freeze_vision_encoder()
+    # Apply freezing strategy (different for FIBER vs baseline)
+    if args.alignment_mode == 'fiber':
+        # For FIBER: freeze language model but keep vision encoder trainable for fusion
+        if config.freeze_language:
+            model.freeze_language_model(
+                unfreeze_last_n=config.unfreeze_last_n_layers)
+        # Note: FIBER vision encoder has fusion layers that need to be trainable
+        # The base DeiT layers can optionally be frozen
+        if config.freeze_vision:
+            # Freeze base vision encoder but keep fusion layers trainable
+            if hasattr(model, 'fiber_vision_encoder'):
+                model.fiber_vision_encoder.freeze_base_vision(freeze=True)
+    else:
+        # Baseline freezing strategy
+        if config.freeze_vision:
+            model.freeze_vision_encoder()
 
-    if config.freeze_language:
-        model.freeze_language_model(
-            unfreeze_last_n=config.unfreeze_last_n_layers)
+        if config.freeze_language:
+            model.freeze_language_model(
+                unfreeze_last_n=config.unfreeze_last_n_layers)
 
     # Print trainable parameters
     trainable_params = model.get_trainable_params()
@@ -1486,6 +1587,8 @@ def main():
     if is_main_process:
         print(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
               f"({100*trainable_params/total_params:.2f}%)")
+        if args.alignment_mode == 'fiber':
+            print("  ✓ FIBER fusion layers are trainable")
 
     # Move to device (use local_rank for DDP, otherwise config.device)
     if is_distributed:
@@ -1508,6 +1611,9 @@ def main():
     
     # Update config device for consistency
     config.device = device
+    
+    # Store alignment mode in config for use in training loop
+    config.alignment_mode = args.alignment_mode
 
     # Create visualizer
     visualizer = create_attention_visualizer(model_config['model_dimensions'])
