@@ -9,6 +9,7 @@ from src.visualization.wandb_logger import WandBLogger
 from src.visualization.attention_vis import create_attention_visualizer
 from src.training.staged_config import load_config as load_staged_config
 from src.training.config import load_config, create_run_name
+from src.training.loss_smoother import LossSmoother, create_loss_smoother
 from src.data.cc12m_loader import create_dataloaders
 from src.models import create_microvlm, create_microvlm_fiber, MicroVLMFIBER
 import os
@@ -782,7 +783,7 @@ def compute_gradient_flow_metrics(model):
 
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, wandb_run=None, wandb_logger=None,
-                is_distributed=False, is_main_process=True):
+                is_distributed=False, is_main_process=True, loss_smoother=None):
     """Train for one epoch
     
     Args:
@@ -798,6 +799,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         wandb_logger: WandB logger object
         is_distributed: Whether using distributed training
         is_main_process: Whether this is the main process (rank 0)
+        loss_smoother: Optional LossSmoother for tracking smoothed loss metrics
     """
     model.train()
 
@@ -926,6 +928,24 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         itm_loss_val = outputs.get('itm_loss')
         itm_loss_total += itm_loss_val.item() if itm_loss_val is not None else 0
 
+        # Update loss smoother (visualization only, does not affect training)
+        if loss_smoother is not None and is_main_process:
+            # Collect component losses for detailed tracking
+            component_losses = {}
+            if itc_loss_val is not None:
+                component_losses['itc'] = itc_loss_val.item()
+            if itm_loss_val is not None:
+                component_losses['itm'] = itm_loss_val.item()
+            if alignment_loss_val is not None:
+                component_losses['alignment'] = alignment_loss_val.item()
+            if lm_loss_val is not None:
+                component_losses['lm'] = lm_loss_val.item()
+            if memory_kl_val is not None:
+                component_losses['memory_kl'] = memory_kl_val.item()
+            
+            # Update smoother with raw loss and components
+            loss_smoother.update(loss.item(), components=component_losses)
+
         global_step += 1
 
         # Update progress bar (main process only)
@@ -985,6 +1005,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 # Language model metrics
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
+                
+                # Log smoothed loss metrics (visualization only)
+                if loss_smoother is not None:
+                    smoothed_metrics = loss_smoother.get_wandb_metrics(prefix='train')
+                    wandb_logger.log_metrics(smoothed_metrics, step=global_step)
 
             # Legacy simple logging (fallback)
             elif wandb_run:
@@ -1004,6 +1029,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 if 'memory_kl' in outputs:
                     metrics['train/memory_kl'] = outputs['memory_kl'].item()
                     metrics['train/addressing_kl'] = outputs['addressing_kl'].item()
+                
+                # Add smoothed metrics for legacy logging
+                if loss_smoother is not None:
+                    metrics.update(loss_smoother.get_wandb_metrics(prefix='train'))
 
                 wandb_run.log(metrics, step=global_step)
 
@@ -1423,6 +1452,13 @@ def main():
                         help='Weight for ITC (image-text contrastive) loss in FIBER mode')
     parser.add_argument('--itm_weight', type=float, default=0.5,
                         help='Weight for ITM (image-text matching) loss in FIBER mode')
+    
+    # Loss smoothing arguments (visualization only, does not affect training)
+    parser.add_argument('--loss_smoothing_window', type=int, default=50,
+                        help='Sliding window size for loss smoothing (default: 50). Set to 0 to disable.')
+    parser.add_argument('--ema_loss_alpha', type=float, default=0.1,
+                        help='EMA decay factor for loss smoothing (default: 0.1). '
+                             'Smaller = smoother. Set to 0 to disable EMA.')
 
     args = parser.parse_args()
 
@@ -1431,6 +1467,10 @@ def main():
 
     # Cap num_workers at 32
     args.num_workers = min(max(args.num_workers, 0), 32)
+    
+    # Process loss smoothing args
+    loss_smoothing_window = args.loss_smoothing_window if args.loss_smoothing_window > 0 else 50
+    ema_loss_alpha = args.ema_loss_alpha if args.ema_loss_alpha > 0 else None
 
     # ========== Multi-GPU / DDP Setup ==========
     is_distributed = False
@@ -1707,6 +1747,19 @@ def main():
         start_epoch = checkpoint['epoch']
         global_step = checkpoint['global_step']
 
+    # Create loss smoother for visualization (does not affect training)
+    loss_smoother = None
+    if is_main_process and loss_smoothing_window > 0:
+        loss_smoother = create_loss_smoother(
+            window_size=loss_smoothing_window,
+            ema_alpha=ema_loss_alpha,
+            enabled=True
+        )
+        print(f"\n📊 Loss Smoothing Enabled:")
+        print(f"  Window size: {loss_smoothing_window}")
+        print(f"  EMA alpha: {ema_loss_alpha if ema_loss_alpha else 'disabled'}")
+        print(f"  (Visualization only - does not affect training)\n")
+
     # Training loop
     if is_main_process:
         print(f"Starting training for {config.num_epochs} epochs...")
@@ -1731,11 +1784,20 @@ def main():
             wandb_run=wandb_run,
             wandb_logger=wandb_logger,
             is_distributed=is_distributed,
-            is_main_process=is_main_process
+            is_main_process=is_main_process,
+            loss_smoother=loss_smoother
         )
 
         if is_main_process:
             print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+            
+            # Print smoothed loss summary at epoch end
+            if loss_smoother is not None:
+                stats = loss_smoother.get_stats()
+                print(f"  Smoothed loss: {stats['current_smoothed']:.4f}")
+                print(f"  Running minimum: {stats['current_min']:.4f}")
+                if stats.get('current_ema') is not None:
+                    print(f"  EMA loss: {stats['current_ema']:.4f}")
 
             # Log weight histograms at end of epoch (if wandb_logger available)
             if wandb_logger and (epoch % max(1, config.num_epochs // 5) == 0):
