@@ -837,7 +837,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 input_ids=input_ids,
                 attention_mask=attention_mask,
                 labels=labels,
-                mode='fiber'  # Use FIBER training mode
+                use_memory=config.use_memory,
+                use_alignment=True  # Always use alignment in FIBER mode
             )
         else:
             # Baseline forward pass
