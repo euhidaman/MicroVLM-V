@@ -220,9 +220,9 @@ class FineGrainedAlignmentLoss(nn.Module):
             loss: scalar tensor
             attention_weights: (B, seq_len, num_patches) for visualization
         """
-        # Normalize embeddings
-        patch_norm = F.normalize(patch_embeddings, p=2, dim=-1)
-        text_norm = F.normalize(text_embeddings, p=2, dim=-1)
+        # Normalize embeddings - ensure same dtype for mixed precision training
+        patch_norm = F.normalize(patch_embeddings.float(), p=2, dim=-1)
+        text_norm = F.normalize(text_embeddings.float(), p=2, dim=-1)
         
         # Compute text-to-patch attention: (B, seq_len, num_patches)
         attention_logits = torch.bmm(text_norm, patch_norm.transpose(1, 2)) / self.temperature

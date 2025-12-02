@@ -609,9 +609,9 @@ class FIBERAlignmentLoss(nn.Module):
         Returns:
             loss: scalar tensor
         """
-        # Normalize
-        image_features = F.normalize(image_features, p=2, dim=-1)
-        text_features = F.normalize(text_features, p=2, dim=-1)
+        # Normalize - ensure float32 for mixed precision compatibility
+        image_features = F.normalize(image_features.float(), p=2, dim=-1)
+        text_features = F.normalize(text_features.float(), p=2, dim=-1)
         
         # Clamp temperature
         logit_scale = torch.clamp(self.logit_scale, min=0, max=4.6052).exp()
@@ -722,9 +722,9 @@ class FIBERAlignmentLoss(nn.Module):
             loss: scalar tensor
             attention: (B, seq_len, num_patches) attention weights
         """
-        # Normalize
-        patch_norm = F.normalize(patch_embeddings, p=2, dim=-1)
-        text_norm = F.normalize(text_embeddings, p=2, dim=-1)
+        # Normalize - ensure float32 for mixed precision compatibility
+        patch_norm = F.normalize(patch_embeddings.float(), p=2, dim=-1)
+        text_norm = F.normalize(text_embeddings.float(), p=2, dim=-1)
         
         # Compute attention scores
         attention_logits = torch.bmm(text_norm, patch_norm.transpose(1, 2))  # (B, seq_len, num_patches)
