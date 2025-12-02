@@ -1014,7 +1014,14 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             viz_model = model.module if hasattr(model, 'module') else model
             with torch.no_grad():
                 # Extract features for visualization
-                prefix_tokens, image_features = viz_model.encode_image(images[:4])
+                # Handle both baseline (2 returns) and FIBER (4 returns) models
+                encode_result = viz_model.encode_image(images[:4])
+                if len(encode_result) == 4:
+                    # FIBER model returns: prefix_tokens, image_features, patch_embeddings_proj, fiber_attention
+                    prefix_tokens, image_features, _, _ = encode_result
+                else:
+                    # Baseline model returns: prefix_tokens, image_features
+                    prefix_tokens, image_features = encode_result
                 text_embeddings, text_features = viz_model.encode_text(
                     input_ids[:4], attention_mask[:4]
                 )
@@ -1060,7 +1067,12 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             viz_attention_mask = fixed_samples['attention_mask'][:num_samples].to(
                                 text_device)
 
-                        viz_prefix_tokens, _ = viz_model.encode_image(viz_images)
+                        # Handle both baseline (2 returns) and FIBER (4 returns) models
+                        viz_encode_result = viz_model.encode_image(viz_images)
+                        if len(viz_encode_result) == 4:
+                            viz_prefix_tokens, _, _, _ = viz_encode_result
+                        else:
+                            viz_prefix_tokens, _ = viz_encode_result
                         viz_text_embeddings, _ = viz_model.encode_text(
                             viz_input_ids, viz_attention_mask)
                         attention_from_lm = None
