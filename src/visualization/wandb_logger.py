@@ -156,8 +156,15 @@ class WandBLogger:
             # Take first few samples
             sample_images = images[:num_samples]
             
-            # Extract features
-            patch_embeddings = model.vision_encoder(sample_images)  # (B, num_patches, hidden)
+            # Extract features - handle both baseline and FIBER vision encoders
+            vision_output = model.vision_encoder(sample_images)
+            if isinstance(vision_output, tuple):
+                # FIBER encoder returns (patch_tokens, layer_outputs, fusion_attention)
+                patch_embeddings = vision_output[0]
+            else:
+                # Baseline encoder returns just patch embeddings
+                patch_embeddings = vision_output
+            
             cls_features = model.vision_encoder.get_cls_token(sample_images)  # (B, hidden)
             
             # Log image samples
