@@ -426,24 +426,28 @@ class AttentionVisualizer(nn.Module):
         captions: list,
         save_path: str,
         title: str = "Text-Conditioned Attention",
-        num_images: int = 3
+        num_images: int = 3,
+        text_to_patch_attention: torch.Tensor = None,
+        num_patches: int = 196
     ):
         """
         Create a side-by-side visualization of images with their text-conditioned attention heatmaps
 
         Layout for each image:
         - Left: Original image with caption below
-        - Right: Attention heatmap overlay
+        - Right: Attention heatmap overlay (uses text-to-patch attention if available)
 
         Args:
             images: (B, 3, H, W) tensor of images
-            image_tokens: (B, k_prefix, D) image token embeddings
+            image_tokens: (B, k_prefix, D) image token embeddings (pooled prefix tokens)
             text_tokens: (B, seq_len, D) text token embeddings  
-            attention_weights: (B, seq_len, k_prefix) attention from text to image tokens
+            attention_weights: (B, seq_len, k_prefix) attention from text to prefix tokens
             captions: list of text captions for each image
             save_path: path to save the grid image
             title: title for the visualization
             num_images: number of images to visualize (default: 3)
+            text_to_patch_attention: (B, seq_len, num_patches) direct text-to-patch attention (preferred)
+            num_patches: number of image patches (default: 196 for 14x14 grid)
 
         Returns:
             fig: matplotlib figure
@@ -451,7 +455,6 @@ class AttentionVisualizer(nn.Module):
         # Select first num_images
         num_images = min(num_images, images.size(0), len(captions))
         images = images[:num_images]
-        attention_weights = attention_weights[:num_images]
         captions = captions[:num_images]
 
         # Convert images to numpy (denormalize if needed)
@@ -466,30 +469,45 @@ class AttentionVisualizer(nn.Module):
         # Transpose to (B, H, W, C)
         images_np = images_np.transpose(0, 2, 3, 1)
 
-        # Get attention maps: average over text sequence dimension to get (B, k_prefix)
-        attention_maps = attention_weights.mean(
-            dim=1).cpu().detach().numpy()  # (B, k_prefix)
-
-        # Reshape attention to spatial grid
-        k_prefix = attention_maps.shape[1]
-        grid_size = int(np.sqrt(k_prefix))
-
-        if grid_size * grid_size != k_prefix:
-            # Handle DeiT-Tiny with 197 tokens (196 patches + 1 CLS)
-            if k_prefix == 197:
-                grid_size = 14  # 14x14 = 196
-                attention_maps = attention_maps[:, 1:]  # Remove CLS token
-            elif k_prefix == 196:
-                grid_size = 14
+        # Determine which attention to use:
+        # Prefer text_to_patch_attention (direct 196-patch attention) over prefix attention
+        if text_to_patch_attention is not None:
+            # Use direct text-to-patch attention (B, seq_len, num_patches)
+            attention_maps = text_to_patch_attention[:num_images].mean(dim=1).cpu().detach().numpy()
+            grid_size = int(np.sqrt(num_patches))  # Should be 14 for 196 patches
+        else:
+            # Fallback to prefix attention - need to map k_prefix back to patches
+            # This is less accurate since prefix tokens are pooled representations
+            attention_weights = attention_weights[:num_images]
+            attention_maps = attention_weights.mean(dim=1).cpu().detach().numpy()  # (B, k_prefix)
+            
+            k_prefix = attention_maps.shape[1]
+            grid_size = int(np.sqrt(k_prefix))
+            
+            # Handle non-square prefix counts by interpolating to 14x14
+            if grid_size * grid_size != k_prefix:
+                # Approximate: repeat each prefix token to fill a 14x14 grid
+                # This is not ideal but preserves some spatial information
+                target_size = 14
+                new_attention_maps = []
+                for i in range(num_images):
+                    # Reshape to closest square, pad if needed
+                    side = int(np.ceil(np.sqrt(k_prefix)))
+                    padded = np.pad(attention_maps[i], (0, side*side - k_prefix), mode='edge')
+                    square = padded.reshape(side, side)
+                    # Resize to 14x14
+                    attn_tensor = torch.from_numpy(square).unsqueeze(0).unsqueeze(0).float()
+                    resized = F.interpolate(attn_tensor, size=(target_size, target_size), 
+                                           mode='bilinear', align_corners=False)
+                    new_attention_maps.append(resized.squeeze().numpy())
+                attention_maps = np.array(new_attention_maps)
+                grid_size = target_size
             else:
-                grid_size = int(np.ceil(np.sqrt(k_prefix)))
-                pad_size = grid_size * grid_size - k_prefix
-                if pad_size > 0:
-                    attention_maps = np.pad(
-                        attention_maps, ((0, 0), (0, pad_size)), mode='constant')
+                attention_maps = attention_maps.reshape(num_images, grid_size, grid_size)
 
-        attention_maps = attention_maps.reshape(
-            num_images, grid_size, grid_size)
+        # For text_to_patch_attention, reshape to grid
+        if text_to_patch_attention is not None:
+            attention_maps = attention_maps.reshape(num_images, grid_size, grid_size)
 
         # Upsample attention maps to image resolution
         H, W = images_np.shape[1:3]
@@ -542,8 +560,9 @@ class AttentionVisualizer(nn.Module):
             axes[i, 1].axis('off')
 
             if i == 0:
+                attn_type = "Text-to-Patch" if text_to_patch_attention is not None else "Text-to-Prefix"
                 axes[i, 1].set_title(
-                    'Text-Conditioned Attention', fontsize=12, fontweight='bold', pad=10)
+                    f'{attn_type} Attention', fontsize=12, fontweight='bold', pad=10)
 
         # Add overall title
         fig.suptitle(title, fontsize=14, fontweight='bold', y=0.98)

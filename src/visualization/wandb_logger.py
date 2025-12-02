@@ -62,6 +62,10 @@ class WandBLogger:
         if 'alignment_loss' in outputs:
             metrics['alignment/loss'] = outputs['alignment_loss'].item()
         
+        # Fine-grained alignment loss (text-to-patch attention supervision)
+        if 'fine_grained_loss' in outputs:
+            metrics['alignment/fine_grained_loss'] = outputs['fine_grained_loss'].item()
+        
         # Memory losses
         if 'memory_kl' in outputs:
             metrics['memory/kl_divergence'] = outputs['memory_kl'].item()
@@ -324,6 +328,75 @@ class WandBLogger:
                 logit_scale = alignment_loss_module.logit_scale.exp().item()
                 metrics['alignment/temperature'] = 1.0 / logit_scale  # Convert logit_scale to temperature
                 metrics['alignment/logit_scale'] = logit_scale
+            
+            self.wandb_run.log(metrics, step=global_step)
+    
+    def log_text_to_patch_attention_metrics(self, text_to_patch_attn, attention_mask, global_step):
+        """
+        Log quantitative metrics for text-to-patch attention quality.
+        
+        These metrics help diagnose whether text tokens are learning to attend to
+        semantically relevant image regions.
+        
+        Args:
+            text_to_patch_attn: (B, seq_len, num_patches) attention weights
+            attention_mask: (B, seq_len) text attention mask
+            global_step: training step
+        """
+        if not self.enabled or text_to_patch_attn is None:
+            return
+        
+        with torch.no_grad():
+            B, seq_len, num_patches = text_to_patch_attn.shape
+            
+            # 1. Attention entropy (lower = more focused)
+            eps = 1e-8
+            entropy = -(text_to_patch_attn * torch.log(text_to_patch_attn + eps)).sum(dim=-1)
+            max_entropy = np.log(num_patches)
+            
+            if attention_mask is not None:
+                # Average over valid tokens only
+                valid_tokens = attention_mask.sum(dim=-1).clamp(min=1)
+                mean_entropy = ((entropy * attention_mask).sum(dim=-1) / valid_tokens).mean().item()
+            else:
+                mean_entropy = entropy.mean().item()
+            
+            normalized_entropy = mean_entropy / max_entropy
+            
+            # 2. Attention sparsity (fraction of patches with attention > threshold)
+            threshold = 1.0 / num_patches  # Uniform attention level
+            sparse_ratio = (text_to_patch_attn > threshold * 2).float().mean().item()
+            
+            # 3. Top-k attention concentration (what fraction of attention is in top-k patches)
+            k = min(10, num_patches // 4)  # Top 10 or 25% of patches
+            topk_attn, _ = text_to_patch_attn.topk(k, dim=-1)
+            topk_concentration = topk_attn.sum(dim=-1).mean().item()
+            
+            # 4. Attention diversity across tokens
+            # Different tokens should attend to different patches
+            mean_attn_per_patch = text_to_patch_attn.mean(dim=1)  # (B, num_patches)
+            patch_usage_variance = mean_attn_per_patch.var(dim=-1).mean().item()
+            
+            # 5. Spatial coherence - do nearby patches get similar attention?
+            # Reshape to spatial grid (14x14 for 196 patches)
+            grid_size = int(np.sqrt(num_patches))
+            if grid_size * grid_size == num_patches:
+                attn_grid = text_to_patch_attn.mean(dim=1).view(B, grid_size, grid_size)
+                # Compute horizontal and vertical gradients
+                h_grad = (attn_grid[:, :, 1:] - attn_grid[:, :, :-1]).abs().mean().item()
+                v_grad = (attn_grid[:, 1:, :] - attn_grid[:, :-1, :]).abs().mean().item()
+                spatial_smoothness = 1.0 - (h_grad + v_grad) / 2  # Higher = smoother/more coherent
+            else:
+                spatial_smoothness = 0.0
+            
+            metrics = {
+                'attention/text_to_patch_entropy': mean_entropy,
+                'attention/text_to_patch_entropy_normalized': normalized_entropy,
+                'attention/text_to_patch_sparsity': 1.0 - sparse_ratio,  # Higher = more sparse
+                'attention/topk_concentration': topk_concentration,
+                'attention/patch_usage_variance': patch_usage_variance,
+                'attention/spatial_coherence': spatial_smoothness
+            }
             
             self.wandb_run.log(metrics, step=global_step)
     

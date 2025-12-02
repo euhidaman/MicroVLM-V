@@ -117,6 +117,7 @@ class Stage1Config(TrainingConfig):
     # Loss weights for Stage 1 - ALIGNMENT ONLY
     lm_loss_weight: float = 0.0  # DISABLED - frozen LM can't improve
     alignment_loss_weight: float = 1.0  # Full weight - this is the ONLY trainable objective
+    fine_grained_loss_weight: float = 0.5  # Text-to-patch attention supervision
     skip_lm_loss: bool = True  # Skip LM forward pass (saves compute)
     
     # Contrastive learning specific

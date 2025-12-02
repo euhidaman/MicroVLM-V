@@ -10,7 +10,7 @@ from typing import Optional, Dict, Tuple
 
 from .vision_encoder import DeiTVisionEncoder
 from .language_model import Qwen2LanguageModel
-from .multimodal_adapter import MultimodalAdapter, ContrastiveAlignmentLoss, MultimodalFusion
+from .multimodal_adapter import MultimodalAdapter, ContrastiveAlignmentLoss, MultimodalFusion, FineGrainedAlignmentLoss
 from .episodic_memory import EpisodicMemory, ScopeDetector
 from ..quantization.quantized_episodic_memory import apply_158bit_quantization_to_memory
 
@@ -100,8 +100,19 @@ class MicroVLM(nn.Module):
             temperature=config.get('alignment_temperature', 0.07)
         )
         
+        # Fine-grained text-to-patch alignment loss
+        # This encourages text tokens to attend to semantically relevant image patches
+        self.fine_grained_alignment_loss = FineGrainedAlignmentLoss(
+            temperature=0.1,
+            entropy_weight=0.3,  # Encourage focused attention
+            diversity_weight=0.2  # Encourage diverse attention patterns
+        )
+        
         # Debug counter for logging feature norms
         self._alignment_log_counter = 0
+        
+        # Store last fine-grained attention for visualization
+        self._last_text_to_patch_attention = None
 
         # Memory state (persistent across forward passes)
         self.memory_state = None
@@ -123,16 +134,18 @@ class MicroVLM(nn.Module):
                     nn.init.ones_(m.weight)
                     nn.init.zeros_(m.bias)
 
-    def encode_image(self, images):
+    def encode_image(self, images, return_patch_embeddings=False):
         """
         Encode images to prefix tokens
 
         Args:
             images: (batch_size, 3, H, W) or list of PIL Images
+            return_patch_embeddings: if True, also return projected patch embeddings
 
         Returns:
             prefix_tokens: (batch_size, k_prefix, qwen_dim)
             image_features: (batch_size, alignment_dim) for alignment - projected to shared space
+            patch_embeddings_proj: (batch_size, num_patches, qwen_dim) if return_patch_embeddings
         """
         # Extract patch embeddings
         patch_embeddings = self.vision_encoder(
@@ -147,10 +160,15 @@ class MicroVLM(nn.Module):
             raw_image_features)  # (B, alignment_dim=256)
 
         # Project to language space for prefix tokens
-        prefix_tokens = self.multimodal_adapter(
-            patch_embeddings)  # (B, k_prefix, qwen_dim)
-
-        return prefix_tokens, image_features
+        # Also get projected patch embeddings for fine-grained attention
+        if return_patch_embeddings:
+            prefix_tokens, patch_embeddings_proj = self.multimodal_adapter(
+                patch_embeddings, return_patch_embeddings=True)  # (B, k_prefix, qwen_dim), (B, num_patches, qwen_dim)
+            return prefix_tokens, image_features, patch_embeddings_proj
+        else:
+            prefix_tokens = self.multimodal_adapter(
+                patch_embeddings)  # (B, k_prefix, qwen_dim)
+            return prefix_tokens, image_features
 
     def encode_text(self, input_ids, attention_mask=None):
         """
@@ -217,10 +235,11 @@ class MicroVLM(nn.Module):
         if reset_memory:
             self.memory_state = None
 
-        # Encode images
-        prefix_tokens, image_features = None, None
+        # Encode images (with patch embeddings for fine-grained alignment)
+        prefix_tokens, image_features, patch_embeddings_proj = None, None, None
         if images is not None:
-            prefix_tokens, image_features = self.encode_image(images)
+            prefix_tokens, image_features, patch_embeddings_proj = self.encode_image(
+                images, return_patch_embeddings=True)
 
         # Encode text
         text_embeddings, text_features = self.encode_text(
@@ -228,8 +247,19 @@ class MicroVLM(nn.Module):
 
         # Compute alignment loss if both modalities present
         if use_alignment and image_features is not None:
+            # Global contrastive alignment loss
             alignment_loss = self.alignment_loss(image_features, text_features)
             outputs['alignment_loss'] = alignment_loss
+            
+            # Fine-grained text-to-patch alignment loss
+            # This provides explicit supervision for text-conditioned attention
+            fine_grained_loss, text_to_patch_attn = self.fine_grained_alignment_loss(
+                patch_embeddings_proj, text_embeddings, attention_mask
+            )
+            outputs['fine_grained_loss'] = fine_grained_loss
+            
+            # Store attention for visualization
+            self._last_text_to_patch_attention = text_to_patch_attn.detach()
             
             # Log alignment metrics periodically for debugging
             self._alignment_log_counter += 1
@@ -249,8 +279,14 @@ class MicroVLM(nn.Module):
                     # Temperature
                     temp = self.alignment_loss.logit_scale.exp().item() if hasattr(self.alignment_loss, 'logit_scale') else 14.29
                     
+                    # Attention entropy (lower = more focused)
+                    attn_entropy = -(text_to_patch_attn * torch.log(text_to_patch_attn + 1e-8)).sum(dim=-1).mean().item()
+                    max_entropy = torch.log(torch.tensor(float(patch_embeddings_proj.size(1)))).item()
+                    
                     print(f"  📊 Alignment: img_norm={img_norm:.3f}, txt_norm={txt_norm:.3f}, "
                           f"correct_sim={correct_sim:.4f}, temp={temp:.2f}, loss={alignment_loss.item():.4f}")
+                    print(f"  📊 Fine-grained: attn_entropy={attn_entropy:.3f}/{max_entropy:.3f}, "
+                          f"fine_loss={fine_grained_loss.item():.4f}")
 
         # Fuse modalities
         if prefix_tokens is not None:
@@ -410,6 +446,14 @@ class MicroVLM(nn.Module):
             align_loss = outputs['alignment_loss']
             if not torch.isnan(align_loss) and not torch.isinf(align_loss):
                 total_loss = total_loss + alignment_weight * align_loss
+        
+        # Add fine-grained alignment loss if valid
+        # Weight: Use same as alignment for now, can be tuned separately
+        fine_grained_weight = _get_training_attr('fine_grained_loss_weight', alignment_weight * 0.5)
+        if 'fine_grained_loss' in outputs:
+            fg_loss = outputs['fine_grained_loss']
+            if not torch.isnan(fg_loss) and not torch.isinf(fg_loss):
+                total_loss = total_loss + fine_grained_weight * fg_loss
 
         # Add memory losses if valid
         if use_memory and 'memory_kl' in outputs:
@@ -503,6 +547,24 @@ class MicroVLM(nn.Module):
     def get_trainable_params(self):
         """Get count of trainable parameters"""
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
+    
+    def get_text_to_patch_attention(self):
+        """
+        Get the last computed text-to-patch attention weights for visualization.
+        
+        Returns:
+            attention: (batch_size, seq_len, num_patches) or None
+        """
+        return self._last_text_to_patch_attention
+    
+    def get_pooling_attention(self):
+        """
+        Get the adapter's pooling attention showing which patches each prefix token attends to.
+        
+        Returns:
+            attention: (batch_size, k_prefix, num_patches) or None
+        """
+        return self.multimodal_adapter.get_pooling_attention_weights()
 
     def save_checkpoint(self, path):
         """Save model checkpoint"""

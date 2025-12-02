@@ -1091,6 +1091,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             captions.append(
                                 caption if caption.strip() else "(empty caption)")
 
+                        # Get text-to-patch attention if available (much better for visualization)
+                        text_to_patch_attn = None
+                        if hasattr(viz_model, 'get_text_to_patch_attention'):
+                            text_to_patch_attn = viz_model.get_text_to_patch_attention()
+                            if text_to_patch_attn is not None:
+                                text_to_patch_attn = text_to_patch_attn[:num_samples]
+
                         sbs_path = Path(config.output_dir) / "visualizations" / \
                             f"attention_sidebyside_step_{global_step}.png"
                         visualizer.visualize_attention_side_by_side(
@@ -1101,7 +1108,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             captions=captions,
                             save_path=str(sbs_path),
                             title=f"Text-Conditioned Attention (Step {global_step})",
-                            num_images=num_samples
+                            num_images=num_samples,
+                            text_to_patch_attention=text_to_patch_attn,
+                            num_patches=196  # DeiT-Tiny: 14x14 patches
                         )
 
                         print(
@@ -1119,6 +1128,12 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                                 'enhanced_viz/attention_sparsity': stats['attention_sparsity'],
                                 'enhanced_viz/divergence': stats['divergence_statistic']
                             }, step=global_step)
+                            
+                            # Log text-to-patch attention metrics if available
+                            if text_to_patch_attn is not None:
+                                wandb_logger.log_text_to_patch_attention_metrics(
+                                    text_to_patch_attn, viz_attention_mask, global_step
+                                )
                         elif wandb_run:
                             wandb_run.log({
                                 'attention/mean': stats['mean_attention'],

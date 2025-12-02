@@ -13,6 +13,10 @@ class MultimodalAdapter(nn.Module):
     """
     Adapts vision encoder outputs to language model input space
     Implements projection, pooling, and positional encoding
+    
+    Key insight: We preserve the original patch embeddings for visualization
+    and fine-grained text-to-image attention, while also producing pooled
+    prefix tokens for efficient LM processing.
     """
     
     def __init__(self, config):
@@ -48,6 +52,10 @@ class MultimodalAdapter(nn.Module):
         # Layer normalization
         self.layer_norm = nn.LayerNorm(self.qwen_dim)
         
+        # Store last pooling attention weights for visualization
+        # This shows which patches each prefix token attends to
+        self._last_pooling_attn_weights = None
+        
         self._init_weights()
     
     def _init_weights(self):
@@ -66,15 +74,17 @@ class MultimodalAdapter(nn.Module):
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
-    def forward(self, vision_embeddings):
+    def forward(self, vision_embeddings, return_patch_embeddings=False):
         """
         Forward pass
         
         Args:
             vision_embeddings: (batch_size, num_patches, deit_dim)
+            return_patch_embeddings: if True, also return projected patch embeddings
         
         Returns:
             prefix_tokens: (batch_size, k_prefix, qwen_dim)
+            patch_embeddings_proj: (batch_size, num_patches, qwen_dim) if return_patch_embeddings
         """
         batch_size = vision_embeddings.size(0)
         
@@ -84,16 +94,23 @@ class MultimodalAdapter(nn.Module):
         # Apply MLP
         projected = self.mlp(projected)
         
+        # Store projected patch embeddings before pooling (for attention visualization)
+        patch_embeddings_proj = projected
+        
         # Expand pooling queries for batch
         queries = self.pooling_queries.unsqueeze(0).expand(batch_size, -1, -1)
         
-        # Apply cross-attention pooling
-        # queries attend to all patch tokens
-        pooled, _ = self.pooling_attn(
+        # Apply cross-attention pooling with attention weights
+        pooled, attn_weights = self.pooling_attn(
             query=queries,
             key=projected,
-            value=projected
+            value=projected,
+            need_weights=True,
+            average_attn_weights=True  # Average across heads
         )
+        
+        # Store attention weights for visualization: (B, k_prefix, num_patches)
+        self._last_pooling_attn_weights = attn_weights.detach()
         
         # Add positional embeddings
         prefix_tokens = pooled + self.prefix_pos_embeddings.unsqueeze(0)
@@ -101,7 +118,18 @@ class MultimodalAdapter(nn.Module):
         # Layer normalization
         prefix_tokens = self.layer_norm(prefix_tokens)
         
+        if return_patch_embeddings:
+            return prefix_tokens, patch_embeddings_proj
         return prefix_tokens
+    
+    def get_pooling_attention_weights(self):
+        """
+        Get the last pooling attention weights showing which patches each prefix token attends to.
+        
+        Returns:
+            attn_weights: (batch_size, k_prefix, num_patches) or None
+        """
+        return self._last_pooling_attn_weights
 
 
 class ContrastiveAlignmentLoss(nn.Module):
@@ -159,6 +187,88 @@ class ContrastiveAlignmentLoss(nn.Module):
         loss = (loss_i2t + loss_t2i) / 2
         
         return loss
+
+
+class FineGrainedAlignmentLoss(nn.Module):
+    """
+    Fine-grained text-to-patch alignment loss
+    
+    Encourages each text token to attend to semantically relevant image patches.
+    This provides explicit supervision for text-conditioned attention learning.
+    
+    Two components:
+    1. Token-to-patch attention entropy regularization (encourages focused attention)
+    2. Attention diversity loss (encourages different tokens to attend to different regions)
+    """
+    
+    def __init__(self, temperature=0.1, entropy_weight=0.5, diversity_weight=0.5):
+        super().__init__()
+        self.temperature = temperature
+        self.entropy_weight = entropy_weight
+        self.diversity_weight = diversity_weight
+    
+    def forward(self, patch_embeddings, text_embeddings, attention_mask=None):
+        """
+        Compute fine-grained alignment loss
+        
+        Args:
+            patch_embeddings: (B, num_patches, D) - projected patch embeddings
+            text_embeddings: (B, seq_len, D) - text token embeddings
+            attention_mask: (B, seq_len) - text attention mask
+        
+        Returns:
+            loss: scalar tensor
+            attention_weights: (B, seq_len, num_patches) for visualization
+        """
+        # Normalize embeddings
+        patch_norm = F.normalize(patch_embeddings, p=2, dim=-1)
+        text_norm = F.normalize(text_embeddings, p=2, dim=-1)
+        
+        # Compute text-to-patch attention: (B, seq_len, num_patches)
+        attention_logits = torch.bmm(text_norm, patch_norm.transpose(1, 2)) / self.temperature
+        attention_weights = F.softmax(attention_logits, dim=-1)
+        
+        # Apply attention mask if provided
+        if attention_mask is not None:
+            # Expand mask to (B, seq_len, 1) for broadcasting
+            mask = attention_mask.unsqueeze(-1).float()
+            attention_weights = attention_weights * mask
+        
+        # Component 1: Attention entropy loss
+        # Low entropy = focused attention on specific patches (desirable)
+        # We minimize negative entropy (maximize focus)
+        eps = 1e-8
+        entropy = -(attention_weights * torch.log(attention_weights + eps)).sum(dim=-1)  # (B, seq_len)
+        max_entropy = math.log(patch_embeddings.size(1))  # Maximum possible entropy
+        normalized_entropy = entropy / max_entropy  # Normalize to [0, 1]
+        
+        if attention_mask is not None:
+            # Average only over valid tokens
+            valid_tokens = attention_mask.sum(dim=-1).clamp(min=1)
+            entropy_loss = (normalized_entropy * attention_mask).sum(dim=-1) / valid_tokens
+        else:
+            entropy_loss = normalized_entropy.mean(dim=-1)
+        entropy_loss = entropy_loss.mean()  # Average over batch
+        
+        # Component 2: Attention diversity loss
+        # Different tokens should attend to different patches
+        # We want the attention patterns to be diverse across tokens
+        if attention_mask is not None:
+            # Compute mean attention pattern per sample
+            valid_tokens = attention_mask.sum(dim=-1, keepdim=True).clamp(min=1)
+            mean_attention = (attention_weights * attention_mask.unsqueeze(-1)).sum(dim=1) / valid_tokens
+        else:
+            mean_attention = attention_weights.mean(dim=1)  # (B, num_patches)
+        
+        # Diversity: maximize variance across patches (uniform is bad, peaked is good)
+        # Low diversity means all tokens attend to the same patches
+        diversity = mean_attention.var(dim=-1).mean()  # Higher is better
+        diversity_loss = 1.0 - diversity.clamp(max=1.0)  # Convert to loss (minimize)
+        
+        # Combined loss
+        loss = self.entropy_weight * entropy_loss + self.diversity_weight * diversity_loss
+        
+        return loss, attention_weights
 
 
 class MultimodalFusion(nn.Module):
