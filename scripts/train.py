@@ -982,8 +982,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
                 # Alignment visualizations
                 if wandb_logger and 'alignment_loss' in outputs:
+                    # Get the alignment_loss module for temperature logging
+                    alignment_loss_module = getattr(viz_model, 'alignment_loss', None)
                     wandb_logger.log_alignment_metrics(
-                        image_features, text_features, global_step
+                        image_features, text_features, global_step,
+                        alignment_loss_module=alignment_loss_module
                     )
 
                 # Cross-modal attention analysis + side-by-side visualization

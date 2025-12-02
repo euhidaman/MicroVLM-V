@@ -81,9 +81,12 @@ def compute_model_dimensions():
     dimensions = {
         "qwen_hidden_dim": qwen_config["hidden_size"],
         "deit_embed_dim": deit_config["hidden_size"],
+        "vision_hidden_size": deit_config["hidden_size"],  # Alias for microvlm.py
+        "language_hidden_size": qwen_config["hidden_size"],  # Alias for microvlm.py
         "num_patches": num_patches,
         "k_prefix": k_prefix,
         "adapter_projection_dim": qwen_config["hidden_size"],
+        "alignment_dim": 256,  # Shared contrastive learning embedding space
         "memory_size": 512,  # K_mem
         "memory_dim": qwen_config["hidden_size"],  # C_mem = qwen_hidden_dim
         "scope_hidden_dim": 256

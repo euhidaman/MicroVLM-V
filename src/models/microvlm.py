@@ -71,16 +71,37 @@ class MicroVLM(nn.Module):
             apply_158bit_quantization_to_memory(self.scope_detector)
             print("Scope detector quantization applied!")
 
-        # Image feature projection for alignment (DeiT 192-dim -> Qwen 896-dim)
-        self.image_proj_for_alignment = nn.Linear(
-            config.get('vision_hidden_size', 192),
-            config.get('language_hidden_size', 896)
+        # Alignment embedding dimension (shared projection space)
+        self.alignment_dim = config.get('alignment_dim', 256)
+        
+        # Image feature projection for alignment (DeiT 192-dim -> alignment_dim)
+        # Uses MLP for better representation
+        self.image_proj_for_alignment = nn.Sequential(
+            nn.Linear(config.get('vision_hidden_size', 192), config.get('vision_hidden_size', 192) * 2),
+            nn.GELU(),
+            nn.Linear(config.get('vision_hidden_size', 192) * 2, self.alignment_dim),
+            nn.LayerNorm(self.alignment_dim)
         )
+        
+        # Text feature projection for alignment (Qwen 896-dim -> alignment_dim)
+        # Crucial: both modalities must project to the same space!
+        self.text_proj_for_alignment = nn.Sequential(
+            nn.Linear(config.get('language_hidden_size', 896), config.get('language_hidden_size', 896)),
+            nn.GELU(),
+            nn.Linear(config.get('language_hidden_size', 896), self.alignment_dim),
+            nn.LayerNorm(self.alignment_dim)
+        )
+        
+        # Initialize projection layers with small weights for stable training
+        self._init_alignment_projections()
 
         # Alignment loss
         self.alignment_loss = ContrastiveAlignmentLoss(
             temperature=config.get('alignment_temperature', 0.07)
         )
+        
+        # Debug counter for logging feature norms
+        self._alignment_log_counter = 0
 
         # Memory state (persistent across forward passes)
         self.memory_state = None
@@ -88,6 +109,19 @@ class MicroVLM(nn.Module):
         # Training configuration
         self.use_memory = True
         self.use_alignment = True
+    
+    def _init_alignment_projections(self):
+        """Initialize alignment projection layers with stable weights"""
+        for module in [self.image_proj_for_alignment, self.text_proj_for_alignment]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    # Xavier initialization for stable gradients
+                    nn.init.xavier_uniform_(m.weight, gain=0.1)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+                elif isinstance(m, nn.LayerNorm):
+                    nn.init.ones_(m.weight)
+                    nn.init.zeros_(m.bias)
 
     def encode_image(self, images):
         """
@@ -98,7 +132,7 @@ class MicroVLM(nn.Module):
 
         Returns:
             prefix_tokens: (batch_size, k_prefix, qwen_dim)
-            image_features: (batch_size, qwen_dim) for alignment - projected to same space as text
+            image_features: (batch_size, alignment_dim) for alignment - projected to shared space
         """
         # Extract patch embeddings
         patch_embeddings = self.vision_encoder(
@@ -108,11 +142,11 @@ class MicroVLM(nn.Module):
         raw_image_features = self.vision_encoder.get_cls_token(
             images)  # (B, deit_dim=192)
 
-        # Project image features to language space for alignment
+        # Project image features to alignment space (NOT language space)
         image_features = self.image_proj_for_alignment(
-            raw_image_features)  # (B, qwen_dim=896)
+            raw_image_features)  # (B, alignment_dim=256)
 
-        # Project to language space
+        # Project to language space for prefix tokens
         prefix_tokens = self.multimodal_adapter(
             patch_embeddings)  # (B, k_prefix, qwen_dim)
 
@@ -128,20 +162,23 @@ class MicroVLM(nn.Module):
 
         Returns:
             text_embeddings: (batch_size, seq_len, qwen_dim)
-            text_features: (batch_size, qwen_dim) for alignment
+            text_features: (batch_size, alignment_dim) for alignment - projected to shared space
         """
         # Get embeddings
         text_embeddings = self.language_model.get_input_embeddings()(input_ids)
 
-        # Get text-level features (mean pooling)
+        # Get text-level features (mean pooling over valid tokens)
         if attention_mask is not None:
             mask_expanded = attention_mask.unsqueeze(
                 -1).expand(text_embeddings.size())
             sum_embeddings = torch.sum(text_embeddings * mask_expanded, dim=1)
             sum_mask = torch.clamp(mask_expanded.sum(dim=1), min=1e-9)
-            text_features = sum_embeddings / sum_mask
+            raw_text_features = sum_embeddings / sum_mask  # (B, qwen_dim=896)
         else:
-            text_features = text_embeddings.mean(dim=1)
+            raw_text_features = text_embeddings.mean(dim=1)  # (B, qwen_dim=896)
+        
+        # Project text features to alignment space (crucial for contrastive learning!)
+        text_features = self.text_proj_for_alignment(raw_text_features)  # (B, alignment_dim=256)
 
         return text_embeddings, text_features
 
@@ -193,6 +230,27 @@ class MicroVLM(nn.Module):
         if use_alignment and image_features is not None:
             alignment_loss = self.alignment_loss(image_features, text_features)
             outputs['alignment_loss'] = alignment_loss
+            
+            # Log alignment metrics periodically for debugging
+            self._alignment_log_counter += 1
+            if self._alignment_log_counter % 100 == 1:  # Log every 100 steps
+                with torch.no_grad():
+                    # Pre-normalization norms (should be similar after projection)
+                    img_norm = image_features.norm(dim=-1).mean().item()
+                    txt_norm = text_features.norm(dim=-1).mean().item()
+                    
+                    # Post-normalization similarity
+                    img_normalized = F.normalize(image_features, p=2, dim=-1)
+                    txt_normalized = F.normalize(text_features, p=2, dim=-1)
+                    
+                    # Correct pair similarity (diagonal)
+                    correct_sim = (img_normalized * txt_normalized).sum(dim=-1).mean().item()
+                    
+                    # Temperature
+                    temp = self.alignment_loss.logit_scale.exp().item() if hasattr(self.alignment_loss, 'logit_scale') else 14.29
+                    
+                    print(f"  📊 Alignment: img_norm={img_norm:.3f}, txt_norm={txt_norm:.3f}, "
+                          f"correct_sim={correct_sim:.4f}, temp={temp:.2f}, loss={alignment_loss.item():.4f}")
 
         # Fuse modalities
         if prefix_tokens is not None:

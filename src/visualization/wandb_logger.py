@@ -105,7 +105,8 @@ class WandBLogger:
             'multimodal_adapter': [],
             'language_model': [],
             'episodic_memory': [],
-            'image_proj_for_alignment': []
+            'image_proj_for_alignment': [],
+            'text_proj_for_alignment': []
         }
         
         for name, param in model.named_parameters():
@@ -121,6 +122,8 @@ class WandBLogger:
                     component_grads['language_model'].append(grad_norm)
                 elif 'episodic_memory' in name:
                     component_grads['episodic_memory'].append(grad_norm)
+                elif 'text_proj_for_alignment' in name:
+                    component_grads['text_proj_for_alignment'].append(grad_norm)
                 elif 'image_proj_for_alignment' in name:
                     component_grads['image_proj_for_alignment'].append(grad_norm)
         
@@ -262,7 +265,7 @@ class WandBLogger:
             self.wandb_run.log(metrics, step=global_step)
     
     def log_alignment_metrics(self, image_features, text_features, global_step, 
-                             num_samples=4):
+                             num_samples=4, alignment_loss_module=None):
         """
         Log multimodal alignment visualizations
         
@@ -271,6 +274,7 @@ class WandBLogger:
             text_features: (B, hidden_dim)
             global_step: global training step
             num_samples: number of samples for similarity matrix
+            alignment_loss_module: optional reference to ContrastiveAlignmentLoss for temperature logging
         """
         if not self.enabled:
             return
@@ -311,8 +315,15 @@ class WandBLogger:
                 'alignment/incorrect_pair_similarity': off_diagonal_sim.item(),
                 'alignment/similarity_gap': diagonal_sim - off_diagonal_sim.item(),
                 'alignment/image_feature_norm': torch.norm(image_features, dim=-1).mean().item(),
-                'alignment/text_feature_norm': torch.norm(text_features, dim=-1).mean().item()
+                'alignment/text_feature_norm': torch.norm(text_features, dim=-1).mean().item(),
+                'alignment/feature_norm_ratio': torch.norm(image_features, dim=-1).mean().item() / (torch.norm(text_features, dim=-1).mean().item() + 1e-8)
             }
+            
+            # Log learnable temperature if available
+            if alignment_loss_module is not None and hasattr(alignment_loss_module, 'logit_scale'):
+                logit_scale = alignment_loss_module.logit_scale.exp().item()
+                metrics['alignment/temperature'] = 1.0 / logit_scale  # Convert logit_scale to temperature
+                metrics['alignment/logit_scale'] = logit_scale
             
             self.wandb_run.log(metrics, step=global_step)
     
