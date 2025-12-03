@@ -260,6 +260,10 @@ class FIBERVisionEncoder(nn.Module):
     
     Injects cross-modal attention blocks at specified layers of the transformer.
     This allows text information to guide visual feature extraction at intermediate levels.
+    
+    NOTE: Reduced for compact model (<1GB target):
+    - Default fusion_layers reduced from [8,9,10,11] to [9,11] (2 layers)
+    - num_fusion_heads reduced from 4 to 2
     """
     
     def __init__(
@@ -268,7 +272,7 @@ class FIBERVisionEncoder(nn.Module):
         pretrained_path: Optional[str] = None,
         fusion_layers: list = None,
         text_dim: int = 896,
-        num_fusion_heads: int = 4
+        num_fusion_heads: int = 2  # Reduced from 4
     ):
         super().__init__()
         
@@ -278,8 +282,8 @@ class FIBERVisionEncoder(nn.Module):
         self.num_patches = config.get('num_patches', 196)
         self.num_layers = 12  # DeiT-Tiny has 12 layers
         
-        # Fusion layer indices (0-indexed, default: last 4 layers)
-        self.fusion_layers = fusion_layers or [8, 9, 10, 11]
+        # Fusion layer indices (0-indexed, reduced from [8,9,10,11] to [9,11])
+        self.fusion_layers = fusion_layers or [9, 11]
         
         # Image preprocessing
         from torchvision import transforms
@@ -515,9 +519,11 @@ class ImageTextMatchingHead(nn.Module):
     
     Predicts whether an image-text pair is matched or not.
     Uses concatenated CLS features from both modalities.
+    
+    NOTE: Reduced hidden_dim from 512 to 256 for compact model.
     """
     
-    def __init__(self, vision_dim: int, text_dim: int, hidden_dim: int = 512):
+    def __init__(self, vision_dim: int, text_dim: int, hidden_dim: int = 256):
         super().__init__()
         
         # MLP classifier

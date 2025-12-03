@@ -288,6 +288,11 @@ class StagedTrainingConfig:
     alignment_mode: AlignmentMode = AlignmentMode.BASELINE
     current_stage: TrainingStage = TrainingStage.STAGE1_ALIGNMENT
     
+    # Quantization settings - ENABLE 4-bit for compact model (<1GB target)
+    quantize_language_4bit: bool = True   # 4-bit Qwen reduces ~2GB to ~250MB
+    quantize_vision_4bit: bool = False    # DeiT stays FP16 (only 23MB)
+    quantize_memory_158bit: bool = False  # Optional 1.58-bit memory
+    
     # Distributed training
     use_ddp: bool = True
     ddp_backend: str = "nccl"

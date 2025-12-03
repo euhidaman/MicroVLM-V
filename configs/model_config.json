@@ -1,0 +1,99 @@
+{
+  "qwen2_5_config": {
+    "hidden_size": 896,
+    "num_hidden_layers": 24,
+    "num_attention_heads": 14,
+    "num_key_value_heads": 2,
+    "intermediate_size": 4864,
+    "vocab_size": 151936,
+    "max_position_embeddings": 32768,
+    "rope_theta": 1000000.0,
+    "rms_norm_eps": 1e-06,
+    "tie_word_embeddings": true,
+    "use_sliding_window": false,
+    "sliding_window": null,
+    "max_window_layers": 21,
+    "head_dim": 64,
+    "kv_head_dim": 128,
+    "model_type": "qwen2"
+  },
+  "deit_tiny_config": {
+    "image_size": 224,
+    "patch_size": 16,
+    "num_channels": 3,
+    "hidden_size": 192,
+    "num_hidden_layers": 12,
+    "num_attention_heads": 3,
+    "intermediate_size": 768,
+    "hidden_dropout_prob": 0.0,
+    "attention_probs_dropout_prob": 0.0,
+    "layer_norm_eps": 1e-06,
+    "num_patches": 196,
+    "encoder_stride": 16
+  },
+  "quantization_config": {
+    "memory_quantization": {
+      "bits": 1.58,
+      "method": "bitnet_158",
+      "description": "1.58-bit quantization for episodic memory and final model"
+    },
+    "training_quantization": {
+      "weight_bits": 4,
+      "activation_bits": 4,
+      "method": "symmetric",
+      "description": "4-bit quantization for weights and activations during training"
+    },
+    "inference_quantization": {
+      "model_bits": 1.58,
+      "method": "bitnet_158",
+      "description": "1.58-bit quantization for final deployed model"
+    }
+  },
+  "model_dimensions": {
+    "qwen_hidden_dim": 896,
+    "deit_embed_dim": 192,
+    "vision_hidden_size": 192,
+    "language_hidden_size": 896,
+    "num_patches": 196,
+    "k_prefix": 25,
+    "adapter_projection_dim": 896,
+    "alignment_dim": 128,
+    "memory_size": 64,
+    "memory_dim": 896,
+    "memory_target_layers": 6,
+    "memory_num_heads": 4,
+    "scope_hidden_dim": 256,
+    "itm_hidden_dim": 256,
+    "fusion_layers": [
+      9,
+      11
+    ],
+    "num_fusion_heads": 2
+  },
+  "estimated_sizes": {
+    "qwen_original_mb": 1976,
+    "deit_original_mb": 22.8,
+    "qwen_4bit_mb": 247.0,
+    "deit_4bit_mb": 2.85,
+    "qwen_158bit_mb": 98.80000000000001,
+    "adapter_mb": 0.777728,
+    "memory_original_mb": 0.229376,
+    "memory_158bit_mb": 0.011468800000000001,
+    "wm_projection_mb": 11.010048,
+    "scopenet_mb": 1.180672,
+    "fusion_mb": 0.009216,
+    "alignment_mb": 0.557056,
+    "itm_head_mb": 1.11616,
+    "overhead_total_mb": 14.880256,
+    "total_fp32_mb": 2013.6802559999999,
+    "total_4bit_qwen_mb": 273.28025599999995,
+    "total_fully_quantized_mb": 116.53025600000001
+  },
+  "metadata": {
+    "qwen_model": "Qwen/Qwen2.5-0.5B",
+    "deit_model": "facebook/deit-tiny-patch16-224",
+    "target_total_size_mb": 500,
+    "description": "MicroVLM-V compact model configuration with 4-bit quantization for <1GB deployment",
+    "quantization_default": "4-bit Qwen, FP16 DeiT, FP32 overhead"
+  }
+}

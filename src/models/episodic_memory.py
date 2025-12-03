@@ -17,16 +17,22 @@ class EpisodicMemory(nn.Module):
     """
     Larimar-style episodic memory with Gaussian Process Memory
     Implements write/read operations with Sherman-Morrison updates
+    
+    NOTE: Dimensions reduced for compact model (<1GB target):
+    - memory_size: 512 -> 64 (8x reduction)
+    - W_M targets only 6 layers with 4 heads (vs 24 layers, 14 heads)
     """
     
     def __init__(self, config):
         super().__init__()
         
-        self.memory_size = config.get('memory_size', 512)  # K_mem
-        self.code_size = config.get('memory_dim', 896)  # C_mem
+        # Reduced memory dimensions for compact model
+        self.memory_size = config.get('memory_size', 64)  # K_mem (reduced from 512)
+        self.code_size = config.get('memory_dim', 896)  # C_mem (matches Qwen hidden)
         self.qwen_hidden_dim = config.get('qwen_hidden_dim', 896)
-        self.num_layers = config.get('num_layers', 24)
-        self.num_heads = config.get('num_heads', 14)
+        # W_M projection targets fewer layers/heads for size reduction
+        self.num_layers = config.get('memory_num_layers', 6)  # Reduced from 24
+        self.num_heads = config.get('memory_num_heads', 4)    # Reduced from 14
         self.head_dim = config.get('head_dim', 64)
         self.compute_dtype = torch.float32
         
@@ -49,13 +55,13 @@ class EpisodicMemory(nn.Module):
         kv_total_dim = self.num_layers * self.num_heads * self.head_dim * 2
         self.W_M = nn.Linear(self.code_size, kv_total_dim)
         
-        # Ordering: LSTM for sequential context
+        # Ordering: LSTM for sequential context (reduced for compact model)
         self.use_ordering = True
         if self.use_ordering:
             self.lstm_z = nn.LSTM(
                 input_size=self.code_size,
-                hidden_size=self.code_size // 2,
-                num_layers=2,
+                hidden_size=self.code_size // 4,  # Reduced from //2 for compact model
+                num_layers=1,  # Reduced from 2 for compact model
                 bidirectional=True,
                 batch_first=True
             )
@@ -427,20 +433,18 @@ class EpisodicMemory(nn.Module):
 class ScopeDetector(nn.Module):
     """
     Larimar-style ScopeNet for memory injection decisions
-    Lightweight MLP classifier
+    Lightweight MLP classifier (reduced for compact model)
     """
     
     def __init__(self, config):
         super().__init__()
         
         self.input_dim = config.get('qwen_hidden_dim', 896)
-        self.hidden_dim = config.get('scope_hidden_dim', 256)
+        self.hidden_dim = config.get('scope_hidden_dim', 64)  # Reduced from 256
         
+        # Simplified 2-layer MLP (reduced from 3 layers)
         self.mlp = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),
-            nn.ReLU(),
-            nn.Dropout(0.1),
-            nn.Linear(self.hidden_dim, self.hidden_dim),
             nn.ReLU(),
             nn.Dropout(0.1),
             nn.Linear(self.hidden_dim, 1),

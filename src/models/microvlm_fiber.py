@@ -32,10 +32,10 @@ from ..quantization.quantized_episodic_memory import apply_158bit_quantization_t
 
 @dataclass
 class FIBERConfig:
-    """Configuration for FIBER-style alignment"""
+    """Configuration for FIBER-style alignment (reduced for compact model)"""
     enabled: bool = True
     fusion_layers: list = None  # Which vision layers get cross-modal fusion
-    num_fusion_heads: int = 4
+    num_fusion_heads: int = 2  # Reduced from 4 for compact model
     bidirectional: bool = False  # T2I fusion in vision encoder
     itc_weight: float = 1.0
     itm_weight: float = 0.5
@@ -44,7 +44,7 @@ class FIBERConfig:
     
     def __post_init__(self):
         if self.fusion_layers is None:
-            self.fusion_layers = [8, 9, 10, 11]  # Last 4 layers of DeiT-Tiny
+            self.fusion_layers = [9, 11]  # Reduced to 2 layers for compact model
 
 
 class MicroVLM_FIBER(nn.Module):
@@ -120,21 +120,17 @@ class MicroVLM_FIBER(nn.Module):
         if quantize_memory_158bit:
             apply_158bit_quantization_to_memory(self.scope_detector)
         
-        # Alignment dimension
-        self.alignment_dim = config.get('alignment_dim', 256)
+        # Alignment dimension (reduced for compact model)
+        self.alignment_dim = config.get('alignment_dim', 128)  # Reduced from 256
         
-        # Image feature projection for alignment
+        # Image feature projection for alignment (simplified)
         self.image_proj_for_alignment = nn.Sequential(
-            nn.Linear(config.get('vision_hidden_size', 192), config.get('vision_hidden_size', 192) * 2),
-            nn.GELU(),
-            nn.Linear(config.get('vision_hidden_size', 192) * 2, self.alignment_dim),
+            nn.Linear(config.get('vision_hidden_size', 192), self.alignment_dim),
             nn.LayerNorm(self.alignment_dim)
         )
         
-        # Text feature projection for alignment
+        # Text feature projection for alignment (simplified)
         self.text_proj_for_alignment = nn.Sequential(
-            nn.Linear(config.get('language_hidden_size', 896), config.get('language_hidden_size', 896)),
-            nn.GELU(),
             nn.Linear(config.get('language_hidden_size', 896), self.alignment_dim),
             nn.LayerNorm(self.alignment_dim)
         )

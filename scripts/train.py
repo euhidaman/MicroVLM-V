@@ -1534,18 +1534,25 @@ def main():
             'itm_weight': args.itm_weight,
         }
         
+        # Get quantization flags from config (default: 4-bit for language model)
+        quantize_4bit = getattr(config, 'quantize_language_4bit', True)
+        quantize_memory_158bit = getattr(config, 'quantize_memory_158bit', False)
+        
         model = create_microvlm_fiber(
             config=model_config['model_dimensions'],
             vision_checkpoint=getattr(
                 config, 'vision_checkpoint', config.deit_checkpoint),
             language_checkpoint=getattr(
                 config, 'language_checkpoint', config.qwen_model),
+            quantize_4bit=quantize_4bit,
+            quantize_memory_158bit=quantize_memory_158bit,
             training_config=config,
             fiber_config=fiber_config
         )
         
         if is_main_process:
             print(f"  ✓ Created MicroVLMFIBER model with fusion at layers {fiber_fusion_layers}")
+            print(f"  ✓ 4-bit quantization: {quantize_4bit}")
     else:
         # Create baseline MicroVLM model
         model = create_microvlm(

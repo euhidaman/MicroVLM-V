@@ -17,6 +17,11 @@ class MultimodalAdapter(nn.Module):
     Key insight: We preserve the original patch embeddings for visualization
     and fine-grained text-to-image attention, while also producing pooled
     prefix tokens for efficient LM processing.
+    
+    NOTE: Reduced for compact model (<1GB target):
+    - k_prefix: 25 -> 8
+    - MLP expansion: 2x -> 1x (removed expansion)
+    - Pooling heads: 4 -> 2
     """
     
     def __init__(self, config):
@@ -25,16 +30,16 @@ class MultimodalAdapter(nn.Module):
         self.deit_dim = config.get('deit_embed_dim', 192)
         self.qwen_dim = config.get('qwen_hidden_dim', 896)
         self.num_patches = config.get('num_patches', 196)
-        self.k_prefix = config.get('k_prefix', 25)
+        self.k_prefix = config.get('k_prefix', 8)  # Reduced from 25
         
         # Projection layer: deit_dim -> qwen_dim
         self.projection = nn.Linear(self.deit_dim, self.qwen_dim)
         
-        # Optional small MLP for additional capacity
+        # Simplified MLP without expansion (reduced from 2x expansion)
         self.mlp = nn.Sequential(
-            nn.Linear(self.qwen_dim, self.qwen_dim * 2),
+            nn.Linear(self.qwen_dim, self.qwen_dim),
             nn.GELU(),
-            nn.Linear(self.qwen_dim * 2, self.qwen_dim)
+            nn.Linear(self.qwen_dim, self.qwen_dim)
         )
         
         # Pooling layer to reduce patches to K_prefix tokens
@@ -42,7 +47,7 @@ class MultimodalAdapter(nn.Module):
         self.pooling_queries = nn.Parameter(torch.randn(self.k_prefix, self.qwen_dim))
         self.pooling_attn = nn.MultiheadAttention(
             embed_dim=self.qwen_dim,
-            num_heads=4,
+            num_heads=2,  # Reduced from 4
             batch_first=True
         )
         

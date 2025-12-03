@@ -39,8 +39,11 @@ class TrainingConfig:
     memory_kl_weight: float = 0.02
     addressing_kl_weight: float = 0.005
     
-    # Quantization
-    use_4bit: bool = False
+    # Quantization - ENABLE 4-bit for language model to reduce size < 1GB
+    use_4bit: bool = True  # Legacy flag (deprecated)
+    quantize_language_4bit: bool = True  # 4-bit quantization for Qwen (reduces ~2GB to ~250MB)
+    quantize_vision_4bit: bool = False   # Vision encoder stays FP16 (only 23MB)
+    quantize_memory_158bit: bool = False # 1.58-bit memory (optional further reduction)
     
     # Optimization
     optimizer: str = "adamw"
