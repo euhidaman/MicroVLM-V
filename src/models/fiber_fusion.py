@@ -114,6 +114,11 @@ class CrossModalAttention(nn.Module):
         B, seq_source, _ = source.shape
         seq_target = target.size(1)
         
+        # Ensure consistent dtype (needed for 4-bit quantized models that use float16)
+        proj_dtype = self.q_proj.weight.dtype
+        source = source.to(proj_dtype)
+        target = target.to(proj_dtype)
+        
         # Apply layer norm to source
         source_normed = self.norm_source(source)
         
