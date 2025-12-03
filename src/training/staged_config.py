@@ -56,11 +56,11 @@ class TrainingConfig:
     freeze_language: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Quantization
-    enable_quantization: bool = False
+    # Quantization - 4-bit for language model to reduce size < 1GB
+    enable_quantization: bool = True
     quantize_memory_158bit: bool = False
     quantize_vision_4bit: bool = False
-    quantize_language_4bit: bool = False
+    quantize_language_4bit: bool = True  # Reduces Qwen from ~2GB to ~250MB
 
     # Optimization
     optimizer: str = "adamw"
@@ -129,10 +129,10 @@ class Stage1Config(TrainingConfig):
     train_adapter_only: bool = True
     unfreeze_last_n_layers: int = 0
 
-    # Quantization - Disabled for full precision training
-    enable_quantization: bool = False
+    # Quantization - 4-bit for language model to reduce size < 1GB
+    enable_quantization: bool = True
     quantize_vision_4bit: bool = False
-    quantize_language_4bit: bool = False
+    quantize_language_4bit: bool = True  # Reduces Qwen from ~2GB to ~250MB
 
     # Monitoring
     log_interval: int = 25  # More frequent logging to track loss
