@@ -191,25 +191,34 @@ class ContrastiveAlignmentLoss(nn.Module):
 
 class FineGrainedAlignmentLoss(nn.Module):
     """
-    Fine-grained text-to-patch alignment loss
+    Improved fine-grained text-to-patch alignment loss with spatial coherence.
     
-    Encourages each text token to attend to semantically relevant image patches.
-    This provides explicit supervision for text-conditioned attention learning.
+    Encourages each text token to attend to semantically relevant image patches
+    with spatially coherent attention patterns.
     
-    Two components:
-    1. Token-to-patch attention entropy regularization (encourages focused attention)
-    2. Attention diversity loss (encourages different tokens to attend to different regions)
+    Components:
+    1. Focus loss: entropy regularization for focused attention
+    2. Spatial coherence: total variation loss for smooth attention maps
+    3. Diversity loss: different tokens should attend to different regions
+    4. Sharpness loss: attention should have clear peaks
+    5. Contrastive grounding: text closer to attended than non-attended patches
     """
     
-    def __init__(self, temperature=0.1, entropy_weight=0.5, diversity_weight=0.5):
+    def __init__(self, temperature=0.2, entropy_weight=0.25, diversity_weight=0.20,
+                 spatial_weight=0.15, sharpness_weight=0.15, contrastive_weight=0.25,
+                 grid_size=14):
         super().__init__()
         self.temperature = temperature
         self.entropy_weight = entropy_weight
         self.diversity_weight = diversity_weight
+        self.spatial_weight = spatial_weight
+        self.sharpness_weight = sharpness_weight
+        self.contrastive_weight = contrastive_weight
+        self.grid_size = grid_size
     
     def forward(self, patch_embeddings, text_embeddings, attention_mask=None):
         """
-        Compute fine-grained alignment loss
+        Compute improved fine-grained alignment loss
         
         Args:
             patch_embeddings: (B, num_patches, D) - projected patch embeddings
@@ -220,6 +229,11 @@ class FineGrainedAlignmentLoss(nn.Module):
             loss: scalar tensor
             attention_weights: (B, seq_len, num_patches) for visualization
         """
+        B, num_patches, D = patch_embeddings.shape
+        seq_len = text_embeddings.size(1)
+        device = patch_embeddings.device
+        eps = 1e-8
+        
         # Normalize embeddings - ensure same dtype for mixed precision training
         patch_norm = F.normalize(patch_embeddings.float(), p=2, dim=-1)
         text_norm = F.normalize(text_embeddings.float(), p=2, dim=-1)
@@ -230,43 +244,67 @@ class FineGrainedAlignmentLoss(nn.Module):
         
         # Apply attention mask if provided
         if attention_mask is not None:
-            # Expand mask to (B, seq_len, 1) for broadcasting
             mask = attention_mask.unsqueeze(-1).float()
-            attention_weights = attention_weights * mask
-        
-        # Component 1: Attention entropy loss
-        # Low entropy = focused attention on specific patches (desirable)
-        # We minimize negative entropy (maximize focus)
-        eps = 1e-8
-        entropy = -(attention_weights * torch.log(attention_weights + eps)).sum(dim=-1)  # (B, seq_len)
-        max_entropy = math.log(patch_embeddings.size(1))  # Maximum possible entropy
-        normalized_entropy = entropy / max_entropy  # Normalize to [0, 1]
-        
-        if attention_mask is not None:
-            # Average only over valid tokens
-            valid_tokens = attention_mask.sum(dim=-1).clamp(min=1)
-            entropy_loss = (normalized_entropy * attention_mask).sum(dim=-1) / valid_tokens
+            valid_tokens = attention_mask.sum(dim=-1, keepdim=True).clamp(min=1).float()
         else:
-            entropy_loss = normalized_entropy.mean(dim=-1)
-        entropy_loss = entropy_loss.mean()  # Average over batch
+            mask = torch.ones(B, seq_len, 1, device=device)
+            valid_tokens = torch.tensor(seq_len, device=device, dtype=torch.float32).view(1, 1)
         
-        # Component 2: Attention diversity loss
-        # Different tokens should attend to different patches
-        # We want the attention patterns to be diverse across tokens
-        if attention_mask is not None:
-            # Compute mean attention pattern per sample
-            valid_tokens = attention_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-            mean_attention = (attention_weights * attention_mask.unsqueeze(-1)).sum(dim=1) / valid_tokens
+        # ====== Component 1: Focus Loss (Entropy) ======
+        entropy = -(attention_weights * torch.log(attention_weights + eps)).sum(dim=-1)
+        max_entropy = math.log(num_patches)
+        normalized_entropy = entropy / max_entropy
+        focus_loss = (normalized_entropy * attention_mask.float()).sum(dim=-1) / valid_tokens.squeeze(-1) if attention_mask is not None else normalized_entropy.mean(dim=-1)
+        focus_loss = focus_loss.mean()
+        
+        # ====== Component 2: Spatial Coherence Loss ======
+        H = W = self.grid_size
+        if num_patches == H * W:
+            attention_grid = attention_weights.view(B, seq_len, H, W)
+            tv_h = torch.abs(attention_grid[:, :, 1:, :] - attention_grid[:, :, :-1, :]).mean()
+            tv_w = torch.abs(attention_grid[:, :, :, 1:] - attention_grid[:, :, :, :-1]).mean()
+            spatial_loss = (tv_h + tv_w) * 0.5
         else:
-            mean_attention = attention_weights.mean(dim=1)  # (B, num_patches)
+            spatial_loss = torch.tensor(0.0, device=device)
         
-        # Diversity: maximize variance across patches (uniform is bad, peaked is good)
-        # Low diversity means all tokens attend to the same patches
-        diversity = mean_attention.var(dim=-1).mean()  # Higher is better
-        diversity_loss = 1.0 - diversity.clamp(max=1.0)  # Convert to loss (minimize)
+        # ====== Component 3: Diversity Loss ======
+        mean_attention = (attention_weights * mask).sum(dim=1) / valid_tokens
+        diversity = mean_attention.var(dim=-1).mean()
+        diversity_loss = (1.0 - 10.0 * diversity).clamp(min=0.0)
         
-        # Combined loss
-        loss = self.entropy_weight * entropy_loss + self.diversity_weight * diversity_loss
+        # ====== Component 4: Sharpness Loss ======
+        max_attention = attention_weights.max(dim=-1)[0]
+        if attention_mask is not None:
+            peak_sharpness = (max_attention * attention_mask.float()).sum(dim=-1) / valid_tokens.squeeze(-1)
+        else:
+            peak_sharpness = max_attention.mean(dim=-1)
+        sharpness_loss = (1.0 - peak_sharpness.mean()).clamp(min=0.0)
+        
+        # ====== Component 5: Contrastive Grounding Loss ======
+        attended_patches = torch.bmm(attention_weights, patch_norm)
+        positive_sim = (text_norm * attended_patches).sum(dim=-1)
+        
+        neg_attention = 1.0 - attention_weights
+        neg_attention = neg_attention / neg_attention.sum(dim=-1, keepdim=True).clamp(min=eps)
+        neg_patches = torch.bmm(neg_attention, patch_norm)
+        negative_sim = (text_norm * neg_patches).sum(dim=-1)
+        
+        margin = 0.3
+        contrastive_loss = F.relu(negative_sim - positive_sim + margin)
+        if attention_mask is not None:
+            contrastive_loss = (contrastive_loss * attention_mask.float()).sum(dim=-1) / valid_tokens.squeeze(-1)
+        else:
+            contrastive_loss = contrastive_loss.mean(dim=-1)
+        contrastive_loss = contrastive_loss.mean()
+        
+        # ====== Combine all losses ======
+        loss = (
+            self.entropy_weight * focus_loss +
+            self.spatial_weight * spatial_loss +
+            self.diversity_weight * diversity_loss +
+            self.sharpness_weight * sharpness_loss +
+            self.contrastive_weight * contrastive_loss
+        )
         
         return loss, attention_weights
 

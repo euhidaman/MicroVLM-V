@@ -9,10 +9,17 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 from torch import distributed as dist
-from torch.distributed._functional_collectives import all_reduce as functional_all_reduce
 import matplotlib.pyplot as plt
 import numpy as np
 from pathlib import Path
+
+# Try to import functional_all_reduce, fall back gracefully if not available
+try:
+    from torch.distributed._functional_collectives import all_reduce as functional_all_reduce
+    HAS_FUNCTIONAL_COLLECTIVES = True
+except ImportError:
+    HAS_FUNCTIONAL_COLLECTIVES = False
+    functional_all_reduce = None
 
 
 def all_reduce(x, op="AVG"):
@@ -21,7 +28,7 @@ def all_reduce(x, op="AVG"):
     Note: For visualization which only runs on main process,
     we skip distributed sync to avoid CPU tensor issues.
     """
-    if dist.is_available() and dist.is_initialized() and x.is_cuda:
+    if HAS_FUNCTIONAL_COLLECTIVES and dist.is_available() and dist.is_initialized() and x.is_cuda:
         return functional_all_reduce(x, op.lower(), dist.group.WORLD)
     else:
         return x
@@ -720,6 +727,148 @@ class AttentionVisualizer(nn.Module):
 
         plt.close()
 
+        return fig
+
+    def visualize_per_word_attention(
+        self,
+        image: torch.Tensor,
+        text_to_patch_attention: torch.Tensor,
+        tokens: list,
+        save_path: str,
+        title: str = "Per-Word Attention Maps",
+        num_words: int = 6,
+        grid_size: int = 14
+    ):
+        """
+        Visualize attention maps for individual words/tokens.
+        
+        Shows how each word in the caption attends to different image regions.
+        This helps diagnose whether attention is correctly grounding words to patches.
+        
+        Args:
+            image: (3, H, W) or (1, 3, H, W) single image tensor
+            text_to_patch_attention: (seq_len, num_patches) attention for this image
+            tokens: list of token strings corresponding to seq_len
+            save_path: path to save the visualization
+            title: title for the figure
+            num_words: maximum number of words to visualize
+            grid_size: patch grid size (14 for 14x14=196 patches)
+        
+        Returns:
+            fig: matplotlib figure
+        """
+        import textwrap
+        
+        # Handle batch dimension
+        if image.dim() == 4:
+            image = image[0]
+        if text_to_patch_attention.dim() == 3:
+            text_to_patch_attention = text_to_patch_attention[0]
+        
+        # Convert image to numpy
+        image_np = image.cpu().detach().numpy()
+        mean = np.array([0.485, 0.456, 0.406]).reshape(3, 1, 1)
+        std = np.array([0.229, 0.224, 0.225]).reshape(3, 1, 1)
+        image_np = image_np * std + mean
+        image_np = np.clip(image_np, 0, 1).transpose(1, 2, 0)
+        
+        # Get attention maps
+        attention = text_to_patch_attention.cpu().detach().numpy()  # (seq_len, num_patches)
+        seq_len, num_patches = attention.shape
+        
+        # Filter to content words (skip special tokens, punctuation, short tokens)
+        content_indices = []
+        content_tokens = []
+        for i, token in enumerate(tokens[:seq_len]):
+            # Skip special tokens and very short tokens
+            clean_token = token.strip().lower()
+            if len(clean_token) > 2 and not clean_token.startswith('<') and not clean_token.startswith('['):
+                # Skip common stop words
+                stop_words = {'the', 'a', 'an', 'is', 'are', 'was', 'were', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'but'}
+                if clean_token not in stop_words:
+                    content_indices.append(i)
+                    content_tokens.append(token)
+        
+        # Limit to num_words
+        content_indices = content_indices[:num_words]
+        content_tokens = content_tokens[:num_words]
+        
+        if len(content_indices) == 0:
+            # Fallback: use first few tokens
+            content_indices = list(range(min(num_words, seq_len)))
+            content_tokens = tokens[:len(content_indices)]
+        
+        num_plots = len(content_indices) + 1  # +1 for original image
+        ncols = min(4, num_plots)
+        nrows = (num_plots + ncols - 1) // ncols
+        
+        fig, axes = plt.subplots(nrows, ncols, figsize=(4 * ncols, 4 * nrows))
+        axes = np.atleast_2d(axes)
+        if nrows == 1:
+            axes = axes.reshape(1, -1)
+        
+        H, W = image_np.shape[:2]
+        
+        # First subplot: original image
+        ax = axes.flat[0]
+        ax.imshow(image_np)
+        ax.set_title('Original Image', fontsize=10, fontweight='bold')
+        ax.axis('off')
+        
+        # Remaining subplots: per-word attention
+        for idx, (token_idx, token) in enumerate(zip(content_indices, content_tokens)):
+            ax = axes.flat[idx + 1]
+            ax.imshow(image_np)
+            
+            # Get attention for this token
+            token_attn = attention[token_idx]  # (num_patches,)
+            
+            # Reshape to grid
+            if num_patches == grid_size * grid_size:
+                attn_grid = token_attn.reshape(grid_size, grid_size)
+            else:
+                # Approximate
+                side = int(np.ceil(np.sqrt(num_patches)))
+                padded = np.pad(token_attn, (0, side*side - num_patches), mode='edge')
+                attn_grid = padded.reshape(side, side)
+            
+            # Upsample to image size
+            attn_tensor = torch.from_numpy(attn_grid).unsqueeze(0).unsqueeze(0).float()
+            attn_upsampled = F.interpolate(attn_tensor, size=(H, W), mode='bilinear', align_corners=False)
+            attn_upsampled = attn_upsampled.squeeze().numpy()
+            
+            # Normalize
+            attn_norm = (attn_upsampled - attn_upsampled.min()) / (attn_upsampled.max() - attn_upsampled.min() + 1e-8)
+            
+            # Overlay attention
+            im = ax.imshow(attn_norm, cmap='jet', alpha=0.6, interpolation='bilinear')
+            
+            # Clean token for title
+            clean_token = token.replace('Ġ', '').replace('▁', '').strip()
+            ax.set_title(f'"{clean_token}"', fontsize=10, fontweight='bold')
+            ax.axis('off')
+        
+        # Hide unused subplots
+        for idx in range(num_plots, nrows * ncols):
+            axes.flat[idx].axis('off')
+        
+        fig.suptitle(title, fontsize=14, fontweight='bold', y=1.02)
+        
+        # Add colorbar
+        cbar_ax = fig.add_axes([0.92, 0.15, 0.02, 0.7])
+        cbar = fig.colorbar(im, cax=cbar_ax)
+        cbar.set_label('Attention', rotation=270, labelpad=15)
+        
+        plt.tight_layout(rect=[0, 0, 0.9, 0.98])
+        
+        if save_path:
+            os.makedirs(os.path.dirname(save_path), exist_ok=True)
+            plt.savefig(save_path, dpi=150, bbox_inches='tight')
+            print(f"Saved per-word attention visualization to {save_path}")
+        
+        self.visualizations.append(save_path)
+        plt.close()
+        
         return fig
 
 

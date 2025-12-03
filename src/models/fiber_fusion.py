@@ -66,7 +66,8 @@ class CrossModalAttention(nn.Module):
         
         # Learnable gating parameter (FIBER uses alpha starting at 0)
         # This allows gradual introduction of cross-modal information
-        self.alpha = nn.Parameter(torch.zeros(1))
+        # Start with small positive value (0.1) for faster learning
+        self.alpha = nn.Parameter(torch.tensor(0.1))
         
         # Dropout
         self.attn_dropout = nn.Dropout(dropout)
@@ -78,11 +79,13 @@ class CrossModalAttention(nn.Module):
         self._init_weights()
     
     def _init_weights(self):
-        """Initialize weights with small values for stable training"""
-        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.k_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.v_proj.weight, gain=0.1)
-        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.1)
+        """Initialize weights with proper scaling for stable training"""
+        # Use smaller gain for Q projection (queries should be stable)
+        nn.init.xavier_uniform_(self.q_proj.weight, gain=0.5)
+        # Use normal initialization for K, V (more expressive)
+        nn.init.xavier_uniform_(self.k_proj.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.v_proj.weight, gain=1.0)
+        nn.init.xavier_uniform_(self.out_proj.weight, gain=0.5)
         nn.init.zeros_(self.q_proj.bias)
         nn.init.zeros_(self.k_proj.bias)
         nn.init.zeros_(self.v_proj.bias)
@@ -705,53 +708,140 @@ class FIBERAlignmentLoss(nn.Module):
         self,
         patch_embeddings: torch.Tensor,
         text_embeddings: torch.Tensor,
-        text_mask: Optional[torch.Tensor] = None
+        text_mask: Optional[torch.Tensor] = None,
+        grid_size: int = 14
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         """
-        Compute token-level alignment loss.
+        Compute improved token-level alignment loss with spatial coherence.
         
-        Encourages text tokens to attend to relevant image patches.
-        Similar to FineGrainedAlignmentLoss but integrated with FIBER.
+        This loss encourages:
+        1. Text tokens to attend to semantically relevant patches (grounding)
+        2. Attention to be spatially coherent (attend to nearby patches)
+        3. Different text tokens to attend to different regions (diversity)
+        4. Sharp, focused attention (low entropy)
         
         Args:
             patch_embeddings: (B, num_patches, D)
             text_embeddings: (B, seq_len, D)
             text_mask: (B, seq_len)
+            grid_size: size of patch grid (default 14 for 14x14=196 patches)
         
         Returns:
             loss: scalar tensor
             attention: (B, seq_len, num_patches) attention weights
         """
+        B, num_patches, D = patch_embeddings.shape
+        seq_len = text_embeddings.size(1)
+        device = patch_embeddings.device
+        
         # Normalize - ensure float32 for mixed precision compatibility
         patch_norm = F.normalize(patch_embeddings.float(), p=2, dim=-1)
         text_norm = F.normalize(text_embeddings.float(), p=2, dim=-1)
         
-        # Compute attention scores
+        # Compute attention scores with learnable temperature
+        # Use warmer temperature (0.2) for smoother gradients initially
+        temperature = 0.2
         attention_logits = torch.bmm(text_norm, patch_norm.transpose(1, 2))  # (B, seq_len, num_patches)
-        attention = F.softmax(attention_logits / 0.1, dim=-1)
+        attention = F.softmax(attention_logits / temperature, dim=-1)
         
-        # Entropy regularization (encourage focused attention)
         eps = 1e-8
+        
+        # ====== Component 1: Focus Loss (Entropy Regularization) ======
+        # Encourage each text token to focus on a small number of patches
         entropy = -(attention * torch.log(attention + eps)).sum(dim=-1)  # (B, seq_len)
-        max_entropy = math.log(patch_embeddings.size(1))
+        max_entropy = math.log(num_patches)
         normalized_entropy = entropy / max_entropy
         
-        # Diversity loss (different tokens should attend to different patches)
         if text_mask is not None:
             valid_tokens = text_mask.sum(dim=-1, keepdim=True).clamp(min=1)
-            mean_attention = (attention * text_mask.unsqueeze(-1)).sum(dim=1) / valid_tokens
-            entropy_loss = (normalized_entropy * text_mask).sum(dim=-1) / valid_tokens.squeeze(-1)
+            focus_loss = (normalized_entropy * text_mask).sum(dim=-1) / valid_tokens.squeeze(-1)
         else:
-            mean_attention = attention.mean(dim=1)
-            entropy_loss = normalized_entropy.mean(dim=-1)
+            focus_loss = normalized_entropy.mean(dim=-1)
+        focus_loss = focus_loss.mean()
         
-        entropy_loss = entropy_loss.mean()
+        # ====== Component 2: Spatial Coherence Loss ======
+        # Encourage attention to be spatially smooth (nearby patches should have similar attention)
+        # Reshape attention to spatial grid: (B, seq_len, H, W)
+        H = W = grid_size
+        if num_patches == H * W:
+            attention_grid = attention.view(B, seq_len, H, W)
+            
+            # Compute spatial smoothness via total variation (TV) loss
+            # This penalizes large differences between adjacent patches
+            tv_h = torch.abs(attention_grid[:, :, 1:, :] - attention_grid[:, :, :-1, :]).mean()
+            tv_w = torch.abs(attention_grid[:, :, :, 1:] - attention_grid[:, :, :, :-1]).mean()
+            
+            # We want some smoothness but not too much (would lose focus)
+            # Use a soft target: attention should be locally smooth but globally varied
+            spatial_loss = tv_h + tv_w
+            
+            # Invert: we want to MINIMIZE sudden changes (encourage spatial coherence)
+            # But scale appropriately - too much smoothness is bad
+            spatial_coherence_loss = spatial_loss * 0.5
+        else:
+            spatial_coherence_loss = torch.tensor(0.0, device=device)
         
-        # Diversity: variance across patches
+        # ====== Component 3: Diversity Loss ======
+        # Different text tokens should attend to different patches
+        # Penalize when all tokens attend to the same region
+        if text_mask is not None:
+            # Compute mean attention per sample, weighted by mask
+            mask_expanded = text_mask.unsqueeze(-1).float()  # (B, seq_len, 1)
+            sum_attention = (attention * mask_expanded).sum(dim=1)  # (B, num_patches)
+            count = mask_expanded.sum(dim=1).clamp(min=1)  # (B, 1)
+            mean_attention = sum_attention / count  # (B, num_patches)
+        else:
+            mean_attention = attention.mean(dim=1)  # (B, num_patches)
+        
+        # Diversity: maximize variance across patches
+        # High variance = different tokens attend to different patches
         diversity = mean_attention.var(dim=-1).mean()
-        diversity_loss = 1.0 - diversity.clamp(max=1.0)
+        diversity_loss = (1.0 - 10.0 * diversity).clamp(min=0.0)  # Scale up importance
         
-        loss = 0.5 * entropy_loss + 0.5 * diversity_loss
+        # ====== Component 4: Peak Sharpness Loss ======
+        # Encourage attention to have clear peaks (max attention should be high)
+        max_attention = attention.max(dim=-1)[0]  # (B, seq_len)
+        if text_mask is not None:
+            peak_sharpness = (max_attention * text_mask).sum(dim=-1) / valid_tokens.squeeze(-1)
+        else:
+            peak_sharpness = max_attention.mean(dim=-1)
+        peak_sharpness = peak_sharpness.mean()
+        # We want high peak sharpness, so minimize (1 - peak)
+        sharpness_loss = (1.0 - peak_sharpness).clamp(min=0.0)
+        
+        # ====== Component 5: Contrastive Grounding Loss ======
+        # Text tokens should be closer to their attended patches than random patches
+        # Compute weighted patch representation for each text token
+        attended_patches = torch.bmm(attention, patch_norm)  # (B, seq_len, D)
+        
+        # Contrastive: text should be similar to attended patches
+        positive_sim = (text_norm * attended_patches).sum(dim=-1)  # (B, seq_len)
+        
+        # Negative: text should be dissimilar to non-attended patches
+        # Use hardest negatives (patches with low attention)
+        neg_attention = 1.0 - attention  # Invert attention
+        neg_attention = neg_attention / neg_attention.sum(dim=-1, keepdim=True).clamp(min=eps)
+        neg_patches = torch.bmm(neg_attention, patch_norm)  # (B, seq_len, D)
+        negative_sim = (text_norm * neg_patches).sum(dim=-1)  # (B, seq_len)
+        
+        # Margin-based contrastive loss
+        margin = 0.3
+        contrastive_loss = F.relu(negative_sim - positive_sim + margin)
+        if text_mask is not None:
+            contrastive_loss = (contrastive_loss * text_mask).sum(dim=-1) / valid_tokens.squeeze(-1)
+        else:
+            contrastive_loss = contrastive_loss.mean(dim=-1)
+        contrastive_loss = contrastive_loss.mean()
+        
+        # ====== Combine all losses ======
+        # Weight the components appropriately
+        loss = (
+            0.25 * focus_loss +           # Encourage focused attention
+            0.15 * spatial_coherence_loss + # Encourage spatial smoothness
+            0.20 * diversity_loss +        # Encourage different tokens -> different patches
+            0.15 * sharpness_loss +        # Encourage clear attention peaks
+            0.25 * contrastive_loss        # Encourage correct grounding
+        )
         
         return loss, attention
     
