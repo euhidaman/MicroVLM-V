@@ -141,22 +141,38 @@ class ContrastiveAlignmentLoss(nn.Module):
     """
     CLIP-style contrastive alignment loss with learnable temperature
     Implements image-text alignment learning with improved stability
+    
+    STABILITY FIXES:
+    - Temperature bounded via soft clamping for smooth gradients
+    - Logits clamped to prevent overflow
     """
     
-    def __init__(self, temperature=0.07, learnable_temperature=True, label_smoothing=0.1):
+    def __init__(self, temperature=0.07, learnable_temperature=True, label_smoothing=0.1,
+                 min_temperature=0.01, max_temperature=0.5):
         super().__init__()
         self.learnable_temperature = learnable_temperature
         self.label_smoothing = label_smoothing
         
+        # STABILITY FIX: Store bounds for soft clamping
+        self.log_scale_min = math.log(1 / max_temperature)  # ~0.7
+        self.log_scale_max = math.log(1 / min_temperature)  # ~4.6
+        
         if learnable_temperature:
-            # Learnable log temperature (CLIP style) - initialized to log(1/0.07) ≈ 2.66
-            # Clamped to prevent instability
-            self.logit_scale = nn.Parameter(torch.ones([]) * math.log(1 / temperature))
+            # Initialize in middle of valid range
+            init_log_scale = math.log(1 / temperature)
+            self._logit_scale_raw = nn.Parameter(torch.tensor(init_log_scale))
         else:
-            self.register_buffer('logit_scale', torch.ones([]) * math.log(1 / temperature))
+            self.register_buffer('_logit_scale_raw', torch.tensor(math.log(1 / temperature)))
         
         # Use label smoothing for better generalization
         self.cross_entropy = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
+    
+    @property
+    def logit_scale(self):
+        """Get bounded logit scale using soft clamping for smooth gradients"""
+        range_size = self.log_scale_max - self.log_scale_min
+        normalized = torch.sigmoid(self._logit_scale_raw - (self.log_scale_min + range_size / 2))
+        return self.log_scale_min + normalized * range_size
     
     def forward(self, image_features, text_features):
         """
@@ -170,16 +186,20 @@ class ContrastiveAlignmentLoss(nn.Module):
             loss: scalar tensor
         """
         # Normalize features (L2 normalization)
-        image_features = F.normalize(image_features, p=2, dim=-1)
-        text_features = F.normalize(text_features, p=2, dim=-1)
+        image_features = F.normalize(image_features.float(), p=2, dim=-1)
+        text_features = F.normalize(text_features.float(), p=2, dim=-1)
         
-        # Clamp logit_scale to prevent NaN/explosion (CLIP uses 0-100 range)
-        logit_scale = torch.clamp(self.logit_scale, min=0, max=4.6052)  # max = log(100)
+        # STABILITY FIX: Use property for bounded logit scale
+        logit_scale = self.logit_scale.exp()
         
         # Compute similarity matrix with learnable temperature
         # shape: (batch_size, batch_size)
-        logits_per_image = logit_scale.exp() * torch.matmul(image_features, text_features.t())
+        logits_per_image = logit_scale * torch.matmul(image_features, text_features.t())
         logits_per_text = logits_per_image.t()
+        
+        # STABILITY FIX: Clamp logits to prevent extreme values
+        logits_per_image = torch.clamp(logits_per_image, min=-100.0, max=100.0)
+        logits_per_text = torch.clamp(logits_per_text, min=-100.0, max=100.0)
         
         # Labels: diagonal elements are positive pairs
         batch_size = image_features.size(0)
@@ -201,23 +221,21 @@ class FineGrainedAlignmentLoss(nn.Module):
     Encourages each text token to attend to semantically relevant image patches
     with spatially coherent attention patterns.
     
-    Components:
-    1. Focus loss: entropy regularization for focused attention
-    2. Spatial coherence: total variation loss for smooth attention maps
-    3. Diversity loss: different tokens should attend to different regions
-    4. Sharpness loss: attention should have clear peaks
-    5. Contrastive grounding: text closer to attended than non-attended patches
+    STABILITY FIXES:
+    - Removed conflicting sharpness vs smoothness objectives
+    - Warmer temperature for smoother gradients
+    - Soft focus target instead of pushing to extremes
+    - Simplified contrastive grounding
     """
     
-    def __init__(self, temperature=0.2, entropy_weight=0.25, diversity_weight=0.20,
-                 spatial_weight=0.15, sharpness_weight=0.15, contrastive_weight=0.25,
+    def __init__(self, temperature=0.5, entropy_weight=0.30, diversity_weight=0.20,
+                 spatial_weight=0.15, contrastive_weight=0.35,
                  grid_size=14):
         super().__init__()
         self.temperature = temperature
         self.entropy_weight = entropy_weight
         self.diversity_weight = diversity_weight
         self.spatial_weight = spatial_weight
-        self.sharpness_weight = sharpness_weight
         self.contrastive_weight = contrastive_weight
         self.grid_size = grid_size
     
@@ -243,8 +261,9 @@ class FineGrainedAlignmentLoss(nn.Module):
         patch_norm = F.normalize(patch_embeddings.float(), p=2, dim=-1)
         text_norm = F.normalize(text_embeddings.float(), p=2, dim=-1)
         
-        # Compute text-to-patch attention: (B, seq_len, num_patches)
+        # STABILITY FIX: Clamp logits before softmax
         attention_logits = torch.bmm(text_norm, patch_norm.transpose(1, 2)) / self.temperature
+        attention_logits = torch.clamp(attention_logits, min=-20.0, max=20.0)
         attention_weights = F.softmax(attention_logits, dim=-1)
         
         # Apply attention mask if provided
@@ -255,59 +274,64 @@ class FineGrainedAlignmentLoss(nn.Module):
             mask = torch.ones(B, seq_len, 1, device=device)
             valid_tokens = torch.tensor(seq_len, device=device, dtype=torch.float32).view(1, 1)
         
-        # ====== Component 1: Focus Loss (Entropy) ======
+        # ====== Component 1: Soft Focus Loss (Target moderate entropy) ======
         entropy = -(attention_weights * torch.log(attention_weights + eps)).sum(dim=-1)
         max_entropy = math.log(num_patches)
         normalized_entropy = entropy / max_entropy
-        focus_loss = (normalized_entropy * attention_mask.float()).sum(dim=-1) / valid_tokens.squeeze(-1) if attention_mask is not None else normalized_entropy.mean(dim=-1)
+        
+        # STABILITY FIX: Target 40% entropy instead of minimum
+        focus_loss = F.smooth_l1_loss(
+            normalized_entropy,
+            torch.full_like(normalized_entropy, 0.4),
+            reduction='none'
+        )
+        focus_loss = (focus_loss * attention_mask.float()).sum(dim=-1) / valid_tokens.squeeze(-1) if attention_mask is not None else focus_loss.mean(dim=-1)
         focus_loss = focus_loss.mean()
         
-        # ====== Component 2: Spatial Coherence Loss ======
+        # ====== Component 2: Local Spatial Coherence ======
         H = W = self.grid_size
         if num_patches == H * W:
             attention_grid = attention_weights.view(B, seq_len, H, W)
-            tv_h = torch.abs(attention_grid[:, :, 1:, :] - attention_grid[:, :, :-1, :]).mean()
-            tv_w = torch.abs(attention_grid[:, :, :, 1:] - attention_grid[:, :, :, :-1]).mean()
-            spatial_loss = (tv_h + tv_w) * 0.5
+            
+            # Only penalize variation in significant attention regions
+            mean_attn = attention_grid.mean(dim=(2, 3), keepdim=True)
+            significant_mask = (attention_grid > mean_attn).float()
+            
+            tv_h = torch.abs(attention_grid[:, :, 1:, :] - attention_grid[:, :, :-1, :])
+            tv_w = torch.abs(attention_grid[:, :, :, 1:] - attention_grid[:, :, :, :-1])
+            
+            masked_tv_h = (tv_h * significant_mask[:, :, 1:, :]).sum() / (significant_mask[:, :, 1:, :].sum() + eps)
+            masked_tv_w = (tv_w * significant_mask[:, :, :, 1:]).sum() / (significant_mask[:, :, :, 1:].sum() + eps)
+            
+            spatial_loss = (masked_tv_h + masked_tv_w) * 0.25
         else:
             spatial_loss = torch.tensor(0.0, device=device)
         
-        # ====== Component 3: Diversity Loss ======
+        # ====== Component 3: Soft Diversity Loss ======
         mean_attention = (attention_weights * mask).sum(dim=1) / valid_tokens
-        diversity = mean_attention.var(dim=-1).mean()
-        diversity_loss = (1.0 - 10.0 * diversity).clamp(min=0.0)
+        mean_attn_entropy = -(mean_attention * torch.log(mean_attention + eps)).sum(dim=-1)
+        max_coverage_entropy = math.log(num_patches)
+        target_coverage = 0.3 * max_coverage_entropy
+        diversity_loss = F.relu(target_coverage - mean_attn_entropy).mean()
         
-        # ====== Component 4: Sharpness Loss ======
-        max_attention = attention_weights.max(dim=-1)[0]
-        if attention_mask is not None:
-            peak_sharpness = (max_attention * attention_mask.float()).sum(dim=-1) / valid_tokens.squeeze(-1)
-        else:
-            peak_sharpness = max_attention.mean(dim=-1)
-        sharpness_loss = (1.0 - peak_sharpness.mean()).clamp(min=0.0)
-        
-        # ====== Component 5: Contrastive Grounding Loss ======
+        # ====== Component 4: Simplified Contrastive Grounding ======
         attended_patches = torch.bmm(attention_weights, patch_norm)
         positive_sim = (text_norm * attended_patches).sum(dim=-1)
         
-        neg_attention = 1.0 - attention_weights
-        neg_attention = neg_attention / neg_attention.sum(dim=-1, keepdim=True).clamp(min=eps)
-        neg_patches = torch.bmm(neg_attention, patch_norm)
-        negative_sim = (text_norm * neg_patches).sum(dim=-1)
+        # Use batch mean as simple negative
+        batch_mean_patches = patch_norm.mean(dim=1, keepdim=True).expand(-1, seq_len, -1)
+        baseline_sim = (text_norm * batch_mean_patches).sum(dim=-1)
         
-        margin = 0.3
-        contrastive_loss = F.relu(negative_sim - positive_sim + margin)
-        if attention_mask is not None:
-            contrastive_loss = (contrastive_loss * attention_mask.float()).sum(dim=-1) / valid_tokens.squeeze(-1)
-        else:
-            contrastive_loss = contrastive_loss.mean(dim=-1)
+        margin = 0.1
+        contrastive_loss = F.relu(baseline_sim - positive_sim + margin)
+        contrastive_loss = (contrastive_loss * attention_mask.float()).sum(dim=-1) / valid_tokens.squeeze(-1) if attention_mask is not None else contrastive_loss.mean(dim=-1)
         contrastive_loss = contrastive_loss.mean()
         
-        # ====== Combine all losses ======
+        # ====== Combine losses ======
         loss = (
             self.entropy_weight * focus_loss +
             self.spatial_weight * spatial_loss +
             self.diversity_weight * diversity_loss +
-            self.sharpness_weight * sharpness_loss +
             self.contrastive_weight * contrastive_loss
         )
         
