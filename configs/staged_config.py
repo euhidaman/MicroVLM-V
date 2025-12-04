@@ -293,6 +293,12 @@ class StagedTrainingConfig:
     quantize_vision_4bit: bool = False    # DeiT stays FP16 (only 23MB)
     quantize_memory_158bit: bool = False  # Optional 1.58-bit memory
     
+    # Carbon/Compute Tracking
+    track_carbon: bool = True    # Track CO2 emissions via CodeCarbon
+    track_flops: bool = True     # Track FLOPs computation
+    track_gpu: bool = True       # Track GPU utilization, memory, power
+    country_iso_code: str = "USA"  # ISO country code for carbon intensity
+    
     # Distributed training
     use_ddp: bool = True
     ddp_backend: str = "nccl"

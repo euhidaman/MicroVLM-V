@@ -9,6 +9,7 @@ from src.visualization.wandb_logger import WandBLogger
 from src.visualization.attention_vis import create_attention_visualizer
 from src.training.staged_config import load_config as load_staged_config
 from src.training.config import load_config, create_run_name
+from src.training.carbon_tracker import CarbonComputeTracker, estimate_model_flops
 from src.data.cc12m_loader import create_dataloaders
 from src.models import create_microvlm, create_microvlm_fiber, MicroVLMFIBER
 import os
@@ -782,7 +783,7 @@ def compute_gradient_flow_metrics(model):
 
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, wandb_run=None, wandb_logger=None,
-                is_distributed=False, is_main_process=True):
+                is_distributed=False, is_main_process=True, carbon_tracker=None):
     """Train for one epoch
     
     Args:
@@ -798,6 +799,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         wandb_logger: WandB logger object
         is_distributed: Whether using distributed training
         is_main_process: Whether this is the main process (rank 0)
+        carbon_tracker: CarbonComputeTracker for emissions/FLOPs tracking
     """
     model.train()
 
@@ -811,6 +813,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
     # Check if using FIBER mode
     use_fiber = getattr(config, 'alignment_mode', 'baseline') == 'fiber'
 
+    # Start epoch tracking for carbon tracker
+    if carbon_tracker is not None:
+        carbon_tracker.start_epoch(epoch)
+
     # Only show progress bar on main process
     if is_main_process:
         pbar = tqdm(train_loader, desc=f"Epoch {epoch}")
@@ -818,6 +824,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         pbar = train_loader
 
     for batch_idx, batch in enumerate(pbar):
+        # Start batch timing for carbon tracker
+        if carbon_tracker is not None:
+            carbon_tracker.start_batch()
+
         # Move to device
         images = batch['image'].to(config.device)
         input_ids = batch['input_ids'].to(config.device)
@@ -927,6 +937,16 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         itm_loss_total += itm_loss_val.item() if itm_loss_val is not None else 0
 
         global_step += 1
+
+        # End batch tracking for carbon tracker and log compute metrics
+        if carbon_tracker is not None:
+            batch_size = images.size(0)
+            compute_metrics = carbon_tracker.end_batch(batch_size=batch_size)
+            
+            # Log compute metrics periodically (every log_interval steps)
+            if wandb_logger and global_step % config.log_interval == 0:
+                compute_wandb_metrics = carbon_tracker.get_wandb_metrics(compute_metrics)
+                wandb_logger.log_metrics(compute_wandb_metrics, step=global_step)
 
         # Update progress bar (main process only)
         if is_main_process:
@@ -1221,6 +1241,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         # Remove step-based checkpointing (only save at end of epoch)
 
+    # End epoch tracking for carbon tracker
+    if carbon_tracker is not None:
+        epoch_metrics = carbon_tracker.end_epoch()
+        if is_main_process and wandb_logger:
+            epoch_wandb_metrics = carbon_tracker.get_wandb_metrics(epoch_metrics, prefix="epoch_compute")
+            wandb_logger.log_metrics(epoch_wandb_metrics, step=global_step)
+
     avg_loss = total_loss / len(train_loader)
     return avg_loss, global_step
 
@@ -1508,6 +1535,26 @@ def main():
         wandb_run = setup_wandb(config, run_name)
         wandb_logger = WandBLogger(config, wandb_run) if wandb_run else None
 
+    # Initialize Carbon/Compute Tracker (main process only)
+    carbon_tracker = None
+    track_carbon = getattr(config, 'track_carbon', True)
+    track_flops = getattr(config, 'track_flops', True)
+    track_gpu = getattr(config, 'track_gpu', True)
+    
+    if is_main_process and (track_carbon or track_flops or track_gpu):
+        carbon_log_dir = Path(config.output_dir) / "carbon_logs"
+        carbon_tracker = CarbonComputeTracker(
+            is_main_process=is_main_process,
+            output_dir=str(carbon_log_dir),
+            project_name=f"microvlm-v-{args.config}",
+            country_iso_code=getattr(config, 'country_iso_code', 'USA'),
+            track_carbon=track_carbon,
+            track_gpu=track_gpu,
+            track_flops=track_flops,
+            model=None  # Set after model creation
+        )
+        print(f"[CarbonTracker] Initialized (carbon={track_carbon}, gpu={track_gpu}, flops={track_flops})")
+
     # Create model with quantization settings
     if is_main_process:
         print("Creating model...")
@@ -1635,6 +1682,15 @@ def main():
     # Store alignment mode in config for use in training loop
     config.alignment_mode = args.alignment_mode
 
+    # Initialize FLOPs estimation for carbon tracker
+    if carbon_tracker is not None and is_main_process:
+        base_model_for_flops = model.module if hasattr(model, 'module') else model
+        num_params = sum(p.numel() for p in base_model_for_flops.parameters())
+        # Estimate sequence length (prefix tokens + text tokens)
+        seq_len = getattr(config, 'max_length', 256) + getattr(config, 'num_image_tokens', 196)
+        estimated_flops = carbon_tracker.estimate_flops_from_params(num_params, seq_len)
+        print(f"[CarbonTracker] Total params: {num_params:,}, Est. FLOPs/forward: {estimated_flops:.2e}")
+
     # Create visualizer
     visualizer = create_attention_visualizer(model_config['model_dimensions'])
 
@@ -1714,6 +1770,10 @@ def main():
         start_epoch = checkpoint['epoch']
         global_step = checkpoint['global_step']
 
+    # Start carbon/compute tracking
+    if carbon_tracker is not None:
+        carbon_tracker.start_training()
+
     # Training loop
     if is_main_process:
         print(f"Starting training for {config.num_epochs} epochs...")
@@ -1738,7 +1798,8 @@ def main():
             wandb_run=wandb_run,
             wandb_logger=wandb_logger,
             is_distributed=is_distributed,
-            is_main_process=is_main_process
+            is_main_process=is_main_process,
+            carbon_tracker=carbon_tracker
         )
 
         if is_main_process:
@@ -1784,6 +1845,27 @@ def main():
         # Synchronize all processes before next epoch
         if is_distributed:
             dist.barrier()
+
+    # End carbon/compute tracking and log final summary
+    if carbon_tracker is not None:
+        final_metrics = carbon_tracker.end_training()
+        
+        # Log final carbon/compute summary to WandB
+        if is_main_process and wandb_logger:
+            final_wandb_metrics = carbon_tracker.get_wandb_metrics(final_metrics, prefix="final_compute")
+            wandb_logger.log_metrics(final_wandb_metrics, step=global_step)
+            
+            # Log summary statistics as WandB summary
+            if wandb_run:
+                wandb_run.summary["total_training_hours"] = final_metrics.total_time_seconds / 3600
+                wandb_run.summary["total_flops"] = final_metrics.cumulative_flops
+                wandb_run.summary["total_tflops"] = final_metrics.cumulative_flops / 1e12
+                if final_metrics.emissions_kg > 0:
+                    wandb_run.summary["carbon_emissions_g"] = final_metrics.emissions_kg * 1000
+                    wandb_run.summary["energy_consumed_kwh"] = final_metrics.energy_consumed_kwh
+        
+        # Cleanup tracker resources
+        carbon_tracker.cleanup()
 
     # Final save (main process only)
     if is_main_process:
