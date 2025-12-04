@@ -79,7 +79,56 @@ class WandBLogger:
             metrics['memory/scope_prob_mean'] = scope_probs.mean().item()
             metrics['memory/scope_prob_std'] = scope_probs.std().item()
         
+        # ITC/ITM losses (FIBER mode)
+        if 'itc_loss' in outputs:
+            itc_loss = outputs['itc_loss']
+            if itc_loss is not None:
+                metrics['alignment/itc_loss'] = itc_loss.item() if hasattr(itc_loss, 'item') else itc_loss
+        
+        if 'itm_loss' in outputs:
+            itm_loss = outputs['itm_loss']
+            if itm_loss is not None:
+                metrics['alignment/itm_loss'] = itm_loss.item() if hasattr(itm_loss, 'item') else itm_loss
+        
+        if 'token_loss' in outputs:
+            token_loss = outputs['token_loss']
+            if token_loss is not None:
+                metrics['alignment/token_loss'] = token_loss.item() if hasattr(token_loss, 'item') else token_loss
+        
         self.wandb_run.log(metrics, step=global_step)
+    
+    def log_temperature_metrics(self, model, global_step):
+        """Log temperature/logit_scale metrics for monitoring alignment stability"""
+        if not self.enabled:
+            return
+        
+        metrics = {}
+        base_model = model.module if hasattr(model, 'module') else model
+        
+        # Find alignment loss module and log temperature
+        if hasattr(base_model, 'alignment_loss'):
+            alignment_loss = base_model.alignment_loss
+            if hasattr(alignment_loss, 'logit_scale'):
+                logit_scale = alignment_loss.logit_scale
+                if hasattr(logit_scale, 'item'):
+                    logit_scale_val = logit_scale.item()
+                else:
+                    logit_scale_val = float(logit_scale)
+                temperature = 1.0 / logit_scale_val if logit_scale_val > 0 else 0.0
+                metrics['alignment/logit_scale'] = logit_scale_val
+                metrics['alignment/temperature'] = temperature
+        
+        # Find and log alpha values from fusion blocks
+        if hasattr(base_model, 'vision_encoder') and hasattr(base_model.vision_encoder, 'fusion_blocks'):
+            fusion_blocks = base_model.vision_encoder.fusion_blocks
+            for layer_idx, block in fusion_blocks.items():
+                if hasattr(block, 'i2t_attention') and hasattr(block.i2t_attention, 'alpha'):
+                    alpha = block.i2t_attention.alpha
+                    if hasattr(alpha, 'item'):
+                        metrics[f'fiber/alpha_i2t_layer{layer_idx}'] = alpha.item()
+        
+        if metrics:
+            self.wandb_run.log(metrics, step=global_step)
     
     def log_gradient_metrics(self, model, global_step):
         """

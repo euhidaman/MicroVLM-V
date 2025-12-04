@@ -621,12 +621,12 @@ class FIBERAlignmentLoss(nn.Module):
         self,
         temperature: float = 0.07,
         learnable_temperature: bool = True,
-        label_smoothing: float = 0.1,
-        itc_weight: float = 1.0,
-        itm_weight: float = 1.0,
+        label_smoothing: float = 0.2,  # Increased from 0.1 for better regularization
+        itc_weight: float = 0.8,  # Reduced from 1.0 to prevent over-focus on pixel patterns
+        itm_weight: float = 1.2,  # Increased for better semantic matching
         token_weight: float = 0.5,
-        min_temperature: float = 0.01,  # Minimum temperature (max logit_scale ~ 4.6)
-        max_temperature: float = 0.5,   # Maximum temperature (min logit_scale ~ 0.7)
+        min_temperature: float = 0.05,  # Raised from 0.01 to prevent edge-detection mode
+        max_temperature: float = 0.3,   # Tightened from 0.5 for more stable training
         # ITC Queue settings (lightweight for edge devices)
         use_itc_queue: bool = True,
         queue_size: int = 256,  # Reduced from FIBER's 4096 for compact model
@@ -809,8 +809,9 @@ class FIBERAlignmentLoss(nn.Module):
             sim_t2i = sim_i2t.T
         
         # STABILITY FIX: Clamp logits to prevent extreme values
-        sim_i2t = torch.clamp(sim_i2t, min=-100.0, max=100.0)
-        sim_t2i = torch.clamp(sim_t2i, min=-100.0, max=100.0)
+        # Tightened bounds to prevent over-confident predictions
+        sim_i2t = torch.clamp(sim_i2t, min=-50.0, max=50.0)
+        sim_t2i = torch.clamp(sim_t2i, min=-50.0, max=50.0)
         
         # Labels: diagonal elements are positive pairs (first B columns)
         labels = torch.arange(batch_size, device=image_feat_itc.device)

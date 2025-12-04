@@ -624,20 +624,47 @@ def setup_wandb(config, run_name):
 
 
 def create_optimizer(model, config):
-    """Create optimizer"""
-    # Get trainable parameters
-    trainable_params = [p for p in model.parameters() if p.requires_grad]
+    """Create optimizer with separate param groups for stability"""
+    # Get base model (handle DDP wrapper)
+    base_model = model.module if hasattr(model, 'module') else model
+    
+    # Separate temperature parameters for lower learning rate
+    temperature_params = []
+    other_params = []
+    
+    for name, param in base_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        # Temperature/logit_scale parameters need lower LR to prevent instability
+        if 'logit_scale' in name or '_alpha_raw' in name:
+            temperature_params.append(param)
+        else:
+            other_params.append(param)
+    
+    # Create param groups
+    param_groups = [
+        {'params': other_params, 'lr': config.learning_rate},
+    ]
+    
+    # Add temperature params with 10x lower learning rate
+    if temperature_params:
+        param_groups.append({
+            'params': temperature_params,
+            'lr': config.learning_rate * 0.1,  # 10x lower LR for temperature
+            'name': 'temperature'
+        })
+        print(f"[Optimizer] Temperature params ({len(temperature_params)}) using LR={config.learning_rate * 0.1:.2e}")
 
     if config.optimizer == "adamw":
         optimizer = torch.optim.AdamW(
-            trainable_params,
+            param_groups,
             lr=config.learning_rate,
             weight_decay=config.weight_decay,
             betas=(0.9, 0.999)
         )
     elif config.optimizer == "adam":
         optimizer = torch.optim.Adam(
-            trainable_params,
+            param_groups,
             lr=config.learning_rate,
             weight_decay=config.weight_decay
         )
@@ -995,6 +1022,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
                 # Gradient metrics
                 wandb_logger.log_gradient_metrics(model, global_step)
+                
+                # Temperature/alpha metrics for monitoring alignment stability
+                wandb_logger.log_temperature_metrics(model, global_step)
 
                 # Gradient flow monitoring (every 50 steps)
                 if global_step % 50 == 0:
