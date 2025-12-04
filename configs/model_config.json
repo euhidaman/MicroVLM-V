@@ -62,13 +62,23 @@
     "memory_dim": 896,
     "memory_target_layers": 6,
     "memory_num_heads": 4,
+    "memory_num_layers": 6,
+    "head_dim": 64,
     "scope_hidden_dim": 256,
     "itm_hidden_dim": 256,
     "fusion_layers": [
       9,
       11
     ],
-    "num_fusion_heads": 2
+    "num_fusion_heads": 2,
+    "w_logvar_setting": 1,
+    "deterministic_memory": false
+  },
+  "itc_config": {
+    "use_itc_queue": true,
+    "itc_queue_size": 256,
+    "itc_embed_dim": 128,
+    "description": "FIBER-style ITC queue for better negative sampling (lightweight version)"
   },
   "estimated_sizes": {
     "qwen_original_mb": 1976,

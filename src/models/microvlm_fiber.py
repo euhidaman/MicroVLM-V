@@ -32,7 +32,14 @@ from ..quantization.quantized_episodic_memory import apply_158bit_quantization_t
 
 @dataclass
 class FIBERConfig:
-    """Configuration for FIBER-style alignment (reduced for compact model)"""
+    """
+    Configuration for FIBER-style alignment (reduced for compact model).
+    
+    ITC Queue settings (FIBER-style):
+    - use_itc_queue: Enable/disable queue-based negative sampling
+    - itc_queue_size: Number of cached features (reduced from FIBER's 4096)
+    - itc_embed_dim: Dimension of ITC projection space
+    """
     enabled: bool = True
     fusion_layers: list = None  # Which vision layers get cross-modal fusion
     num_fusion_heads: int = 2  # Reduced from 4 for compact model
@@ -41,6 +48,10 @@ class FIBERConfig:
     itm_weight: float = 0.5
     token_weight: float = 0.3
     temperature: float = 0.07
+    # FIBER-style ITC Queue settings (lightweight for edge devices)
+    use_itc_queue: bool = True  # Enable queue-based ITC
+    itc_queue_size: int = 256   # Reduced from FIBER's 4096 for compact model
+    itc_embed_dim: int = 128    # Compact ITC embedding dimension
     
     def __post_init__(self):
         if self.fusion_layers is None:
@@ -139,19 +150,35 @@ class MicroVLM_FIBER(nn.Module):
         
         # Choose alignment loss based on mode
         if alignment_mode == 'fiber' and self.fiber_config.enabled:
-            print("🔗 Using FIBER Alignment Loss (ITC + ITM + Token)")
+            # Get ITC configuration from fiber_config or use defaults
+            use_itc_queue = getattr(self.fiber_config, 'use_itc_queue', True)
+            itc_queue_size = getattr(self.fiber_config, 'itc_queue_size', 256)
+            itc_embed_dim = getattr(self.fiber_config, 'itc_embed_dim', 128)
+            
+            print(f"🔗 Using FIBER Alignment Loss (ITC + ITM + Token)")
+            print(f"   ITC Queue: {'enabled' if use_itc_queue else 'disabled'} (size={itc_queue_size})")
+            print(f"   ITC embed dim: {itc_embed_dim}")
+            
             self.alignment_loss = FIBERAlignmentLoss(
                 temperature=self.fiber_config.temperature,
                 learnable_temperature=True,
                 label_smoothing=0.1,
                 itc_weight=self.fiber_config.itc_weight,
                 itm_weight=self.fiber_config.itm_weight,
-                token_weight=self.fiber_config.token_weight
+                token_weight=self.fiber_config.token_weight,
+                use_itc_queue=use_itc_queue,
+                queue_size=itc_queue_size,
+                itc_embed_dim=itc_embed_dim
             )
             # Initialize ITM head
             self.alignment_loss.set_itm_head(
                 vision_dim=config.get('vision_hidden_size', 192),
                 text_dim=config.get('language_hidden_size', 896)
+            )
+            # Initialize ITC projection heads (FIBER-style)
+            self.alignment_loss.set_itc_heads(
+                image_dim=self.alignment_dim,  # Use alignment_dim as input
+                text_dim=self.alignment_dim
             )
         else:
             print("🔗 Using baseline Contrastive Alignment Loss")
@@ -625,6 +652,13 @@ def create_microvlm_fiber(
             fiber_cfg.bidirectional = fiber_config['use_bidirectional']
         if 'temperature' in fiber_config:
             fiber_cfg.temperature = fiber_config['temperature']
+        # ITC Queue settings
+        if 'use_itc_queue' in fiber_config:
+            fiber_cfg.use_itc_queue = fiber_config['use_itc_queue']
+        if 'itc_queue_size' in fiber_config:
+            fiber_cfg.itc_queue_size = fiber_config['itc_queue_size']
+        if 'itc_embed_dim' in fiber_config:
+            fiber_cfg.itc_embed_dim = fiber_config['itc_embed_dim']
         fiber_config = fiber_cfg
     elif fiber_config is None:
         fiber_config = FIBERConfig()

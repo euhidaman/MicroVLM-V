@@ -21,6 +21,13 @@ class EpisodicMemory(nn.Module):
     NOTE: Dimensions reduced for compact model (<1GB target):
     - memory_size: 512 -> 64 (8x reduction)
     - W_M targets only 6 layers with 4 heads (vs 24 layers, 14 heads)
+    
+    w_logvar_setting options (from Larimar):
+    - 0: Single scalar variance for all dimensions and inputs (default, most lightweight)
+    - 1: Per-dimension variance, same for all inputs (lightweight)
+    - 2: Variance is a function of z (input-dependent, small linear layer)
+    - 3: Variance is a function of memory M (memory-dependent, small linear layer)
+    - 4: Variance is a function of both z and M (most expressive, small linear layer)
     """
     
     def __init__(self, config):
@@ -40,8 +47,37 @@ class EpisodicMemory(nn.Module):
         self.memory_mean = nn.Parameter(torch.randn(self.memory_size, self.code_size))
         self.register_buffer('memory_logvar', torch.zeros(1))
         
-        # Addressing variance
-        self.w_logvar = nn.Parameter(torch.zeros(self.memory_size))
+        # ===== Larimar-style w_logvar_setting configuration =====
+        # Controls how addressing weight variance is computed
+        self._w_logvar_setting = config.get('w_logvar_setting', 1)  # Default: setting 1 (per-dim)
+        self.deterministic = config.get('deterministic_memory', False)
+        
+        if self._w_logvar_setting == 0:
+            # Setting 0: Single scalar variance (most lightweight)
+            self.w_logvar = nn.Parameter(torch.zeros(1))
+        elif self._w_logvar_setting == 1:
+            # Setting 1: Per-dimension variance (lightweight, default)
+            self.w_logvar = nn.Parameter(torch.zeros(self.memory_size))
+        elif self._w_logvar_setting == 2:
+            # Setting 2: Variance is a function of z (input-dependent)
+            # Uses small linear layer for compact model
+            self.w_logvar = nn.Linear(self.code_size, self.memory_size)
+            nn.init.xavier_uniform_(self.w_logvar.weight, gain=0.1)
+            nn.init.zeros_(self.w_logvar.bias)
+        elif self._w_logvar_setting == 3:
+            # Setting 3: Variance is a function of memory M
+            # Flatten memory and project (uses small linear layer)
+            self.w_logvar = nn.Linear(self.code_size * self.memory_size, self.memory_size)
+            nn.init.xavier_uniform_(self.w_logvar.weight, gain=0.1)
+            nn.init.zeros_(self.w_logvar.bias)
+        elif self._w_logvar_setting == 4:
+            # Setting 4: Variance is a function of both z and M (most expressive)
+            # Takes concatenated z and flattened M
+            self.w_logvar = nn.Linear(self.code_size + self.code_size * self.memory_size, self.memory_size)
+            nn.init.xavier_uniform_(self.w_logvar.weight, gain=0.1)
+            nn.init.zeros_(self.w_logvar.bias)
+        else:
+            raise ValueError(f"Invalid w_logvar_setting: {self._w_logvar_setting}. Must be 0-4.")
         
         # Observation noise
         self.observation_noise_std = 0.1
@@ -73,12 +109,89 @@ class EpisodicMemory(nn.Module):
         # Initialize memory as identity-like
         nn.init.eye_(self.memory_mean)
         
-        # Small variance for addressing
-        nn.init.constant_(self.w_logvar, 0.0)
+        # Initialize w_logvar based on setting type
+        if self._w_logvar_setting in [0, 1]:
+            # Scalar or per-dimension parameter
+            nn.init.constant_(self.w_logvar, 0.0)
+        # Settings 2-4 use Linear layers, already initialized in __init__
         
         # Initialize W_M projection
         nn.init.xavier_uniform_(self.W_M.weight)
         nn.init.zeros_(self.W_M.bias)
+    
+    def _compute_w_logvar(self, z: torch.Tensor, M: torch.Tensor) -> torch.Tensor:
+        """
+        Compute w_logvar based on the configured setting (Larimar-style).
+        
+        Args:
+            z: (episode_size, batch_size, code_size) - input encoding
+            M: (batch_size, memory_size, code_size) - current memory
+        
+        Returns:
+            w_logvar: variance for addressing weights, shape depends on setting
+        """
+        episode_size, batch_size, _ = z.shape
+        
+        if self._w_logvar_setting == 0:
+            # Setting 0: Single scalar for all
+            return self.w_logvar  # Shape: (1,)
+        
+        elif self._w_logvar_setting == 1:
+            # Setting 1: Per-dimension, same for all inputs
+            return self.w_logvar  # Shape: (memory_size,)
+        
+        elif self._w_logvar_setting == 2:
+            # Setting 2: Function of z
+            z_flat = z.reshape(episode_size * batch_size, self.code_size)
+            w_logvar = self.w_logvar(z_flat)  # (episode_size * batch_size, memory_size)
+            return w_logvar.view(episode_size, batch_size, self.memory_size)
+        
+        elif self._w_logvar_setting == 3:
+            # Setting 3: Function of memory M
+            M_flat = M.reshape(batch_size, -1)  # (batch_size, memory_size * code_size)
+            w_logvar = self.w_logvar(M_flat)  # (batch_size, memory_size)
+            return w_logvar.unsqueeze(0).expand(episode_size, -1, -1)
+        
+        elif self._w_logvar_setting == 4:
+            # Setting 4: Function of both z and M
+            M_flat = M.reshape(batch_size, -1)  # (batch_size, memory_size * code_size)
+            # Expand M to match episode_size
+            M_expanded = M_flat.unsqueeze(0).expand(episode_size, -1, -1)
+            M_expanded = M_expanded.reshape(episode_size * batch_size, -1)
+            z_flat = z.reshape(episode_size * batch_size, self.code_size)
+            # Concatenate z and M
+            combined = torch.cat([z_flat, M_expanded], dim=-1)
+            w_logvar = self.w_logvar(combined)  # (episode_size * batch_size, memory_size)
+            return w_logvar.view(episode_size, batch_size, self.memory_size)
+        
+        else:
+            raise ValueError(f"Invalid w_logvar_setting: {self._w_logvar_setting}")
+    
+    def _sample_w(self, w_mean: torch.Tensor, w_logvar: torch.Tensor) -> torch.Tensor:
+        """
+        Sample addressing weights from Gaussian distribution (Larimar-style).
+        
+        Args:
+            w_mean: (episode_size, batch_size, memory_size)
+            w_logvar: variance, shape depends on w_logvar_setting
+        
+        Returns:
+            w: sampled addressing weights (episode_size, batch_size, memory_size)
+        """
+        std = torch.exp(0.5 * w_logvar)
+        
+        # Handle different shapes of w_logvar
+        if self._w_logvar_setting == 0:
+            # Single scalar - broadcast to w_mean shape
+            std = std.expand_as(w_mean)
+        elif self._w_logvar_setting == 1:
+            # Per-dimension - broadcast to (episode_size, batch_size, memory_size)
+            std = std.view(1, 1, -1).expand_as(w_mean)
+        # Settings 2-4 already have correct shape
+        
+        # Reparameterization trick
+        w_sample = w_mean + std * torch.randn_like(w_mean)
+        return w_sample
     
     def _get_prior_params(self):
         """Get prior distribution parameters"""
@@ -290,15 +403,15 @@ class EpisodicMemory(nn.Module):
         # Compute addressing weights
         w_mean = self._solve_w_mean(z, M)
         
-        # Sample or use deterministic weights
-        if deterministic:
+        # Sample or use deterministic weights (using Larimar-style w_logvar)
+        if deterministic or self.deterministic:
             w = w_mean
         else:
-            # Ensure w_logvar matches w_mean dtype for sampling
-            w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0).to(w_mean.dtype)  # (1, 1, memory_size)
+            # Compute w_logvar based on setting (Larimar-style)
+            w_logvar = self._compute_w_logvar(z, M)
             w_logvar = torch.clamp(w_logvar, min=-10.0, max=10.0)
-            std = torch.exp(0.5 * w_logvar)
-            w = w_mean + std * torch.randn_like(w_mean)
+            # Sample using reparameterization trick
+            w = self._sample_w(w_mean, w_logvar.to(w_mean.dtype))
         
         # Retrieve: z = w^T * M
         z_retrieved = torch.bmm(w.transpose(0, 1), M).transpose(0, 1)
@@ -309,8 +422,11 @@ class EpisodicMemory(nn.Module):
         # Ensure retrieved tensor maintains original dtype
         z_retrieved = z_retrieved.to(original_dtype)
         
-        # Compute KL divergence
-        dkl_w = self._compute_addressing_kl(w_mean)
+        # Compute KL divergence (with w_logvar for accurate computation)
+        if deterministic or self.deterministic:
+            dkl_w = self._compute_addressing_kl(w_mean)
+        else:
+            dkl_w = self._compute_addressing_kl(w_mean, w_logvar)
         
         return z_retrieved, dkl_w.to(original_dtype)
     
@@ -373,16 +489,49 @@ class EpisodicMemory(nn.Module):
         dkl_M = torch.clamp(dkl_M, min=-1e6, max=1e6)
         return dkl_M
     
-    def _compute_addressing_kl(self, w_mean):
-        """Compute KL divergence of addressing weights"""
+    def _compute_addressing_kl(self, w_mean, w_logvar=None):
+        """
+        Compute KL divergence of addressing weights (Larimar-style).
+        
+        KL(q(w) || p(w)) where p(w) = N(0, I) is the prior.
+        
+        Args:
+            w_mean: (episode_size, batch_size, memory_size)
+            w_logvar: variance, shape depends on w_logvar_setting
+                     If None, uses self.w_logvar (for backward compatibility)
+        """
         w_mean = torch.clamp(w_mean, min=-1e3, max=1e3)
-        w_logvar = self.w_logvar.unsqueeze(0).unsqueeze(0).to(w_mean.dtype)
+        
+        # Get w_logvar if not provided
+        if w_logvar is None:
+            if self._w_logvar_setting in [0, 1]:
+                w_logvar = self.w_logvar.to(w_mean.dtype)
+            else:
+                # For settings 2-4, need z and M which we don't have here
+                # Use zeros as fallback (equivalent to unit variance)
+                w_logvar = torch.zeros(self.memory_size, device=w_mean.device, dtype=w_mean.dtype)
+        
         w_logvar = torch.clamp(w_logvar, min=-10.0, max=10.0)
         
-        exp_term = torch.exp(w_logvar)
+        # Handle different shapes based on w_logvar_setting
+        if self._w_logvar_setting == 0:
+            # Scalar: broadcast to full shape
+            w_logvar_expanded = w_logvar.expand_as(w_mean)
+        elif self._w_logvar_setting == 1:
+            # Per-dimension: reshape for broadcasting
+            w_logvar_expanded = w_logvar.view(1, 1, -1).expand_as(w_mean)
+        else:
+            # Settings 2-4: already have correct shape or use provided w_logvar
+            if w_logvar.dim() == 1:
+                w_logvar_expanded = w_logvar.view(1, 1, -1).expand_as(w_mean)
+            else:
+                w_logvar_expanded = w_logvar
+        
+        exp_term = torch.exp(w_logvar_expanded)
         exp_term = torch.clamp(exp_term, max=1e3)
         
-        dkl = 0.5 * (exp_term + w_mean ** 2 - 1 - w_logvar)
+        # KL divergence: 0.5 * (sigma^2 + mu^2 - 1 - log(sigma^2))
+        dkl = 0.5 * (exp_term + w_mean ** 2 - 1 - w_logvar_expanded)
         dkl = torch.clamp(dkl, min=0.0, max=1e3)
         dkl = torch.sum(dkl, dim=-1)
         dkl = torch.clamp(dkl, min=0.0, max=1e6)

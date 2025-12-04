@@ -602,9 +602,14 @@ class FIBERAlignmentLoss(nn.Module):
     Combined alignment loss for FIBER-style training.
     
     Includes:
-    1. Image-Text Contrastive (ITC) loss - CLIP-style global alignment
+    1. Image-Text Contrastive (ITC) loss - CLIP-style global alignment with queue
     2. Image-Text Matching (ITM) loss - binary classification with hard negatives
     3. Token-level alignment loss (optional) - fine-grained supervision
+    
+    FEATURES (from FIBER):
+    - ITC queue for better negative sampling (lightweight version)
+    - Dedicated ITC projection heads for image and text
+    - Learnable temperature with bounded optimization
     
     STABILITY FIXES:
     - Temperature has tighter bounds to prevent extreme values
@@ -621,7 +626,12 @@ class FIBERAlignmentLoss(nn.Module):
         itm_weight: float = 1.0,
         token_weight: float = 0.5,
         min_temperature: float = 0.01,  # Minimum temperature (max logit_scale ~ 4.6)
-        max_temperature: float = 0.5    # Maximum temperature (min logit_scale ~ 0.7)
+        max_temperature: float = 0.5,   # Maximum temperature (min logit_scale ~ 0.7)
+        # ITC Queue settings (lightweight for edge devices)
+        use_itc_queue: bool = True,
+        queue_size: int = 256,  # Reduced from FIBER's 4096 for compact model
+        # ITC projection settings
+        itc_embed_dim: int = 128  # Compact ITC embedding dimension
     ):
         super().__init__()
         
@@ -644,6 +654,26 @@ class FIBERAlignmentLoss(nn.Module):
         
         self.learnable_temperature = learnable_temperature
         
+        # ===== FIBER-style ITC Queue (lightweight version) =====
+        self.use_itc_queue = use_itc_queue
+        self.queue_size = queue_size
+        self.itc_embed_dim = itc_embed_dim
+        
+        if use_itc_queue:
+            # Register queue buffers (not parameters - no gradient)
+            self.register_buffer("image_queue", torch.randn(itc_embed_dim, queue_size))
+            self.register_buffer("text_queue", torch.randn(itc_embed_dim, queue_size))
+            self.register_buffer("queue_ptr", torch.zeros(1, dtype=torch.long))
+            self.register_buffer("queue_total", torch.zeros(1, dtype=torch.long))
+            # Normalize queue embeddings
+            self.image_queue = F.normalize(self.image_queue, dim=0)
+            self.text_queue = F.normalize(self.text_queue, dim=0)
+        
+        # ===== FIBER-style ITC Projection Heads =====
+        # These will be initialized when set_itc_heads is called
+        self.image_proj_itc = None
+        self.text_proj_itc = None
+        
         # ITM head
         self.itm_head = None  # Initialized externally based on model dims
         
@@ -663,43 +693,135 @@ class FIBERAlignmentLoss(nn.Module):
         """Initialize ITM head with correct dimensions"""
         self.itm_head = ImageTextMatchingHead(vision_dim, text_dim)
     
+    def set_itc_heads(self, image_dim: int, text_dim: int):
+        """
+        Initialize FIBER-style dedicated ITC projection heads.
+        
+        These project image and text features to a shared ITC embedding space,
+        separate from the main feature projections used elsewhere.
+        
+        Args:
+            image_dim: dimension of input image features
+            text_dim: dimension of input text features
+        """
+        self.image_proj_itc = nn.Sequential(
+            nn.Linear(image_dim, self.itc_embed_dim),
+            nn.LayerNorm(self.itc_embed_dim)
+        )
+        self.text_proj_itc = nn.Sequential(
+            nn.Linear(text_dim, self.itc_embed_dim),
+            nn.LayerNorm(self.itc_embed_dim)
+        )
+        # Initialize with small weights for stability
+        for module in [self.image_proj_itc, self.text_proj_itc]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.5)
+                    nn.init.zeros_(m.bias)
+    
+    @torch.no_grad()
+    def _dequeue_and_enqueue(self, image_feat: torch.Tensor, text_feat: torch.Tensor):
+        """
+        Update the ITC queue with new features (FIBER-style momentum queue).
+        
+        Args:
+            image_feat: (B, itc_embed_dim) normalized image features
+            text_feat: (B, itc_embed_dim) normalized text features
+        """
+        if not self.use_itc_queue:
+            return
+        
+        batch_size = image_feat.size(0)
+        ptr = int(self.queue_ptr)
+        
+        # Handle wrap-around
+        if ptr + batch_size <= self.queue_size:
+            self.image_queue[:, ptr:ptr + batch_size] = image_feat.T
+            self.text_queue[:, ptr:ptr + batch_size] = text_feat.T
+        else:
+            # Wrap around
+            first_len = self.queue_size - ptr
+            self.image_queue[:, ptr:] = image_feat[:first_len].T
+            self.text_queue[:, ptr:] = text_feat[:first_len].T
+            remaining = batch_size - first_len
+            self.image_queue[:, :remaining] = image_feat[first_len:].T
+            self.text_queue[:, :remaining] = text_feat[first_len:].T
+        
+        # Update pointers
+        self.queue_ptr[0] = (ptr + batch_size) % self.queue_size
+        self.queue_total[0] = min(self.queue_total[0] + batch_size, self.queue_size)
+    
     def compute_itc_loss(
         self,
         image_features: torch.Tensor,
-        text_features: torch.Tensor
+        text_features: torch.Tensor,
+        use_queue: bool = True
     ) -> torch.Tensor:
         """
-        Compute Image-Text Contrastive loss.
+        Compute Image-Text Contrastive loss with optional queue for better negatives.
+        
+        When queue is enabled (FIBER-style), uses accumulated features from previous
+        batches as additional negatives, improving contrastive learning quality.
         
         Args:
-            image_features: (B, D) normalized image features
-            text_features: (B, D) normalized text features
+            image_features: (B, D) image features (will be projected if ITC heads exist)
+            text_features: (B, D) text features (will be projected if ITC heads exist)
+            use_queue: whether to use the ITC queue for additional negatives
         
         Returns:
             loss: scalar tensor
         """
+        # Project through ITC heads if available (FIBER-style)
+        if self.image_proj_itc is not None and self.text_proj_itc is not None:
+            image_feat_itc = self.image_proj_itc(image_features.float())
+            text_feat_itc = self.text_proj_itc(text_features.float())
+        else:
+            image_feat_itc = image_features.float()
+            text_feat_itc = text_features.float()
+        
         # Normalize - ensure float32 for mixed precision compatibility
-        image_features = F.normalize(image_features.float(), p=2, dim=-1)
-        text_features = F.normalize(text_features.float(), p=2, dim=-1)
+        image_feat_itc = F.normalize(image_feat_itc, p=2, dim=-1)
+        text_feat_itc = F.normalize(text_feat_itc, p=2, dim=-1)
         
         # STABILITY FIX: Use property for bounded logit scale
         logit_scale = self.logit_scale.exp()
         
-        # Compute similarity
-        logits_per_image = logit_scale * (image_features @ text_features.t())
-        logits_per_text = logits_per_image.t()
+        batch_size = image_feat_itc.size(0)
+        
+        # ===== FIBER-style Queue-based ITC =====
+        if use_queue and self.use_itc_queue and self.queue_total[0] > 0:
+            # Get queue features (detached - no gradient through queue)
+            queue_size_actual = int(self.queue_total[0])
+            image_queue = self.image_queue[:, :queue_size_actual].clone().detach()
+            text_queue = self.text_queue[:, :queue_size_actual].clone().detach()
+            
+            # Concatenate current batch with queue
+            # image_feat_all: (D, B + queue_size)
+            image_feat_all = torch.cat([image_feat_itc.T, image_queue], dim=1)
+            text_feat_all = torch.cat([text_feat_itc.T, text_queue], dim=1)
+            
+            # Compute similarity with all features (current + queue)
+            sim_i2t = logit_scale * (image_feat_itc @ text_feat_all)  # (B, B + queue_size)
+            sim_t2i = logit_scale * (text_feat_itc @ image_feat_all)  # (B, B + queue_size)
+        else:
+            # Standard in-batch contrastive (no queue)
+            sim_i2t = logit_scale * (image_feat_itc @ text_feat_itc.T)  # (B, B)
+            sim_t2i = sim_i2t.T
         
         # STABILITY FIX: Clamp logits to prevent extreme values
-        logits_per_image = torch.clamp(logits_per_image, min=-100.0, max=100.0)
-        logits_per_text = torch.clamp(logits_per_text, min=-100.0, max=100.0)
+        sim_i2t = torch.clamp(sim_i2t, min=-100.0, max=100.0)
+        sim_t2i = torch.clamp(sim_t2i, min=-100.0, max=100.0)
         
-        # Labels (diagonal)
-        batch_size = image_features.size(0)
-        labels = torch.arange(batch_size, device=image_features.device)
+        # Labels: diagonal elements are positive pairs (first B columns)
+        labels = torch.arange(batch_size, device=image_feat_itc.device)
         
         # Bidirectional loss
-        loss_i2t = self.ce_loss(logits_per_image, labels)
-        loss_t2i = self.ce_loss(logits_per_text, labels)
+        loss_i2t = self.ce_loss(sim_i2t, labels)
+        loss_t2i = self.ce_loss(sim_t2i, labels)
+        
+        # Update queue with current batch features (during training)
+        if self.training and self.use_itc_queue:
+            self._dequeue_and_enqueue(image_feat_itc.detach(), text_feat_itc.detach())
         
         return (loss_i2t + loss_t2i) / 2
     
