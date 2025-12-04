@@ -97,9 +97,11 @@ class Stage1Config:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     
-    # Batch settings
-    batch_size: int = 32
-    gradient_accumulation_steps: int = 2
+    # Batch settings - optimized for 2x A100 80GB GPUs
+    # With ~34GB used at batch_size=32, we can safely increase to 96
+    # This gives ~60-70GB usage per GPU (leaving headroom for peaks)
+    batch_size: int = 96
+    gradient_accumulation_steps: int = 1  # Reduced since batch is larger
     
     # Epochs
     num_epochs: int = 15
