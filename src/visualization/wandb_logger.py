@@ -95,6 +95,19 @@ class WandBLogger:
             if token_loss is not None:
                 metrics['alignment/token_loss'] = token_loss.item() if hasattr(token_loss, 'item') else token_loss
         
+        # Anti-collapse regularization losses
+        if 'anti_collapse_loss' in outputs:
+            anti_collapse_loss = outputs['anti_collapse_loss']
+            if anti_collapse_loss is not None:
+                val = anti_collapse_loss.item() if hasattr(anti_collapse_loss, 'item') else anti_collapse_loss
+                metrics['regularization/anti_collapse_loss'] = val
+        
+        if 'attention_entropy_loss' in outputs:
+            attn_entropy_loss = outputs['attention_entropy_loss']
+            if attn_entropy_loss is not None:
+                val = attn_entropy_loss.item() if hasattr(attn_entropy_loss, 'item') else attn_entropy_loss
+                metrics['regularization/attention_entropy_loss'] = val
+        
         self.wandb_run.log(metrics, step=global_step)
     
     def log_temperature_metrics(self, model, global_step):

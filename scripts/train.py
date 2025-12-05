@@ -10,6 +10,7 @@ from src.visualization.attention_vis import create_attention_visualizer
 from src.training.staged_config import load_config as load_staged_config
 from src.training.config import load_config, create_run_name
 from src.training.carbon_tracker import CarbonComputeTracker, estimate_model_flops
+from src.training.attention_monitor import AttentionQualityMonitor
 from src.data.cc12m_loader import create_dataloaders
 from src.models import create_microvlm, create_microvlm_fiber, MicroVLMFIBER
 import os
@@ -810,7 +811,8 @@ def compute_gradient_flow_metrics(model):
 
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, wandb_run=None, wandb_logger=None,
-                is_distributed=False, is_main_process=True, carbon_tracker=None):
+                is_distributed=False, is_main_process=True, carbon_tracker=None,
+                attention_monitor=None):
     """Train for one epoch
     
     Args:
@@ -827,6 +829,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         is_distributed: Whether using distributed training
         is_main_process: Whether this is the main process (rank 0)
         carbon_tracker: CarbonComputeTracker for emissions/FLOPs tracking
+        attention_monitor: AttentionQualityMonitor for tracking attention quality
     """
     model.train()
 
@@ -964,6 +967,52 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         itm_loss_total += itm_loss_val.item() if itm_loss_val is not None else 0
 
         global_step += 1
+        
+        # ===== Attention Quality Monitoring =====
+        # Update attention monitor with token attention if available
+        if attention_monitor is not None and 'token_attention' in outputs:
+            token_attn = outputs['token_attention']
+            if token_attn is not None:
+                attention_monitor.update(token_attn.detach(), global_step)
+                
+                # Check for early stopping (main process only)
+                if is_main_process and attention_monitor.should_stop_training():
+                    alert = attention_monitor.get_alert_summary()
+                    print(f"\n{'='*60}")
+                    print("⚠️  ATTENTION QUALITY ALERT - EARLY STOPPING TRIGGERED")
+                    print(f"{'='*60}")
+                    print(f"Step: {global_step}")
+                    print(f"Quality Score: {alert['current_quality']:.4f}")
+                    print(f"Degradation Rate: {alert['degradation_rate']:.4f}")
+                    print(f"Triggered By: {', '.join(alert['triggers'])}")
+                    print(f"\nAttention has degraded to edge-detection mode.")
+                    print(f"Training will stop to prevent further degradation.")
+                    print(f"{'='*60}\n")
+                    
+                    # Log alert to WandB
+                    if wandb_logger:
+                        wandb_logger.log_metrics({
+                            'attention_quality/early_stop_triggered': 1.0,
+                            'attention_quality/stop_step': global_step,
+                            'attention_quality/final_quality': alert['current_quality'],
+                        }, step=global_step)
+                    
+                    # Return with early stop flag
+                    avg_loss = total_loss / max(batch_idx + 1, 1)
+                    return avg_loss, global_step, True  # True = early stop
+                
+                # Log attention quality metrics periodically
+                if is_main_process and global_step % config.log_interval == 0 and wandb_logger:
+                    quality_metrics = attention_monitor.get_quality_metrics()
+                    if quality_metrics:
+                        wandb_metrics = {
+                            'attention_quality/score': quality_metrics['quality_score'],
+                            'attention_quality/entropy': quality_metrics['entropy_score'],
+                            'attention_quality/edge_ratio': quality_metrics['edge_ratio'],
+                            'attention_quality/spatial_coherence': quality_metrics['spatial_coherence'],
+                            'attention_quality/cross_batch_stability': quality_metrics['cross_batch_stability'],
+                        }
+                        wandb_logger.log_metrics(wandb_metrics, step=global_step)
 
         # End batch tracking for carbon tracker and log compute metrics
         if carbon_tracker is not None:
@@ -1279,7 +1328,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             wandb_logger.log_metrics(epoch_wandb_metrics, step=global_step)
 
     avg_loss = total_loss / len(train_loader)
-    return avg_loss, global_step
+    return avg_loss, global_step, False  # False = no early stop
 
 
 def count_parameters(model):
@@ -1584,6 +1633,21 @@ def main():
             model=None  # Set after model creation
         )
         print(f"[CarbonTracker] Initialized (carbon={track_carbon}, gpu={track_gpu}, flops={track_flops})")
+    
+    # Initialize Attention Quality Monitor (for detecting attention degradation)
+    attention_monitor = None
+    use_attention_monitor = getattr(config, 'use_attention_monitor', True)
+    
+    if is_main_process and use_attention_monitor and args.alignment_mode == 'fiber':
+        attention_monitor = AttentionQualityMonitor(
+            num_patches=196,  # DeiT-Tiny: 14x14 patches
+            quality_threshold=getattr(config, 'attention_quality_threshold', 0.25),
+            degradation_rate_threshold=getattr(config, 'attention_degradation_threshold', 0.15),
+            min_steps_before_stop=getattr(config, 'attention_min_steps', 2000),
+            window_size=500,  # Track over last 500 steps
+            check_interval=100  # Check quality every 100 steps
+        )
+        print(f"[AttentionMonitor] Initialized for early stopping on attention degradation")
 
     # Create model with quantization settings
     if is_main_process:
@@ -1810,13 +1874,14 @@ def main():
 
     # Track training history for model card
     training_history = []
+    early_stop = False
 
     for epoch in range(start_epoch, config.num_epochs):
         # Set epoch for distributed sampler (ensures proper shuffling)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
-        avg_loss, global_step = train_epoch(
+        avg_loss, global_step, early_stop = train_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
@@ -1829,8 +1894,24 @@ def main():
             wandb_logger=wandb_logger,
             is_distributed=is_distributed,
             is_main_process=is_main_process,
-            carbon_tracker=carbon_tracker
+            carbon_tracker=carbon_tracker,
+            attention_monitor=attention_monitor
         )
+        
+        # Handle early stopping due to attention degradation
+        if early_stop:
+            if is_main_process:
+                print(f"\n⚠️  Training stopped early at epoch {epoch}, step {global_step}")
+                print("   Reason: Attention quality degraded below threshold")
+                print("   Saving final checkpoint before exit...")
+                
+                # Save emergency checkpoint
+                checkpoint_path, stats = save_epoch_checkpoint(
+                    model, optimizer, epoch, global_step, config, 
+                    f"{args.config}_early_stop"
+                )
+                print(f"   Emergency checkpoint saved: {checkpoint_path}")
+            break
 
         if is_main_process:
             print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")

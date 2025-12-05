@@ -391,8 +391,16 @@ class MicroVLM_FIBER(nn.Module):
                 outputs['itm_loss'] = alignment_outputs.get('itm_loss', torch.tensor(0.0))
                 outputs['token_loss'] = alignment_outputs.get('token_loss', torch.tensor(0.0))
                 
+                # Pass through anti-collapse regularization losses for logging
+                if 'anti_collapse_loss' in alignment_outputs:
+                    outputs['anti_collapse_loss'] = alignment_outputs['anti_collapse_loss']
+                if 'attention_entropy_loss' in alignment_outputs:
+                    outputs['attention_entropy_loss'] = alignment_outputs['attention_entropy_loss']
+                
                 if 'token_attention' in alignment_outputs:
                     self._last_text_to_patch_attention = alignment_outputs['token_attention'].detach()
+                    # Also pass to outputs for attention monitoring in training loop
+                    outputs['token_attention'] = alignment_outputs['token_attention']
             else:
                 # Baseline alignment: contrastive only
                 alignment_loss = self.alignment_loss(image_features, text_features)

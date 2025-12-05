@@ -103,6 +103,11 @@ class Stage1Config(TrainingConfig):
     - Large batch size (256) for better negative sampling
     - Label smoothing in loss helps generalization
     - Learnable temperature adapts to data
+    
+    ATTENTION QUALITY MONITORING:
+    - Monitors entropy, edge ratio, and spatial coherence
+    - Auto-stops training if attention degrades to edge-detection mode
+    - Anti-collapse regularization prevents feature collapse
     """
     # Override defaults for Stage 1
     use_memory: bool = False  # Disable memory in Stage 1
@@ -133,6 +138,12 @@ class Stage1Config(TrainingConfig):
     enable_quantization: bool = True
     quantize_vision_4bit: bool = False
     quantize_language_4bit: bool = True  # Reduces Qwen from ~2GB to ~250MB
+
+    # Attention Quality Monitoring (prevents attention degradation to edge-detection)
+    use_attention_monitor: bool = True
+    attention_quality_threshold: float = 0.25  # Stop if quality drops below this (0-1 scale)
+    attention_degradation_threshold: float = 0.15  # Stop if degradation rate exceeds this
+    attention_min_steps: int = 2000  # Minimum steps before early stopping is allowed
 
     # Monitoring
     log_interval: int = 25  # More frequent logging to track loss

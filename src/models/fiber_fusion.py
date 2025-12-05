@@ -615,6 +615,11 @@ class FIBERAlignmentLoss(nn.Module):
     - Temperature has tighter bounds to prevent extreme values
     - Gradient scaling for temperature updates
     - Soft clamping for smoother optimization
+    
+    ANTI-COLLAPSE REGULARIZATION:
+    - Feature variance regularization prevents embedding collapse
+    - Spectral regularization maintains feature diversity
+    - Attention entropy regularization prevents edge-detection mode
     """
     
     def __init__(
@@ -631,7 +636,11 @@ class FIBERAlignmentLoss(nn.Module):
         use_itc_queue: bool = True,
         queue_size: int = 256,  # Reduced from FIBER's 4096 for compact model
         # ITC projection settings
-        itc_embed_dim: int = 128  # Compact ITC embedding dimension
+        itc_embed_dim: int = 128,  # Compact ITC embedding dimension
+        # Anti-collapse regularization
+        use_anti_collapse: bool = True,
+        variance_reg_weight: float = 0.04,  # Feature variance regularization
+        covariance_reg_weight: float = 0.01,  # Covariance regularization (VICReg-style)
     ):
         super().__init__()
         
@@ -653,6 +662,11 @@ class FIBERAlignmentLoss(nn.Module):
             self.register_buffer('_logit_scale_raw', torch.tensor(math.log(1 / temperature)))
         
         self.learnable_temperature = learnable_temperature
+        
+        # ===== Anti-Collapse Regularization =====
+        self.use_anti_collapse = use_anti_collapse
+        self.variance_reg_weight = variance_reg_weight
+        self.covariance_reg_weight = covariance_reg_weight
         
         # ===== FIBER-style ITC Queue (lightweight version) =====
         self.use_itc_queue = use_itc_queue
@@ -680,6 +694,108 @@ class FIBERAlignmentLoss(nn.Module):
         # Loss functions
         self.ce_loss = nn.CrossEntropyLoss(label_smoothing=label_smoothing)
         self.bce_loss = nn.BCEWithLogitsLoss()
+    
+    def compute_anti_collapse_loss(
+        self,
+        image_features: torch.Tensor,
+        text_features: torch.Tensor
+    ) -> torch.Tensor:
+        """
+        Compute anti-collapse regularization to prevent feature collapse.
+        
+        Based on VICReg (Variance-Invariance-Covariance Regularization):
+        1. Variance: Encourages feature variance to stay above a threshold
+        2. Covariance: Decorrelates different feature dimensions
+        
+        This prevents the model from collapsing to trivial solutions where
+        all embeddings become similar (causing attention to focus on low-level
+        patterns like edges instead of semantic content).
+        
+        Args:
+            image_features: (B, D) normalized image features
+            text_features: (B, D) normalized text features
+            
+        Returns:
+            loss: scalar regularization loss
+        """
+        if not self.use_anti_collapse:
+            return torch.tensor(0.0, device=image_features.device)
+        
+        eps = 1e-4
+        
+        # ===== Variance Regularization =====
+        # Encourage feature std to stay above 1 (prevent collapse)
+        # hinge loss: relu(1 - std)
+        def variance_loss(x):
+            # x: (B, D)
+            std = x.std(dim=0)  # (D,)
+            return F.relu(1.0 - std).mean()
+        
+        var_loss_img = variance_loss(image_features)
+        var_loss_txt = variance_loss(text_features)
+        var_loss = (var_loss_img + var_loss_txt) / 2
+        
+        # ===== Covariance Regularization =====
+        # Decorrelate feature dimensions to prevent redundant representations
+        def covariance_loss(x):
+            # x: (B, D)
+            batch_size, dim = x.shape
+            x_centered = x - x.mean(dim=0, keepdim=True)
+            # Covariance matrix: (D, D)
+            cov = (x_centered.T @ x_centered) / (batch_size - 1 + eps)
+            # Zero out diagonal (we want to penalize off-diagonal elements)
+            off_diag = cov - torch.diag(cov.diag())
+            # Frobenius norm of off-diagonal elements
+            return (off_diag ** 2).sum() / dim
+        
+        cov_loss_img = covariance_loss(image_features)
+        cov_loss_txt = covariance_loss(text_features)
+        cov_loss = (cov_loss_img + cov_loss_txt) / 2
+        
+        # Combined regularization loss
+        total_reg_loss = (
+            self.variance_reg_weight * var_loss +
+            self.covariance_reg_weight * cov_loss
+        )
+        
+        return total_reg_loss
+    
+    def compute_attention_entropy_loss(
+        self,
+        attention: torch.Tensor,
+        min_entropy_ratio: float = 0.3
+    ) -> torch.Tensor:
+        """
+        Compute attention entropy regularization to prevent edge-detection collapse.
+        
+        When attention entropy is too low, the model is focusing on very specific
+        patterns (often edges/boundaries). This regularization encourages maintaining
+        some entropy in attention distributions.
+        
+        Args:
+            attention: (B, num_tokens, num_patches) attention weights
+            min_entropy_ratio: minimum entropy as fraction of maximum possible
+            
+        Returns:
+            loss: scalar entropy regularization loss
+        """
+        eps = 1e-8
+        
+        # Compute entropy per token
+        # attention is already normalized (softmax output)
+        entropy = -(attention * torch.log(attention + eps)).sum(dim=-1)  # (B, num_tokens)
+        
+        # Maximum possible entropy (uniform distribution)
+        num_patches = attention.size(-1)
+        max_entropy = math.log(num_patches)
+        
+        # Target minimum entropy
+        min_target_entropy = min_entropy_ratio * max_entropy
+        
+        # Hinge loss: penalize if entropy drops below threshold
+        entropy_loss = F.relu(min_target_entropy - entropy).mean()
+        
+        return entropy_loss
     
     @property
     def logit_scale(self):
@@ -1099,6 +1215,22 @@ class FIBERAlignmentLoss(nn.Module):
             losses['token_loss'] = token_loss
             losses['token_attention'] = token_attention
             total_loss = total_loss + self.token_weight * token_loss
+            
+            # ===== Anti-Collapse Regularization =====
+            # Add attention entropy regularization to prevent edge-detection mode
+            if self.use_anti_collapse:
+                attn_entropy_loss = self.compute_attention_entropy_loss(token_attention)
+                losses['attention_entropy_loss'] = attn_entropy_loss
+                total_loss = total_loss + 0.05 * attn_entropy_loss  # Small weight
+        
+        # ===== Feature Collapse Prevention =====
+        # Add variance/covariance regularization to prevent embedding collapse
+        if self.use_anti_collapse:
+            anti_collapse_loss = self.compute_anti_collapse_loss(
+                image_features, text_features
+            )
+            losses['anti_collapse_loss'] = anti_collapse_loss
+            total_loss = total_loss + anti_collapse_loss
         
         losses['total_loss'] = total_loss
         
