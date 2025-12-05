@@ -922,7 +922,20 @@ class FIBERAlignmentLoss(nn.Module):
         batch_size = image_feat.size(0)
         ptr = int(self.queue_ptr)
         
-        # Handle wrap-around
+        # If batch is larger than queue, only use the last queue_size samples
+        if batch_size >= self.queue_size:
+            # Take only the most recent samples that fit in queue
+            image_feat = image_feat[-self.queue_size:]
+            text_feat = text_feat[-self.queue_size:]
+            batch_size = self.queue_size
+            # Fill the entire queue
+            self.image_queue[:, :] = image_feat.T
+            self.text_queue[:, :] = text_feat.T
+            self.queue_ptr[0] = 0
+            self.queue_total[0] = self.queue_size
+            return
+        
+        # Handle wrap-around for smaller batches
         if ptr + batch_size <= self.queue_size:
             self.image_queue[:, ptr:ptr + batch_size] = image_feat.T
             self.text_queue[:, ptr:ptr + batch_size] = text_feat.T
