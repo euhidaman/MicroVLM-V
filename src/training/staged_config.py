@@ -100,7 +100,7 @@ class Stage1Config(TrainingConfig):
     
     HYPERPARAMETERS tuned for stable contrastive learning:
     - Lower LR (5e-5) with proper warmup prevents oscillation
-    - Large batch size (256) for better negative sampling
+    - Large batch size for better negative sampling and GPU utilization
     - Label smoothing in loss helps generalization
     - Learnable temperature adapts to data
     
@@ -114,8 +114,8 @@ class Stage1Config(TrainingConfig):
     num_epochs: int = 10  # Reduced - contrastive learning converges faster
     learning_rate: float = 5e-5  # Lower LR for stable contrastive learning (CLIP uses 5e-4 for full model)
     warmup_steps: int = 2000  # ~10% of epoch, critical for contrastive stability
-    batch_size: int = 256  # Larger batches = more negatives = better contrastive learning
-    num_workers: int = 16
+    batch_size: int = 768  # Maximized for 2x A100 80GB - saturate GPU memory
+    num_workers: int = 32  # Match GPU throughput
     gradient_clip: float = 1.0  # Standard clipping
     weight_decay: float = 0.1  # Higher weight decay for regularization
     
