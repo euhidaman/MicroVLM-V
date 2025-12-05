@@ -47,7 +47,8 @@ class TrainingConfig:
     addressing_kl_weight: float = 0.005
     lm_loss_weight: float = 1.0
     alignment_loss_weight: float = 1.0
-    skip_lm_loss: bool = False  # Skip LM forward pass (for alignment-only training)
+    # Skip LM forward pass (for alignment-only training)
+    skip_lm_loss: bool = False
 
     # Alignment
     use_alignment: bool = True
@@ -93,17 +94,17 @@ class Stage1Config(TrainingConfig):
     Stage 1: Alignment Training Without Memory
     Focus on learning image-text alignment before introducing memory
     Based on CLIP/EVO-1 methodology
-    
+
     KEY INSIGHT: Since both vision and language models are FROZEN,
     we only train the multimodal adapter using contrastive alignment loss.
     LM loss is disabled because a frozen LM cannot improve.
-    
+
     HYPERPARAMETERS tuned for stable contrastive learning:
     - Lower LR (5e-5) with proper warmup prevents oscillation
     - Large batch size for better negative sampling and GPU utilization
     - Label smoothing in loss helps generalization
     - Learnable temperature adapts to data
-    
+
     ATTENTION QUALITY MONITORING:
     - Monitors entropy, edge ratio, and spatial coherence
     - Auto-stops training if attention degrades to edge-detection mode
@@ -112,21 +113,24 @@ class Stage1Config(TrainingConfig):
     # Override defaults for Stage 1
     use_memory: bool = False  # Disable memory in Stage 1
     num_epochs: int = 10  # Reduced - contrastive learning converges faster
-    learning_rate: float = 5e-5  # Lower LR for stable contrastive learning (CLIP uses 5e-4 for full model)
+    # Lower LR for stable contrastive learning (CLIP uses 5e-4 for full model)
+    learning_rate: float = 5e-5
     warmup_steps: int = 2000  # ~10% of epoch, critical for contrastive stability
-    batch_size: int = 640  # Optimized for 2x A100 80GB (320 per GPU)
+    batch_size: int = 512  # Optimized for 2x A100 80GB (320 per GPU)
     num_workers: int = 32  # Match GPU throughput
     gradient_clip: float = 1.0  # Standard clipping
     weight_decay: float = 0.1  # Higher weight decay for regularization
-    
+
     # Loss weights for Stage 1 - ALIGNMENT ONLY
     lm_loss_weight: float = 0.0  # DISABLED - frozen LM can't improve
-    alignment_loss_weight: float = 1.0  # Full weight - this is the ONLY trainable objective
+    # Full weight - this is the ONLY trainable objective
+    alignment_loss_weight: float = 1.0
     fine_grained_loss_weight: float = 0.5  # Text-to-patch attention supervision
     skip_lm_loss: bool = True  # Skip LM forward pass (saves compute)
-    
+
     # Contrastive learning specific
-    alignment_temperature: float = 0.07  # Initial temperature (will be learned)
+    # Initial temperature (will be learned)
+    alignment_temperature: float = 0.07
 
     # Adapter-focused training
     freeze_vision: bool = True
@@ -141,8 +145,10 @@ class Stage1Config(TrainingConfig):
 
     # Attention Quality Monitoring (prevents attention degradation to edge-detection)
     use_attention_monitor: bool = True
-    attention_quality_threshold: float = 0.25  # Stop if quality drops below this (0-1 scale)
-    attention_degradation_threshold: float = 0.15  # Stop if degradation rate exceeds this
+    # Stop if quality drops below this (0-1 scale)
+    attention_quality_threshold: float = 0.25
+    # Stop if degradation rate exceeds this
+    attention_degradation_threshold: float = 0.15
     attention_min_steps: int = 2000  # Minimum steps before early stopping is allowed
 
     # Visualization settings
