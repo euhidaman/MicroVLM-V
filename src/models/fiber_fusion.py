@@ -317,6 +317,12 @@ class FIBERFusionBlock(nn.Module):
         """
         attention_dict = {}
         
+        # ===== ENSURE CONSISTENT DTYPE =====
+        # Get projection dtype and convert inputs to match
+        proj_dtype = self.vision_up_proj[0].weight.dtype
+        vision_tokens = vision_tokens.to(proj_dtype)
+        text_tokens = text_tokens.to(proj_dtype)
+        
         # ===== PROJECT TO SHARED FUSION SPACE =====
         # Vision: 192 -> 384
         vision_in_fusion = self.vision_up_proj(vision_tokens)
