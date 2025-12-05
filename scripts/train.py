@@ -1134,15 +1134,52 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 # Cross-modal attention analysis + side-by-side visualization
                 if visualizer:
                     num_viz_images = getattr(config, 'num_viz_images', 3)
-                    # Cache first batch for consistent visualization
+                    # Cache samples for consistent visualization
                     if not hasattr(visualizer, '_fixed_samples'):
-                        cache_samples = min(num_viz_images, images.size(0))
-                        if cache_samples > 0:
-                            visualizer._fixed_samples = {
-                                'images': images[:cache_samples].detach().cpu().clone(),
-                                'input_ids': input_ids[:cache_samples].detach().cpu().clone(),
-                                'attention_mask': attention_mask[:cache_samples].detach().cpu().clone() if attention_mask is not None else None
-                            }
+                        # Fixed image IDs for attention visualization (natural images)
+                        viz_image_ids = [
+                            "clbpghczz2kp60779825732w4",
+                            "clbpghczx2klh0779gghu2c2d",
+                            "clbpghczw2kh70779g2941cyd"
+                        ]
+                        
+                        if hasattr(train_loader.dataset, 'samples'):
+                            # Find specific images by ID
+                            print(f"\n[Visualization] Searching for fixed image IDs...")
+                            found_indices = []
+                            for target_id in viz_image_ids:
+                                for idx, sample in enumerate(train_loader.dataset.samples):
+                                    # Check if ID is in image path or sample ID
+                                    sample_id = sample.get('id', '') or os.path.basename(sample.get('image_path', ''))
+                                    if target_id in str(sample_id) or target_id in sample.get('image_path', ''):
+                                        found_indices.append(idx)
+                                        caption_preview = sample.get('caption', '')[:50]
+                                        print(f"  ✓ Found: {target_id} - \"{caption_preview}...\"")
+                                        break
+                            
+                            if found_indices:
+                                # Load the specific samples
+                                viz_samples = [train_loader.dataset[i] for i in found_indices[:num_viz_images]]
+                                visualizer._fixed_samples = {
+                                    'images': torch.stack([s['image'] for s in viz_samples]),
+                                    'input_ids': torch.stack([s['input_ids'] for s in viz_samples]),
+                                    'attention_mask': torch.stack([s['attention_mask'] for s in viz_samples]) if viz_samples[0].get('attention_mask') is not None else None,
+                                    'captions': [s['caption'] for s in viz_samples]
+                                }
+                                print(f"  Loaded {len(found_indices)} fixed images for visualization\n")
+                            else:
+                                print(f"  ⚠ Could not find specified image IDs, using batch samples\n")
+                        
+                        # Fallback: use samples from current batch if IDs not found
+                        if not hasattr(visualizer, '_fixed_samples'):
+                            cache_samples = min(num_viz_images, images.size(0))
+                            if cache_samples > 0:
+                                visualizer._fixed_samples = {
+                                    'images': images[:cache_samples].detach().cpu().clone(),
+                                    'input_ids': input_ids[:cache_samples].detach().cpu().clone(),
+                                    'attention_mask': attention_mask[:cache_samples].detach().cpu().clone() if attention_mask is not None else None
+                                }
+                    
                     fixed_samples = getattr(visualizer, '_fixed_samples', None)
                     if fixed_samples:
                         num_samples = min(

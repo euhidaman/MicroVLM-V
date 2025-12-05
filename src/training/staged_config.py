@@ -145,10 +145,11 @@ class Stage1Config(TrainingConfig):
     attention_degradation_threshold: float = 0.15  # Stop if degradation rate exceeds this
     attention_min_steps: int = 2000  # Minimum steps before early stopping is allowed
 
-    # Monitoring
+    # Visualization settings
     log_interval: int = 25  # More frequent logging to track loss
     visualize_interval: int = 1000  # Save attention visualizations every 1000 steps
     viz_save_interval: int = 5000
+    num_viz_images: int = 3  # Number of images to visualize
 
     wandb_run_name: str = "stage1_alignment"
 
