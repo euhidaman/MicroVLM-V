@@ -114,7 +114,7 @@ class Stage1Config(TrainingConfig):
     num_epochs: int = 10  # Reduced - contrastive learning converges faster
     learning_rate: float = 5e-5  # Lower LR for stable contrastive learning (CLIP uses 5e-4 for full model)
     warmup_steps: int = 2000  # ~10% of epoch, critical for contrastive stability
-    batch_size: int = 768  # Maximized for 2x A100 80GB - saturate GPU memory
+    batch_size: int = 640  # Optimized for 2x A100 80GB (320 per GPU)
     num_workers: int = 32  # Match GPU throughput
     gradient_clip: float = 1.0  # Standard clipping
     weight_decay: float = 0.1  # Higher weight decay for regularization
