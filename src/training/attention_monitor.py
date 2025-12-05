@@ -67,15 +67,15 @@ class AttentionQualityMonitor:
     def __init__(
         self,
         # Health thresholds
-        min_health_score: float = 0.25,
-        target_entropy_ratio: float = 0.35,  # Target: 35% of max entropy
-        entropy_tolerance: float = 0.25,  # ±25% tolerance around target
-        max_edge_ratio: float = 0.6,  # Max 60% attention on edges
-        min_spatial_coherence: float = 0.3,
+        min_health_score: float = 0.20,  # Lowered - only catch severe issues
+        target_entropy_ratio: float = 0.50,  # Target: 50% of max entropy (more relaxed)
+        entropy_tolerance: float = 0.45,  # ±45% tolerance - allow wide range
+        max_edge_ratio: float = 0.65,  # Max 65% attention on edges (slightly relaxed)
+        min_spatial_coherence: float = 0.2,  # Lowered
         
         # Monitoring settings
         history_size: int = 100,  # Steps to track
-        patience: int = 10,  # Consecutive bad steps before alert
+        patience: int = 20,  # Increased - more consecutive bad steps before alert
         
         # Action settings
         auto_pause: bool = True,
@@ -84,6 +84,9 @@ class AttentionQualityMonitor:
         
         # Grid settings (for spatial analysis)
         grid_size: int = 14,
+        
+        # Warmup settings (don't alert during warmup)
+        warmup_steps: int = 2000,  # Don't trigger alerts before this
         
         # Logging
         verbose: bool = True
@@ -96,6 +99,7 @@ class AttentionQualityMonitor:
         
         self.history_size = history_size
         self.patience = patience
+        self.warmup_steps = warmup_steps
         
         self.auto_pause = auto_pause
         self.auto_adjust_lr = auto_adjust_lr
@@ -233,28 +237,48 @@ class AttentionQualityMonitor:
         """
         Compute overall health score from individual metrics.
         
+        The score is designed to detect DEGRADATION (edge-detection mode),
+        not penalize early training where attention is still uniform.
+        
         Returns:
             score: 0-1, where 1 is perfect health
         """
         scores = []
         
-        # Entropy score (penalize both collapse and uniformity)
-        entropy_diff = abs(metrics.mean_entropy_ratio - self.target_entropy_ratio)
-        entropy_score = max(0, 1 - entropy_diff / self.entropy_tolerance)
-        scores.append(entropy_score * 0.35)  # 35% weight
+        # Entropy score - asymmetric: severely penalize collapse, mildly penalize uniformity
+        # Collapsed attention (entropy < 0.2) is BAD (edge detection)
+        # Uniform attention (entropy > 0.8) is okay early on
+        if metrics.mean_entropy_ratio < 0.2:
+            # Severely penalize collapsed attention
+            entropy_score = metrics.mean_entropy_ratio / 0.2 * 0.3  # Max 0.3 for collapsed
+        elif metrics.mean_entropy_ratio > 0.8:
+            # Mild penalty for very uniform attention
+            entropy_score = 0.6 + 0.4 * (1 - (metrics.mean_entropy_ratio - 0.8) / 0.2)
+        else:
+            # Good range: 0.2-0.8
+            entropy_score = 1.0
+        scores.append(entropy_score * 0.30)  # 30% weight
         
-        # Edge ratio score (penalize high edge attention)
-        edge_score = max(0, 1 - metrics.edge_ratio / self.max_edge_ratio)
-        scores.append(edge_score * 0.35)  # 35% weight
+        # Edge ratio score (penalize high edge attention - this is the key degradation signal)
+        if metrics.edge_ratio > self.max_edge_ratio:
+            # Penalize edge-focused attention
+            edge_score = max(0, 1 - (metrics.edge_ratio - self.max_edge_ratio) / 0.2)
+        else:
+            edge_score = 1.0
+        scores.append(edge_score * 0.40)  # 40% weight - most important for detecting degradation
         
         # Spatial coherence score
-        coherence_score = metrics.spatial_coherence
+        coherence_score = min(1.0, metrics.spatial_coherence / self.min_spatial_coherence)
         scores.append(coherence_score * 0.20)  # 20% weight
         
-        # Focus score (penalize extreme concentration)
-        # Good range: top-10 patches have 30-70% of attention
-        focus_diff = abs(metrics.top_k_concentration - 0.5)
-        focus_score = max(0, 1 - focus_diff / 0.3)
+        # Focus score (less strict - wide acceptable range)
+        # Good range: top-10 patches have 20-80% of attention
+        if metrics.top_k_concentration < 0.1:
+            focus_score = metrics.top_k_concentration / 0.1
+        elif metrics.top_k_concentration > 0.9:
+            focus_score = (1 - metrics.top_k_concentration) / 0.1
+        else:
+            focus_score = 1.0
         scores.append(focus_score * 0.10)  # 10% weight
         
         return sum(scores)
@@ -335,13 +359,17 @@ class AttentionQualityMonitor:
     
     def _check_degradation(self, metrics: AttentionHealthMetrics):
         """Check if attention has degraded and update state"""
+        # Skip alerts during warmup period - attention is still learning
+        if metrics.step < self.warmup_steps:
+            return
+        
         is_bad = metrics.health_score < self.min_health_score
         
-        # Also check for significant degradation from baseline
+        # Also check for significant degradation from baseline (only after baseline established)
         if self.baseline_collected and self.baseline_metrics is not None:
             baseline_score = self.baseline_metrics.health_score
             degradation = (baseline_score - metrics.health_score) / max(baseline_score, 0.1)
-            if degradation > 0.4:  # 40% degradation from baseline
+            if degradation > 0.5:  # 50% degradation from baseline (more lenient)
                 is_bad = True
         
         if is_bad:
