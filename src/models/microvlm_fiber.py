@@ -39,10 +39,15 @@ class FIBERConfig:
     - use_itc_queue: Enable/disable queue-based negative sampling
     - itc_queue_size: Number of cached features (reduced from FIBER's 4096)
     - itc_embed_dim: Dimension of ITC projection space
+    
+    Dimension Alignment:
+    - fusion_dim: Shared dimension (384) for cross-modal attention
+    - Vision (192) and Text (896) are projected to this shared space
     """
     enabled: bool = True
     fusion_layers: list = None  # Which vision layers get cross-modal fusion
     num_fusion_heads: int = 2  # Reduced from 4 for compact model
+    fusion_dim: int = 384  # Shared dimension for cross-modal fusion (NEW)
     bidirectional: bool = False  # T2I fusion in vision encoder
     itc_weight: float = 1.0
     itm_weight: float = 0.5
@@ -92,12 +97,14 @@ class MicroVLM_FIBER(nn.Module):
         # Vision encoder: Choose based on alignment mode
         if alignment_mode == 'fiber' and self.fiber_config.enabled:
             print(f"🔬 Initializing FIBER Vision Encoder with fusion at layers {self.fiber_config.fusion_layers}")
+            print(f"   Fusion dimension: {self.fiber_config.fusion_dim} (shared space for vision-text alignment)")
             self.vision_encoder = FIBERVisionEncoder(
                 config=config,
                 pretrained_path=vision_checkpoint,
                 fusion_layers=self.fiber_config.fusion_layers,
                 text_dim=config.get('language_hidden_size', 896),
-                num_fusion_heads=self.fiber_config.num_fusion_heads
+                num_fusion_heads=self.fiber_config.num_fusion_heads,
+                fusion_dim=self.fiber_config.fusion_dim
             )
         else:
             print("📷 Using baseline DeiT Vision Encoder")

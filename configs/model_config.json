@@ -71,6 +71,7 @@
       11
     ],
     "num_fusion_heads": 2,
+    "fusion_dim": 384,
     "w_logvar_setting": 1,
     "deterministic_memory": false
   },

@@ -204,13 +204,18 @@ class CrossModalAttention(nn.Module):
 
 class FIBERFusionBlock(nn.Module):
     """
-    FIBER-style bidirectional fusion block.
+    FIBER-style bidirectional fusion block with dimension alignment.
     
     Implements:
     1. Image-to-Text attention: Vision tokens attend to text tokens
     2. Text-to-Image attention: Text tokens attend to vision tokens
     
     Both directions are computed in parallel and applied with learnable gating.
+    
+    DIMENSION ALIGNMENT FIX:
+    - Vision (192-dim) and Text (896-dim) are projected to a shared fusion_dim (384)
+    - This allows better cross-modal alignment without the 4.6x compression bottleneck
+    - Adds only ~0.84 MB to model size
     """
     
     def __init__(
@@ -219,34 +224,75 @@ class FIBERFusionBlock(nn.Module):
         text_dim: int = 896,
         num_heads: int = 4,
         dropout: float = 0.0,
-        bidirectional: bool = True
+        bidirectional: bool = True,
+        fusion_dim: int = 384  # Shared dimension for cross-modal fusion
     ):
         super().__init__()
         
         self.vision_dim = vision_dim
         self.text_dim = text_dim
+        self.fusion_dim = fusion_dim
         self.bidirectional = bidirectional
         
-        # Image-to-Text: Vision queries, Text keys/values
-        # Vision tokens get enriched with text information
+        # ===== DIMENSION ALIGNMENT PROJECTIONS =====
+        # Upscale vision: 192 -> 384 (expand to richer space)
+        self.vision_up_proj = nn.Sequential(
+            nn.Linear(vision_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU()
+        )
+        
+        # Compress text: 896 -> 384 (compress to shared space)
+        self.text_down_proj = nn.Sequential(
+            nn.Linear(text_dim, fusion_dim),
+            nn.LayerNorm(fusion_dim),
+            nn.GELU()
+        )
+        
+        # Project back to vision dim after fusion: 384 -> 192
+        self.vision_down_proj = nn.Linear(fusion_dim, vision_dim)
+        
+        # ===== CROSS-MODAL ATTENTION IN SHARED SPACE =====
+        # Image-to-Text: Vision queries, Text keys/values (both in 384-dim)
         self.i2t_attention = CrossModalAttention(
-            source_dim=vision_dim,
-            target_dim=text_dim,
+            source_dim=fusion_dim,  # Now both in shared 384-dim space
+            target_dim=fusion_dim,
             num_heads=num_heads,
             dropout=dropout
         )
         
         # Text-to-Image: Text queries, Vision keys/values
-        # Text tokens get enriched with vision information
         if bidirectional:
+            # Project back to text dim after fusion: 384 -> 896
+            self.text_up_proj = nn.Linear(fusion_dim, text_dim)
+            
             self.t2i_attention = CrossModalAttention(
-                source_dim=text_dim,
-                target_dim=vision_dim,
+                source_dim=fusion_dim,
+                target_dim=fusion_dim,
                 num_heads=num_heads,
                 dropout=dropout
             )
         else:
             self.t2i_attention = None
+            self.text_up_proj = None
+        
+        self._init_projection_weights()
+    
+    def _init_projection_weights(self):
+        """Initialize projection layer weights"""
+        for module in [self.vision_up_proj, self.text_down_proj]:
+            for m in module.modules():
+                if isinstance(m, nn.Linear):
+                    nn.init.xavier_uniform_(m.weight, gain=0.5)
+                    if m.bias is not None:
+                        nn.init.zeros_(m.bias)
+        
+        nn.init.xavier_uniform_(self.vision_down_proj.weight, gain=0.5)
+        nn.init.zeros_(self.vision_down_proj.bias)
+        
+        if self.text_up_proj is not None:
+            nn.init.xavier_uniform_(self.text_up_proj.weight, gain=0.5)
+            nn.init.zeros_(self.text_up_proj.bias)
     
     def forward(
         self,
@@ -256,35 +302,48 @@ class FIBERFusionBlock(nn.Module):
         return_attention: bool = False
     ) -> Tuple[torch.Tensor, torch.Tensor, Optional[dict]]:
         """
-        Forward pass for bidirectional fusion.
+        Forward pass for bidirectional fusion with dimension alignment.
         
         Args:
-            vision_tokens: (B, num_patches, vision_dim)
-            text_tokens: (B, seq_len, text_dim)
+            vision_tokens: (B, num_patches, vision_dim=192)
+            text_tokens: (B, seq_len, text_dim=896)
             text_mask: (B, seq_len) attention mask for text
             return_attention: whether to return attention weights
         
         Returns:
-            updated_vision: (B, num_patches, vision_dim)
-            updated_text: (B, seq_len, text_dim)
+            updated_vision: (B, num_patches, vision_dim=192)
+            updated_text: (B, seq_len, text_dim=896)
             attention_dict: dict with 'i2t' and 't2i' attention weights
         """
         attention_dict = {}
         
-        # Image-to-Text attention
-        updated_vision, i2t_attn = self.i2t_attention(
-            vision_tokens, text_tokens, text_mask, return_attention
+        # ===== PROJECT TO SHARED FUSION SPACE =====
+        # Vision: 192 -> 384
+        vision_in_fusion = self.vision_up_proj(vision_tokens)
+        # Text: 896 -> 384
+        text_in_fusion = self.text_down_proj(text_tokens)
+        
+        # ===== CROSS-MODAL ATTENTION IN SHARED 384-DIM SPACE =====
+        # Image-to-Text attention (vision attends to text)
+        vision_fused, i2t_attn = self.i2t_attention(
+            vision_in_fusion, text_in_fusion, text_mask, return_attention
         )
         if return_attention:
             attention_dict['i2t'] = i2t_attn
         
+        # ===== PROJECT BACK TO ORIGINAL DIMENSIONS =====
+        # Vision: 384 -> 192
+        updated_vision = vision_tokens + self.vision_down_proj(vision_fused - vision_in_fusion)
+        
         # Text-to-Image attention (if bidirectional)
         if self.bidirectional and self.t2i_attention is not None:
-            updated_text, t2i_attn = self.t2i_attention(
-                text_tokens, vision_tokens, target_mask=None, return_attention=return_attention
+            text_fused, t2i_attn = self.t2i_attention(
+                text_in_fusion, vision_in_fusion, target_mask=None, return_attention=return_attention
             )
             if return_attention:
                 attention_dict['t2i'] = t2i_attn
+            # Text: 384 -> 896
+            updated_text = text_tokens + self.text_up_proj(text_fused - text_in_fusion)
         else:
             updated_text = text_tokens
         
@@ -301,6 +360,10 @@ class FIBERVisionEncoder(nn.Module):
     NOTE: Reduced for compact model (<1GB target):
     - Default fusion_layers reduced from [8,9,10,11] to [9,11] (2 layers)
     - num_fusion_heads reduced from 4 to 2
+    
+    DIMENSION ALIGNMENT:
+    - Uses fusion_dim (384) as shared space for cross-modal attention
+    - Vision (192) and Text (896) are projected to this shared dimension
     """
     
     def __init__(
@@ -309,7 +372,8 @@ class FIBERVisionEncoder(nn.Module):
         pretrained_path: Optional[str] = None,
         fusion_layers: list = None,
         text_dim: int = 896,
-        num_fusion_heads: int = 2  # Reduced from 4
+        num_fusion_heads: int = 2,  # Reduced from 4
+        fusion_dim: int = 384  # Shared dimension for cross-modal fusion
     ):
         super().__init__()
         
@@ -318,6 +382,7 @@ class FIBERVisionEncoder(nn.Module):
         self.hidden_size = config.get('deit_embed_dim', 192)
         self.num_patches = config.get('num_patches', 196)
         self.num_layers = 12  # DeiT-Tiny has 12 layers
+        self.fusion_dim = fusion_dim
         
         # Fusion layer indices (0-indexed, reduced from [8,9,10,11] to [9,11])
         self.fusion_layers = fusion_layers or [9, 11]
@@ -380,7 +445,8 @@ class FIBERVisionEncoder(nn.Module):
                 text_dim=text_dim,
                 num_heads=num_fusion_heads,
                 dropout=0.0,
-                bidirectional=False  # Only I2T for vision encoder
+                bidirectional=False,  # Only I2T for vision encoder
+                fusion_dim=fusion_dim  # Shared 384-dim space
             )
         
         # Layer norm
