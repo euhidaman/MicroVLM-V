@@ -973,18 +973,18 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         if attention_monitor is not None and 'token_attention' in outputs:
             token_attn = outputs['token_attention']
             if token_attn is not None:
-                attention_monitor.update(token_attn.detach(), global_step)
+                # Check attention quality
+                metrics = attention_monitor.check_attention(token_attn.detach(), global_step)
                 
                 # Check for early stopping (main process only)
-                if is_main_process and attention_monitor.should_stop_training():
-                    alert = attention_monitor.get_alert_summary()
+                if is_main_process and attention_monitor.should_stop():
                     print(f"\n{'='*60}")
                     print("⚠️  ATTENTION QUALITY ALERT - EARLY STOPPING TRIGGERED")
                     print(f"{'='*60}")
                     print(f"Step: {global_step}")
-                    print(f"Quality Score: {alert['current_quality']:.4f}")
-                    print(f"Degradation Rate: {alert['degradation_rate']:.4f}")
-                    print(f"Triggered By: {', '.join(alert['triggers'])}")
+                    print(f"Health Score: {metrics.health_score:.4f}")
+                    print(f"Edge Ratio: {metrics.edge_ratio:.4f}")
+                    print(f"Entropy Ratio: {metrics.mean_entropy_ratio:.4f}")
                     print(f"\nAttention has degraded to edge-detection mode.")
                     print(f"Training will stop to prevent further degradation.")
                     print(f"{'='*60}\n")
@@ -994,7 +994,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         wandb_logger.log_metrics({
                             'attention_quality/early_stop_triggered': 1.0,
                             'attention_quality/stop_step': global_step,
-                            'attention_quality/final_quality': alert['current_quality'],
+                            'attention_quality/final_health': metrics.health_score,
                         }, step=global_step)
                     
                     # Return with early stop flag
@@ -1003,16 +1003,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 
                 # Log attention quality metrics periodically
                 if is_main_process and global_step % config.log_interval == 0 and wandb_logger:
-                    quality_metrics = attention_monitor.get_quality_metrics()
-                    if quality_metrics:
-                        wandb_metrics = {
-                            'attention_quality/score': quality_metrics['quality_score'],
-                            'attention_quality/entropy': quality_metrics['entropy_score'],
-                            'attention_quality/edge_ratio': quality_metrics['edge_ratio'],
-                            'attention_quality/spatial_coherence': quality_metrics['spatial_coherence'],
-                            'attention_quality/cross_batch_stability': quality_metrics['cross_batch_stability'],
-                        }
-                        wandb_logger.log_metrics(wandb_metrics, step=global_step)
+                    wandb_metrics = attention_monitor.get_wandb_metrics(metrics)
+                    wandb_logger.log_metrics(wandb_metrics, step=global_step)
 
         # End batch tracking for carbon tracker and log compute metrics
         if carbon_tracker is not None:
@@ -1640,12 +1632,13 @@ def main():
     
     if is_main_process and use_attention_monitor and args.alignment_mode == 'fiber':
         attention_monitor = AttentionQualityMonitor(
-            num_patches=196,  # DeiT-Tiny: 14x14 patches
-            quality_threshold=getattr(config, 'attention_quality_threshold', 0.25),
-            degradation_rate_threshold=getattr(config, 'attention_degradation_threshold', 0.15),
-            min_steps_before_stop=getattr(config, 'attention_min_steps', 2000),
-            window_size=500,  # Track over last 500 steps
-            check_interval=100  # Check quality every 100 steps
+            min_health_score=getattr(config, 'attention_quality_threshold', 0.25),
+            max_edge_ratio=0.6,  # Alert if >60% attention on edges
+            patience=10,  # Consecutive bad steps before pause
+            auto_pause=True,
+            auto_adjust_lr=True,
+            grid_size=14,  # DeiT-Tiny: 14x14 patches
+            verbose=True
         )
         print(f"[AttentionMonitor] Initialized for early stopping on attention degradation")
 
