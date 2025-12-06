@@ -423,10 +423,14 @@ class MicroVLM_FIBER(nn.Module):
                     outputs['fine_grained_loss'] = fine_grained_loss
                     self._last_text_to_patch_attention = text_to_patch_attn.detach()
             
+            # Alignment statistics for downstream monitoring
+            alignment_stats = self._compute_alignment_stats(image_features, text_features)
+            outputs['alignment_stats'] = alignment_stats
+
             # Logging
             self._alignment_log_counter += 1
             if self._alignment_log_counter % 100 == 1:
-                self._log_alignment_metrics(outputs, image_features, text_features)
+                self._log_alignment_metrics(outputs, alignment_stats)
         
         # Fuse modalities
         if prefix_tokens is not None:
@@ -552,23 +556,33 @@ class MicroVLM_FIBER(nn.Module):
         
         return outputs
     
-    def _log_alignment_metrics(self, outputs, image_features, text_features):
-        """Log alignment metrics for debugging"""
+    def _compute_alignment_stats(self, image_features, text_features):
+        """Compute reusable alignment statistics"""
         with torch.no_grad():
             img_norm = image_features.norm(dim=-1).mean().item()
             txt_norm = text_features.norm(dim=-1).mean().item()
-            
+
             img_normalized = F.normalize(image_features, p=2, dim=-1)
             txt_normalized = F.normalize(text_features, p=2, dim=-1)
             correct_sim = (img_normalized * txt_normalized).sum(dim=-1).mean().item()
-            
-            print(f"  📊 Alignment [{self.alignment_mode}]: img_norm={img_norm:.3f}, txt_norm={txt_norm:.3f}, "
-                  f"correct_sim={correct_sim:.4f}")
-            
-            if 'itm_loss' in outputs:
-                print(f"     ITM loss: {outputs['itm_loss'].item():.4f}")
-            if 'token_loss' in outputs:
-                print(f"     Token loss: {outputs['token_loss'].item():.4f}")
+
+        return {
+            'img_norm': img_norm,
+            'txt_norm': txt_norm,
+            'correct_sim': correct_sim
+        }
+
+    def _log_alignment_metrics(self, outputs, alignment_stats):
+        """Log alignment metrics for debugging"""
+        if not alignment_stats:
+            return
+        print(f"  📊 Alignment [{self.alignment_mode}]: img_norm={alignment_stats['img_norm']:.3f}, "
+              f"txt_norm={alignment_stats['txt_norm']:.3f}, correct_sim={alignment_stats['correct_sim']:.4f}")
+        
+        if 'itm_loss' in outputs:
+            print(f"     ITM loss: {outputs['itm_loss'].item():.4f}")
+        if 'token_loss' in outputs:
+            print(f"     Token loss: {outputs['token_loss'].item():.4f}")
     
     def get_text_to_patch_attention(self) -> Optional[torch.Tensor]:
         """Get the last computed text-to-patch attention"""

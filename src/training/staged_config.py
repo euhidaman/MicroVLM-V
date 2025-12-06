@@ -78,6 +78,14 @@ class TrainingConfig:
     early_stop_patience: int = 2  # Stop after N epochs without significant improvement
     early_stop_min_delta: float = 0.01  # Minimum loss change to count as improvement
 
+    # Alignment-specific safeguards
+    alignment_early_stop: bool = False
+    alignment_patience: int = 0
+    alignment_improve_min_delta: float = 1e-3
+    alignment_stop_threshold: float = 0.0
+    alignment_negative_patience: int = 100
+    save_best_alignment_checkpoint: bool = True
+
     # WandB
     use_wandb: bool = True
     wandb_project: str = "MicroVLM-V"
@@ -165,6 +173,13 @@ class Stage1Config(TrainingConfig):
     use_early_stopping: bool = True
     early_stop_patience: int = 2  # Stop after 2 epochs without improvement
     early_stop_min_delta: float = 0.01  # Loss must improve by at least this
+
+    # Alignment safeguards
+    alignment_early_stop: bool = True
+    alignment_patience: int = 300  # ~300 steps ≈ 1/3 epoch at batch 512
+    alignment_improve_min_delta: float = 5e-4
+    alignment_stop_threshold: float = 0.0
+    alignment_negative_patience: int = 75
 
     # Visualization settings
     log_interval: int = 25  # More frequent logging to track loss

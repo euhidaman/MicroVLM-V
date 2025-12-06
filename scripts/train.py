@@ -17,6 +17,7 @@ import os
 import sys
 import json
 from datetime import datetime
+import math
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -257,6 +258,97 @@ def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_na
     print(f"📊 Statistics saved: {stats_path}")
 
     return checkpoint_path, stats
+
+
+def ensure_alignment_tracking_state(config):
+    """Initialize alignment tracking attributes if needed."""
+    if hasattr(config, '_best_alignment_sim'):
+        return
+    config._best_alignment_sim = float('-inf')
+    config._best_alignment_step = -1
+    config._alignment_no_improve_steps = 0
+    config._alignment_negative_steps = 0
+    config._best_alignment_checkpoint = None
+
+
+def save_best_alignment_checkpoint(model, optimizer, global_step, config, stage_name, correct_sim):
+    """Persist best alignment checkpoint for Stage 1 handoff."""
+    checkpoint_dir = Path(config.output_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = checkpoint_dir / "best_alignment.pt"
+    torch.save({
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'stage_name': stage_name,
+        'config': vars(config),
+        'best_correct_sim': correct_sim
+    }, checkpoint_path)
+
+    print(f"✅ Saved best-alignment checkpoint ({correct_sim:.4f}) -> {checkpoint_path}")
+    return checkpoint_path
+
+
+def handle_alignment_tracking(config, model, optimizer, global_step, alignment_stats,
+                              stage_name, wandb_logger=None):
+    """Update best alignment stats and determine stop conditions."""
+    if alignment_stats is None:
+        return 0
+
+    correct_sim = alignment_stats.get('correct_sim')
+    if correct_sim is None or math.isnan(correct_sim):
+        return 0
+
+    ensure_alignment_tracking_state(config)
+
+    min_delta = getattr(config, 'alignment_improve_min_delta', 1e-3)
+    patience = getattr(config, 'alignment_patience', 400)
+    negative_patience = getattr(config, 'alignment_negative_patience', 50)
+    stop_threshold = getattr(config, 'alignment_stop_threshold', 0.0)
+    save_best = getattr(config, 'save_best_alignment_checkpoint', True)
+
+    improved = correct_sim > (config._best_alignment_sim + min_delta)
+    if improved:
+        config._best_alignment_sim = correct_sim
+        config._best_alignment_step = global_step
+        config._alignment_no_improve_steps = 0
+        config._alignment_negative_steps = 0
+        if save_best:
+            best_path = save_best_alignment_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                global_step=global_step,
+                config=config,
+                stage_name=stage_name,
+                correct_sim=correct_sim
+            )
+            config._best_alignment_checkpoint = str(best_path)
+        if wandb_logger:
+            wandb_logger.log_metrics({
+                'alignment/best_correct_sim': correct_sim,
+                'alignment/best_step': global_step
+            }, step=global_step)
+        return 0
+
+    # No improvement this step
+    config._alignment_no_improve_steps += 1
+    if correct_sim < stop_threshold:
+        config._alignment_negative_steps += 1
+    else:
+        config._alignment_negative_steps = 0
+
+    if patience > 0 and config._alignment_no_improve_steps >= patience:
+        print("\n⚠️  Alignment early stop: plateau detected")
+        print(f"   Best correct_sim={config._best_alignment_sim:.4f} at step {config._best_alignment_step}")
+        return 1
+
+    if config._alignment_negative_steps >= negative_patience:
+        print("\n⚠️  Alignment early stop: similarity stayed below threshold")
+        print(f"   Threshold: {stop_threshold}, patience: {negative_patience} steps")
+        return 2
+
+    return 0
 
 
 def generate_model_card(stats, epoch, total_epochs, stage_name, config, training_history=None):
@@ -1055,6 +1147,31 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         global_step += 1
         
+        # Alignment-specific tracking (Stage 1)
+        alignment_stop_code = 0
+        alignment_stats = outputs.get('alignment_stats')
+        if getattr(config, 'alignment_early_stop', False) and is_main_process:
+            alignment_stop_code = handle_alignment_tracking(
+                config=config,
+                model=model,
+                optimizer=optimizer,
+                global_step=global_step,
+                alignment_stats=alignment_stats,
+                stage_name=getattr(config, 'stage_name', 'alignment'),
+                wandb_logger=wandb_logger
+            )
+
+        if is_distributed:
+            signal_device = config.device if isinstance(config.device, torch.device) else torch.device(config.device)
+            code_tensor = torch.tensor([alignment_stop_code if is_main_process else 0], device=signal_device)
+            dist.broadcast(code_tensor, src=0)
+            alignment_stop_code = int(code_tensor.item())
+
+        if alignment_stop_code != 0:
+            stop_label = 'alignment_plateau' if alignment_stop_code == 1 else 'alignment_negative'
+            avg_loss = total_loss / max(batch_idx + 1, 1)
+            return avg_loss, global_step, stop_label
+
         # ===== Attention Quality Monitoring =====
         # Update attention monitor with token attention if available
         if attention_monitor is not None and 'token_attention' in outputs:
@@ -1086,7 +1203,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     
                     # Return with early stop flag
                     avg_loss = total_loss / max(batch_idx + 1, 1)
-                    return avg_loss, global_step, True  # True = early stop
+                    return avg_loss, global_step, 'attention'
                 
                 # Log attention quality metrics periodically
                 if is_main_process and global_step % config.log_interval == 0 and wandb_logger:
@@ -1444,7 +1561,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             wandb_logger.log_metrics(epoch_wandb_metrics, step=global_step)
 
     avg_loss = total_loss / len(train_loader)
-    return avg_loss, global_step, False  # False = no early stop
+    return avg_loss, global_step, None
 
 
 def count_parameters(model):
@@ -1876,6 +1993,10 @@ def main():
     
     # Store alignment mode in config for use in training loop
     config.alignment_mode = args.alignment_mode
+    config.stage_name = args.config
+
+    if getattr(config, 'alignment_early_stop', False):
+        ensure_alignment_tracking_state(config)
 
     # Initialize FLOPs estimation for carbon tracker
     if carbon_tracker is not None and is_main_process:
@@ -1994,7 +2115,7 @@ def main():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
-        avg_loss, global_step, early_stop = train_epoch(
+        avg_loss, global_step, stop_reason = train_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
@@ -2011,19 +2132,29 @@ def main():
             attention_monitor=attention_monitor
         )
         
-        # Handle early stopping due to attention degradation
-        if early_stop:
+        # Handle early stopping reason
+        if stop_reason:
             if is_main_process:
                 print(f"\n⚠️  Training stopped early at epoch {epoch}, step {global_step}")
-                print("   Reason: Attention quality degraded below threshold")
+                if stop_reason == 'attention':
+                    print("   Reason: Attention quality degraded below threshold")
+                elif stop_reason == 'alignment_plateau':
+                    print("   Reason: Alignment similarity plateaued")
+                elif stop_reason == 'alignment_negative':
+                    print("   Reason: Alignment similarity stayed below threshold")
+                else:
+                    print(f"   Reason: {stop_reason}")
                 print("   Saving final checkpoint before exit...")
-                
-                # Save emergency checkpoint
+
                 checkpoint_path, stats = save_epoch_checkpoint(
-                    model, optimizer, epoch, global_step, config, 
+                    model, optimizer, epoch, global_step, config,
                     f"{args.config}_early_stop"
                 )
                 print(f"   Emergency checkpoint saved: {checkpoint_path}")
+
+                if stop_reason.startswith('alignment') and getattr(config, '_best_alignment_checkpoint', None):
+                    print(f"   Best alignment checkpoint: {config._best_alignment_checkpoint}")
+                    print(f"   Best correct_sim: {config._best_alignment_sim:.4f} (step {config._best_alignment_step})")
             break
 
         # Check loss-based early stopping
