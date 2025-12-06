@@ -33,6 +33,65 @@ from huggingface_hub import HfApi, create_repo, upload_file
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
+class EarlyStopping:
+    """
+    Stop training when loss stops improving.
+    """
+    
+    def __init__(self, patience=2, min_delta=0.01, verbose=True):
+        """
+        Args:
+            patience: Number of epochs to wait for improvement before stopping
+            min_delta: Minimum loss change to count as improvement
+            verbose: Print status messages
+        """
+        self.patience = patience
+        self.min_delta = min_delta
+        self.verbose = verbose
+        
+        self.best_loss = float('inf')
+        self.epochs_without_improvement = 0
+        self.best_epoch = 0
+        
+    def __call__(self, epoch, current_loss):
+        """
+        Check if training should stop.
+        
+        Returns:
+            bool: True if training should stop
+        """
+        # Check if loss improved
+        if current_loss < self.best_loss - self.min_delta:
+            # Loss improved
+            self.best_loss = current_loss
+            self.best_epoch = epoch
+            self.epochs_without_improvement = 0
+            if self.verbose:
+                print(f"  [EarlyStopping] Loss improved to {current_loss:.4f}")
+        else:
+            # No significant improvement
+            self.epochs_without_improvement += 1
+            if self.verbose:
+                print(f"  [EarlyStopping] No improvement for {self.epochs_without_improvement}/{self.patience} epochs")
+        
+        # Check if patience exceeded
+        if self.epochs_without_improvement >= self.patience:
+            if self.verbose:
+                print(f"\n⚠️  EARLY STOPPING: Loss hasn't improved for {self.patience} epochs")
+                print(f"   Best loss: {self.best_loss:.4f} at epoch {self.best_epoch}\n")
+            return True
+        
+        return False
+    
+    def get_status(self):
+        """Get current status for logging"""
+        return {
+            'best_loss': self.best_loss,
+            'best_epoch': self.best_epoch,
+            'epochs_without_improvement': self.epochs_without_improvement,
+        }
+
+
 def count_parameters(model):
     """Count total and trainable parameters"""
     # Handle DDP/DataParallel wrapped models
@@ -1898,13 +1957,25 @@ def main():
     if carbon_tracker is not None:
         carbon_tracker.start_training()
 
+    # Initialize early stopping
+    loss_early_stopper = None
+    if getattr(config, 'use_early_stopping', True):
+        loss_early_stopper = EarlyStopping(
+            patience=getattr(config, 'early_stop_patience', 2),
+            min_delta=getattr(config, 'early_stop_min_delta', 0.01),
+            verbose=is_main_process
+        )
+        if is_main_process:
+            print(f"\n📉 Early Stopping: patience={loss_early_stopper.patience}, min_delta={loss_early_stopper.min_delta}")
+
     # Training loop
     if is_main_process:
-        print(f"Starting training for {config.num_epochs} epochs...")
+        print(f"Starting training for up to {config.num_epochs} epochs...")
 
     # Track training history for model card
     training_history = []
     early_stop = False
+    loss_converged = False
 
     for epoch in range(start_epoch, config.num_epochs):
         # Set epoch for distributed sampler (ensures proper shuffling)
@@ -1942,6 +2013,27 @@ def main():
                 )
                 print(f"   Emergency checkpoint saved: {checkpoint_path}")
             break
+
+        # Check loss-based early stopping
+        if loss_early_stopper is not None:
+            loss_converged = loss_early_stopper(epoch, avg_loss)
+            if loss_converged:
+                if is_main_process:
+                    # Save final checkpoint before stopping
+                    stage_name = args.config if hasattr(args, 'config') else 'default'
+                    checkpoint_path, stats = save_epoch_checkpoint(
+                        model, optimizer, epoch, global_step, config, stage_name
+                    )
+                    push_to_huggingface(
+                        checkpoint_path=checkpoint_path,
+                        stats=stats,
+                        epoch=epoch,
+                        total_epochs=epoch + 1,
+                        stage_name=stage_name,
+                        config=config,
+                        training_history=training_history
+                    )
+                break
 
         if is_main_process:
             print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
@@ -2010,12 +2102,19 @@ def main():
 
     # Final save (main process only)
     if is_main_process:
+        actual_epochs = epoch + 1
+        print(f"\n📊 Training Summary: {actual_epochs}/{config.num_epochs} epochs, {global_step} steps")
+        if loss_converged:
+            print(f"   Stopped early - loss plateaued")
+        
         final_path = Path(config.output_dir) / "final_model.pt"
         base_model = model.module if hasattr(model, 'module') else model
         base_model.save_checkpoint(str(final_path))
         print(f"Training complete! Final model saved to {final_path}")
 
         if wandb_run:
+            wandb_run.summary["actual_epochs"] = actual_epochs
+            wandb_run.summary["early_stopped"] = loss_converged
             wandb_run.finish()
     
     # Clean up distributed training

@@ -73,6 +73,11 @@ class TrainingConfig:
     visualize_interval: int = 1000  # Reduced frequency for attention visualizations
     viz_save_interval: int = 5000  # Save full attention visualizations every N steps
 
+    # Early Stopping (loss-based convergence detection)
+    use_early_stopping: bool = True  # Enable early stopping on loss plateau
+    early_stop_patience: int = 2  # Stop after N epochs without significant improvement
+    early_stop_min_delta: float = 0.01  # Minimum loss change to count as improvement
+
     # WandB
     use_wandb: bool = True
     wandb_project: str = "MicroVLM-V"
@@ -109,10 +114,15 @@ class Stage1Config(TrainingConfig):
     - Monitors entropy, edge ratio, and spatial coherence
     - Auto-stops training if attention degrades to edge-detection mode
     - Anti-collapse regularization prevents feature collapse
+    
+    EARLY STOPPING:
+    - Loss typically converges to ~0.3-0.5 within 1-2 epochs
+    - Training auto-stops when loss plateaus or reaches threshold
+    - Max 5 epochs is safety cap (rarely reached with early stopping)
     """
     # Override defaults for Stage 1
     use_memory: bool = False  # Disable memory in Stage 1
-    num_epochs: int = 10  # Reduced - contrastive learning converges faster
+    num_epochs: int = 5  # Max epochs (early stopping usually triggers earlier)
     # Lower LR for stable contrastive learning (CLIP uses 5e-4 for full model)
     learning_rate: float = 5e-5
     warmup_steps: int = 2000  # ~10% of epoch, critical for contrastive stability
@@ -150,6 +160,11 @@ class Stage1Config(TrainingConfig):
     # Stop if degradation rate exceeds this
     attention_degradation_threshold: float = 0.15
     attention_min_steps: int = 2000  # Minimum steps before early stopping is allowed
+
+    # Early Stopping - stop when loss plateaus
+    use_early_stopping: bool = True
+    early_stop_patience: int = 2  # Stop after 2 epochs without improvement
+    early_stop_min_delta: float = 0.01  # Loss must improve by at least this
 
     # Visualization settings
     log_interval: int = 25  # More frequent logging to track loss
