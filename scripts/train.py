@@ -269,6 +269,7 @@ def ensure_alignment_tracking_state(config):
     config._alignment_no_improve_steps = 0
     config._alignment_negative_steps = 0
     config._best_alignment_checkpoint = None
+    config._last_alignment_save_step = -9999  # cooldown tracker
 
 
 def save_best_alignment_checkpoint(model, optimizer, global_step, config, stage_name, correct_sim):
@@ -302,11 +303,12 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
 
     ensure_alignment_tracking_state(config)
 
-    min_delta = getattr(config, 'alignment_improve_min_delta', 1e-3)
+    min_delta = getattr(config, 'alignment_improve_min_delta', 0.01)
     patience = getattr(config, 'alignment_patience', 400)
     negative_patience = getattr(config, 'alignment_negative_patience', 50)
     stop_threshold = getattr(config, 'alignment_stop_threshold', 0.0)
     save_best = getattr(config, 'save_best_alignment_checkpoint', True)
+    save_cooldown = getattr(config, 'alignment_save_cooldown', 100)
 
     improved = correct_sim > (config._best_alignment_sim + min_delta)
     if improved:
@@ -314,7 +316,10 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
         config._best_alignment_step = global_step
         config._alignment_no_improve_steps = 0
         config._alignment_negative_steps = 0
-        if save_best:
+
+        # Only persist checkpoint if cooldown has elapsed
+        steps_since_save = global_step - config._last_alignment_save_step
+        if save_best and steps_since_save >= save_cooldown:
             best_path = save_best_alignment_checkpoint(
                 model=model,
                 optimizer=optimizer,
@@ -324,6 +329,7 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
                 correct_sim=correct_sim
             )
             config._best_alignment_checkpoint = str(best_path)
+            config._last_alignment_save_step = global_step
         if wandb_logger:
             wandb_logger.log_metrics({
                 'alignment/best_correct_sim': correct_sim,
