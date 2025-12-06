@@ -265,8 +265,9 @@ class MicroVLM_FIBER(nn.Module):
         else:
             raw_image_features = self.vision_encoder.get_cls_token(images)
         
-        # Project to alignment space
+        # Project to alignment space and normalize for stable similarity metrics
         image_features = self.image_proj_for_alignment(raw_image_features)
+        image_features = F.normalize(image_features, p=2, dim=-1, eps=1e-6)
         
         # Project to language space via adapter
         if return_patch_embeddings:
@@ -306,8 +307,9 @@ class MicroVLM_FIBER(nn.Module):
         else:
             raw_text_features = text_embeddings.mean(dim=1)
         
-        # Project to alignment space
+        # Project to alignment space and normalize to keep cosine similarities bounded
         text_features = self.text_proj_for_alignment(raw_text_features)
+        text_features = F.normalize(text_features, p=2, dim=-1, eps=1e-6)
         
         return text_embeddings, text_features
     

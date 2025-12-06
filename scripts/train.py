@@ -769,6 +769,34 @@ def create_scheduler(optimizer, config, total_steps):
     return scheduler
 
 
+def apply_freezing_strategy(model, config, alignment_mode):
+    """Apply freezing logic based on staged training configuration."""
+    base_model = model.module if hasattr(model, 'module') else model
+
+    # Vision freezing (keeps FIBER fusion trainable via model's helper)
+    if getattr(config, 'freeze_vision', False) and hasattr(base_model, 'freeze_vision_encoder'):
+        base_model.freeze_vision_encoder()
+
+    # Language freezing / partial unfreezing
+    if getattr(config, 'freeze_language', False) and hasattr(base_model, 'freeze_language_model'):
+        unfreeze_last = getattr(config, 'unfreeze_last_n_layers', 0)
+        base_model.freeze_language_model(unfreeze_last_n=unfreeze_last)
+
+    # Adapter-only training: ensure adapter + alignment heads remain trainable
+    if getattr(config, 'train_adapter_only', False):
+        if hasattr(base_model, 'multimodal_adapter'):
+            for param in base_model.multimodal_adapter.parameters():
+                param.requires_grad = True
+        for proj_name in ['image_proj_for_alignment', 'text_proj_for_alignment']:
+            if hasattr(base_model, proj_name):
+                module = getattr(base_model, proj_name)
+                for param in module.parameters():
+                    param.requires_grad = True
+        if hasattr(base_model, 'alignment_loss'):
+            for param in base_model.alignment_loss.parameters():
+                param.requires_grad = True
+
+
 def compute_gradient_flow_metrics(model):
     """
     Compute gradient flow metrics for monitoring training
@@ -1810,26 +1838,10 @@ def main():
             wandb_logger.log_metrics(
                 quant_stats, step=0, prefix="quantization")
 
-    # Apply freezing strategy (different for FIBER vs baseline)
-    if args.alignment_mode == 'fiber':
-        # For FIBER: freeze language model but keep vision encoder trainable for fusion
-        if config.freeze_language:
-            model.freeze_language_model(
-                unfreeze_last_n=config.unfreeze_last_n_layers)
-        # Note: FIBER vision encoder has fusion layers that need to be trainable
-        # The base DeiT layers can optionally be frozen
-        if config.freeze_vision:
-            # Freeze base vision encoder but keep fusion layers trainable
-            if hasattr(model, 'fiber_vision_encoder'):
-                model.fiber_vision_encoder.freeze_base_vision(freeze=True)
-    else:
-        # Baseline freezing strategy
-        if config.freeze_vision:
-            model.freeze_vision_encoder()
-
-        if config.freeze_language:
-            model.freeze_language_model(
-                unfreeze_last_n=config.unfreeze_last_n_layers)
+    # Apply freezing strategy from staged config
+    apply_freezing_strategy(model, config, args.alignment_mode)
+    if is_main_process and getattr(config, 'train_adapter_only', False):
+        print("  ✓ Adapter-only training enabled (vision + LM frozen)")
 
     # Print trainable parameters
     trainable_params = model.get_trainable_params()
