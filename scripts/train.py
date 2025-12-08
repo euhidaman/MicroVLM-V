@@ -2311,6 +2311,13 @@ def main():
         # Get state dict from checkpoint
         state_dict = checkpoint['model_state_dict']
         
+        # Strip 'module.' prefix if present (from DDP checkpoints)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace('module.', '') if k.startswith('module.') else k
+            new_state_dict[new_key] = v
+        state_dict = new_state_dict
+        
         # Detect stage transition (Stage 1 -> Stage 2)
         # Stage 1 has use_memory=False, Stage 2 has use_memory=True
         # If transitioning, exclude memory-related keys to start fresh

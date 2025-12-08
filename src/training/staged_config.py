@@ -208,7 +208,7 @@ class Stage2Config(TrainingConfig):
     alignment_mode: str = 'fiber'  # Must match Stage 1 checkpoint
     use_memory: bool = True  # Enable memory in Stage 2
     episode_size: int = 4  # Longer episodes for memory learning
-    num_epochs: int = 5
+    num_epochs: int = 10  # More epochs for memory learning
     learning_rate: float = 1e-4  # Lower LR with memory
     warmup_steps: int = 1000
     batch_size: int = 64
@@ -233,6 +233,15 @@ class Stage2Config(TrainingConfig):
     pseudoinverse_steps: int = 15
     memory_kl_weight: float = 0.02
     addressing_kl_weight: float = 0.005
+
+    # Stage 2 output directory and HF repo
+    output_dir: str = "./checkpoints/stage2"
+    hf_repo_name: str = "MicroVLM-V-stage2"
+
+    # Early stopping for Stage 2 (loss-based)
+    use_early_stopping: bool = True
+    early_stop_patience: int = 3  # More patience for memory learning
+    early_stop_min_delta: float = 0.005  # Smaller delta for finer convergence
 
     # Visualization
     visualize_interval: int = 100
