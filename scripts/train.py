@@ -260,6 +260,41 @@ def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_na
     return checkpoint_path, stats
 
 
+def _unique_path(path: Path) -> Path:
+    """Return a unique path by appending -vN if the file exists."""
+    if not path.exists():
+        return path
+    stem = path.stem
+    suffix = path.suffix
+    parent = path.parent
+    counter = 1
+    while True:
+        candidate = parent / f"{stem}-v{counter}{suffix}"
+        if not candidate.exists():
+            return candidate
+        counter += 1
+
+
+def save_step_checkpoint(model, optimizer, global_step, config, stage_name="default"):
+    """Save checkpoint at fixed step intervals without overwriting previous ones."""
+    checkpoint_dir = Path(config.output_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    checkpoint_path = checkpoint_dir / f"checkpoint-{global_step}.pt"
+    checkpoint_path = _unique_path(checkpoint_path)
+
+    torch.save({
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'config': vars(config),
+        'stage_name': stage_name
+    }, checkpoint_path)
+
+    print(f"💾 Step checkpoint saved: {checkpoint_path}")
+    return checkpoint_path
+
+
 def ensure_alignment_tracking_state(config):
     """Initialize alignment tracking attributes if needed."""
     if hasattr(config, '_best_alignment_sim'):
@@ -278,7 +313,8 @@ def save_best_alignment_checkpoint(model, optimizer, global_step, config, stage_
     checkpoint_dir = Path(config.output_dir) / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = checkpoint_dir / "best_alignment.pt"
+    checkpoint_path = checkpoint_dir / f"best-checkpoint-step-{global_step}.pt"
+    checkpoint_path = _unique_path(checkpoint_path)
     torch.save({
         'global_step': global_step,
         'model_state_dict': model.state_dict(),
@@ -1166,6 +1202,16 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         itm_loss_total += itm_loss_val.item() if itm_loss_val is not None else 0
 
         global_step += 1
+
+        # Step-based checkpointing (every 150 steps) on main process only
+        if is_main_process and global_step % 150 == 0:
+            save_step_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                global_step=global_step,
+                config=config,
+                stage_name=getattr(config, 'stage_name', 'default')
+            )
         
         # Alignment-specific tracking (Stage 1)
         alignment_stop_code = 0
