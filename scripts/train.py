@@ -350,10 +350,8 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
     force_continue = getattr(config, 'force_continue', False)
     force_continue_steps = getattr(config, 'force_continue_steps', 0)
 
-    # Minimum stopping step logic (alignment-based)
+    # Minimum steps before stopping is allowed (floor, not ceiling)
     effective_min_stop = max(min_stop_steps, force_continue_steps if force_continue else 0)
-    if global_step < effective_min_stop:
-        return 0
 
     improved = correct_sim > (config._best_alignment_sim + min_delta)
     if improved:
@@ -381,6 +379,7 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
                 'alignment/best_correct_sim': correct_sim,
                 'alignment/best_step': global_step
             }, step=global_step)
+        # Don't stop yet - just record the improvement
         return 0
 
     # No improvement this step
@@ -390,19 +389,36 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
     else:
         config._alignment_negative_steps = 0
 
+    # Early stop logic: 
+    # - Never stop before effective_min_stop (e.g., 1500)
+    # - After min_stop: stop only if best was found, else keep training
+    can_stop = global_step >= effective_min_stop and config._best_alignment_found
+
     if patience > 0 and config._alignment_no_improve_steps >= patience:
-        print("\n⚠️  Alignment early stop: plateau detected")
-        print(f"   Best correct_sim={config._best_alignment_sim:.4f} at step {config._best_alignment_step}")
-        return 1
+        if can_stop:
+            print("\n⚠️  Alignment early stop: plateau detected")
+            print(f"   Best correct_sim={config._best_alignment_sim:.4f} at step {config._best_alignment_step}")
+            return 1
+        else:
+            # Cannot stop yet: either before min_stop OR no best found
+            if config._alignment_no_improve_steps % 100 == 0:
+                if global_step < effective_min_stop:
+                    print(f"   [force-continue] Step {global_step} < {effective_min_stop}, continuing despite plateau...")
+                else:
+                    print(f"   [force-continue] No best found yet at step {global_step}, continuing despite plateau...")
 
     if config._alignment_negative_steps >= negative_patience:
-        print("\n⚠️  Alignment early stop: similarity stayed below threshold")
-        print(f"   Threshold: {stop_threshold}, patience: {negative_patience} steps")
-        return 2
-
-    # If force-continue is enabled and no best has been found yet, keep going
-    if force_continue and not config._best_alignment_found:
-        return 0
+        if can_stop:
+            print("\n⚠️  Alignment early stop: similarity stayed below threshold")
+            print(f"   Threshold: {stop_threshold}, patience: {negative_patience} steps")
+            return 2
+        else:
+            # Cannot stop yet
+            if config._alignment_negative_steps % 50 == 0:
+                if global_step < effective_min_stop:
+                    print(f"   [force-continue] Step {global_step} < {effective_min_stop}, continuing despite negative sim...")
+                else:
+                    print(f"   [force-continue] No best found yet at step {global_step}, continuing despite negative sim...")
 
     return 0
 
