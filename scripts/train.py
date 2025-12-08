@@ -2308,8 +2308,26 @@ def main():
                 print(f"⚠️  Warning: Checkpoint alignment_mode='{ckpt_alignment_mode}' differs from current='{args.alignment_mode}'")
                 print(f"   This may cause loading issues. Consider using --alignment_mode {ckpt_alignment_mode}")
         
-        # Handle DDP/DP wrapped models - use strict=False to allow partial loading
+        # Get state dict from checkpoint
         state_dict = checkpoint['model_state_dict']
+        
+        # Detect stage transition (Stage 1 -> Stage 2)
+        # Stage 1 has use_memory=False, Stage 2 has use_memory=True
+        # If transitioning, exclude memory-related keys to start fresh
+        ckpt_config = checkpoint.get('config', {})
+        ckpt_use_memory = ckpt_config.get('use_memory', False)
+        current_use_memory = getattr(config, 'use_memory', False)
+        
+        if not ckpt_use_memory and current_use_memory:
+            # Transitioning from Stage 1 (no memory) to Stage 2 (with memory)
+            # Filter out memory keys - they weren't trained and have wrong dimensions
+            memory_keys = [k for k in state_dict.keys() if 'episodic_memory' in k or 'scope_detector' in k]
+            if memory_keys and is_main_process:
+                print(f"   🔄 Stage transition detected: filtering out {len(memory_keys)} untrained memory keys")
+            for k in memory_keys:
+                del state_dict[k]
+        
+        # Handle DDP/DP wrapped models - use strict=False to allow partial loading
         if hasattr(model, 'module'):
             missing, unexpected = model.module.load_state_dict(state_dict, strict=False)
         else:
