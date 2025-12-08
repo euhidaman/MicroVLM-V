@@ -1487,36 +1487,59 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         # the correct text-to-patch attention for THESE specific images.
                         # Previously we were using attention from the training batch!
                         text_to_patch_attn = None
+                        viz_prefix_tokens = None
+                        viz_text_embeddings = None
                         try:
                             # Create dummy labels for forward pass (we only need attention, not loss)
                             dummy_labels = viz_input_ids.clone()
                             
                             # Full forward pass to compute attention for viz samples
+                            # Note: alignment_mode is a class attribute, not a forward() parameter
                             viz_outputs = viz_model(
                                 images=viz_images,
                                 input_ids=viz_input_ids,
                                 attention_mask=viz_attention_mask,
-                                labels=dummy_labels,
-                                alignment_mode='fiber'  # Force fiber mode for text-to-patch attention
+                                labels=dummy_labels
                             )
                             
                             # Now get_text_to_patch_attention() returns attention for viz samples
                             if hasattr(viz_model, 'get_text_to_patch_attention'):
                                 text_to_patch_attn = viz_model.get_text_to_patch_attention()
                                 if text_to_patch_attn is not None:
-                                    text_to_patch_attn = text_to_patch_attn[:num_samples].detach()
+                                    text_to_patch_attn = text_to_patch_attn[:num_samples].detach().clone()
+                            
+                            # Get embeddings from the same forward pass for consistency
+                            # Re-encode to get the tokens (forward doesn't return them directly)
+                            viz_text_embeddings, _ = viz_model.encode_text(
+                                viz_input_ids, viz_attention_mask)
+                            
+                            # Encode image WITH text embeddings for FIBER fusion consistency
+                            viz_encode_result = viz_model.encode_image(
+                                viz_images,
+                                text_embeddings=viz_text_embeddings if viz_model.alignment_mode == 'fiber' else None,
+                                text_mask=viz_attention_mask if viz_model.alignment_mode == 'fiber' else None
+                            )
+                            if len(viz_encode_result) == 4:
+                                viz_prefix_tokens, _, _, _ = viz_encode_result
+                            else:
+                                viz_prefix_tokens, _ = viz_encode_result
+                                
                         except Exception as exc:
                             print(f"Warning: unable to compute text-to-patch attention for viz samples: {exc}")
+                            import traceback
+                            traceback.print_exc()
                             text_to_patch_attn = None
-
-                        # Get prefix tokens and text embeddings for fallback attention
-                        viz_encode_result = viz_model.encode_image(viz_images)
-                        if len(viz_encode_result) == 4:
-                            viz_prefix_tokens, _, _, _ = viz_encode_result
-                        else:
-                            viz_prefix_tokens, _ = viz_encode_result
-                        viz_text_embeddings, _ = viz_model.encode_text(
-                            viz_input_ids, viz_attention_mask)
+                            
+                            # Fallback: encode separately
+                            if viz_prefix_tokens is None:
+                                viz_encode_result = viz_model.encode_image(viz_images)
+                                if len(viz_encode_result) == 4:
+                                    viz_prefix_tokens, _, _, _ = viz_encode_result
+                                else:
+                                    viz_prefix_tokens, _ = viz_encode_result
+                            if viz_text_embeddings is None:
+                                viz_text_embeddings, _ = viz_model.encode_text(
+                                    viz_input_ids, viz_attention_mask)
                         
                         # Compute fallback embedding-based attention for stats
                         attention_from_lm = None

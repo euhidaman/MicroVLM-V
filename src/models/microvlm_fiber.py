@@ -396,6 +396,11 @@ class MicroVLM_FIBER(nn.Module):
                     compute_token=True
                 )
                 
+                # Use the pre-weighted total_loss from FIBERAlignmentLoss
+                # This contains: itc_weight * ITC + itm_weight * ITM + token_weight * token + regularization
+                outputs['fiber_total_loss'] = alignment_outputs['total_loss']
+                
+                # Store individual losses for logging (unweighted)
                 outputs['alignment_loss'] = alignment_outputs['itc_loss']
                 outputs['itm_loss'] = alignment_outputs.get('itm_loss', torch.tensor(0.0))
                 outputs['token_loss'] = alignment_outputs.get('token_loss', torch.tensor(0.0))
@@ -529,21 +534,26 @@ class MicroVLM_FIBER(nn.Module):
         if outputs.get('lm_loss') is not None:
             total_loss = total_loss + lm_weight * outputs['lm_loss']
         
-        # Alignment losses
-        if 'alignment_loss' in outputs:
-            total_loss = total_loss + alignment_weight * outputs['alignment_loss']
-        
-        if 'itm_loss' in outputs and not torch.isnan(outputs['itm_loss']):
-            itm_weight = _get_training_attr('itm_loss_weight', 0.5)
-            total_loss = total_loss + itm_weight * outputs['itm_loss']
-        
-        if 'token_loss' in outputs and not torch.isnan(outputs['token_loss']):
-            token_weight = _get_training_attr('token_loss_weight', 0.3)
-            total_loss = total_loss + token_weight * outputs['token_loss']
-        
-        if 'fine_grained_loss' in outputs:
-            fg_weight = _get_training_attr('fine_grained_loss_weight', 0.5)
-            total_loss = total_loss + fg_weight * outputs['fine_grained_loss']
+        # FIBER alignment: use pre-weighted total from FIBERAlignmentLoss
+        # This already includes: itc_weight * ITC + itm_weight * ITM + token_weight * token + regularization
+        if 'fiber_total_loss' in outputs:
+            total_loss = total_loss + alignment_weight * outputs['fiber_total_loss']
+        else:
+            # Baseline alignment: weight individual losses
+            if 'alignment_loss' in outputs:
+                total_loss = total_loss + alignment_weight * outputs['alignment_loss']
+            
+            if 'itm_loss' in outputs and not torch.isnan(outputs['itm_loss']):
+                itm_weight = _get_training_attr('itm_loss_weight', 0.5)
+                total_loss = total_loss + itm_weight * outputs['itm_loss']
+            
+            if 'token_loss' in outputs and not torch.isnan(outputs['token_loss']):
+                token_weight = _get_training_attr('token_loss_weight', 0.3)
+                total_loss = total_loss + token_weight * outputs['token_loss']
+            
+            if 'fine_grained_loss' in outputs:
+                fg_weight = _get_training_attr('fine_grained_loss_weight', 0.5)
+                total_loss = total_loss + fg_weight * outputs['fine_grained_loss']
         
         # Memory losses
         if use_memory and 'memory_kl' in outputs:
