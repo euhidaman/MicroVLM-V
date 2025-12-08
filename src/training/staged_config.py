@@ -70,7 +70,7 @@ class TrainingConfig:
     # Logging
     log_interval: int = 50
     save_interval: int = 100
-    visualize_interval: int = 150  # Save attention visualizations every N steps
+    visualize_interval: int = 300  # Save attention visualizations every N steps
     viz_save_interval: int = 5000  # Save full attention visualizations every N steps
 
     # Early Stopping (loss-based convergence detection)
@@ -188,7 +188,7 @@ class Stage1Config(TrainingConfig):
 
     # Visualization settings
     log_interval: int = 25  # More frequent logging to track loss
-    visualize_interval: int = 150  # Save attention visualizations every 150 steps
+    visualize_interval: int = 300  # Save attention visualizations every 300 steps
     viz_save_interval: int = 5000
     num_viz_images: int = 3  # Number of images to visualize
 

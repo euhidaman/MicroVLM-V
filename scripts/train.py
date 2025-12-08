@@ -1219,8 +1219,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         global_step += 1
 
-        # Step-based checkpointing (every 150 steps) on main process only
-        if is_main_process and global_step % 150 == 0:
+        # Step-based checkpointing (every 300 steps) on main process only
+        # Only save periodic checkpoints before force_continue_steps threshold
+        force_continue_steps = getattr(config, 'force_continue_steps', 1500)
+        if is_main_process and global_step % 300 == 0 and global_step <= force_continue_steps:
             save_step_checkpoint(
                 model=model,
                 optimizer=optimizer,
