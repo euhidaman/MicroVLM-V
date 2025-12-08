@@ -1494,12 +1494,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             dummy_labels = viz_input_ids.clone()
                             
                             # Full forward pass to compute attention for viz samples
-                            # Note: alignment_mode is a class attribute, not a forward() parameter
+                            # Disable memory to avoid dimension mismatches with small viz batch
                             viz_outputs = viz_model(
                                 images=viz_images,
                                 input_ids=viz_input_ids,
                                 attention_mask=viz_attention_mask,
-                                labels=dummy_labels
+                                labels=dummy_labels,
+                                use_memory=False  # Disable memory for viz - avoids dim mismatch
                             )
                             
                             # Now get_text_to_patch_attention() returns attention for viz samples
