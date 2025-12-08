@@ -353,7 +353,8 @@ def save_step_checkpoint(model, optimizer, global_step, config, stage_name="defa
         'model_state_dict': model.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'config': vars(config),
-        'stage_name': stage_name
+        'stage_name': stage_name,
+        'alignment_mode': getattr(config, 'alignment_mode', 'baseline')
     }, checkpoint_path)
 
     print(f"💾 Step checkpoint saved: {checkpoint_path}")
@@ -390,7 +391,8 @@ def save_best_alignment_checkpoint(model, optimizer, global_step, config, stage_
         'optimizer_state_dict': optimizer.state_dict(),
         'stage_name': stage_name,
         'config': vars(config),
-        'best_correct_sim': correct_sim
+        'best_correct_sim': correct_sim,
+        'alignment_mode': getattr(config, 'alignment_mode', 'baseline')
     }, checkpoint_path)
 
     print(f"✅ Saved best-alignment checkpoint ({correct_sim:.4f}) -> {checkpoint_path}")
@@ -2298,14 +2300,41 @@ def main():
         if is_main_process:
             print(f"Resuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=config.device)
-        # Handle DDP/DP wrapped models
+        
+        # Check if checkpoint has alignment_mode metadata
+        ckpt_alignment_mode = checkpoint.get('alignment_mode', None)
+        if ckpt_alignment_mode and ckpt_alignment_mode != args.alignment_mode:
+            if is_main_process:
+                print(f"⚠️  Warning: Checkpoint alignment_mode='{ckpt_alignment_mode}' differs from current='{args.alignment_mode}'")
+                print(f"   This may cause loading issues. Consider using --alignment_mode {ckpt_alignment_mode}")
+        
+        # Handle DDP/DP wrapped models - use strict=False to allow partial loading
+        state_dict = checkpoint['model_state_dict']
         if hasattr(model, 'module'):
-            model.module.load_state_dict(checkpoint['model_state_dict'])
+            missing, unexpected = model.module.load_state_dict(state_dict, strict=False)
         else:
-            model.load_state_dict(checkpoint['model_state_dict'])
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        start_epoch = checkpoint['epoch']
-        global_step = checkpoint['global_step']
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        
+        # Report any mismatched keys (but don't crash)
+        if is_main_process and (missing or unexpected):
+            if missing:
+                print(f"   ℹ️  Missing keys (new modules): {len(missing)} keys")
+            if unexpected:
+                print(f"   ℹ️  Unexpected keys (removed modules): {len(unexpected)} keys")
+        
+        # Load optimizer state (may fail if architecture changed significantly)
+        try:
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except Exception as e:
+            if is_main_process:
+                print(f"   ⚠️  Could not restore optimizer state (architecture changed): {e}")
+                print(f"   Starting with fresh optimizer state")
+        
+        start_epoch = checkpoint.get('epoch', 0)
+        global_step = checkpoint.get('global_step', 0)
+        
+        if is_main_process:
+            print(f"   ✓ Resumed from epoch {start_epoch}, step {global_step}")
 
     # Start carbon/compute tracking
     if carbon_tracker is not None:
