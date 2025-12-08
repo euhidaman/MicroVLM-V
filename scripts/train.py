@@ -275,6 +275,71 @@ def _unique_path(path: Path) -> Path:
         counter += 1
 
 
+def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type="step", correct_sim=None):
+    """
+    Push a checkpoint to HuggingFace Hub.
+    
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        global_step: Current training step
+        config: Training config with HF settings
+        checkpoint_type: "step" or "best"
+        correct_sim: Best alignment similarity (for best checkpoints)
+    """
+    try:
+        # Get HF token
+        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+        if not hf_token:
+            try:
+                from huggingface_hub import HfFolder
+                hf_token = HfFolder.get_token()
+            except:
+                pass
+        
+        if not hf_token:
+            print("   ⚠️ No HF token - skipping HuggingFace upload")
+            return False
+        
+        # Get repo config
+        repo_name = getattr(config, 'hf_repo_name', 'MicroVLM-V')
+        username = getattr(config, 'hf_username', 'euhidaman')
+        repo_id = f"{username}/{repo_name}"
+        
+        api = HfApi()
+        
+        # Ensure repo exists
+        try:
+            api.create_repo(repo_id=repo_id, token=hf_token, exist_ok=True, repo_type="model")
+        except Exception:
+            pass  # Repo likely exists
+        
+        # Determine path in repo
+        checkpoint_name = Path(checkpoint_path).name
+        if checkpoint_type == "best":
+            path_in_repo = f"checkpoints/best/{checkpoint_name}"
+            commit_msg = f"Best alignment checkpoint (step {global_step}, sim={correct_sim:.4f})"
+        else:
+            path_in_repo = f"checkpoints/step_{global_step}/{checkpoint_name}"
+            commit_msg = f"Step {global_step} checkpoint"
+        
+        # Upload
+        print(f"   🤗 Uploading to HuggingFace: {path_in_repo}")
+        api.upload_file(
+            path_or_fileobj=str(checkpoint_path),
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_msg,
+            token=hf_token
+        )
+        print(f"   ✅ Uploaded to https://huggingface.co/{repo_id}")
+        return True
+        
+    except Exception as e:
+        print(f"   ⚠️ HuggingFace upload failed: {e}")
+        return False
+
+
 def save_step_checkpoint(model, optimizer, global_step, config, stage_name="default"):
     """Save checkpoint at fixed step intervals without overwriting previous ones."""
     checkpoint_dir = Path(config.output_dir) / "checkpoints"
@@ -292,6 +357,10 @@ def save_step_checkpoint(model, optimizer, global_step, config, stage_name="defa
     }, checkpoint_path)
 
     print(f"💾 Step checkpoint saved: {checkpoint_path}")
+    
+    # Push to HuggingFace
+    push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type="step")
+    
     return checkpoint_path
 
 
@@ -325,6 +394,10 @@ def save_best_alignment_checkpoint(model, optimizer, global_step, config, stage_
     }, checkpoint_path)
 
     print(f"✅ Saved best-alignment checkpoint ({correct_sim:.4f}) -> {checkpoint_path}")
+    
+    # Push to HuggingFace as best checkpoint
+    push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type="best", correct_sim=correct_sim)
+    
     return checkpoint_path
 
 
