@@ -270,6 +270,7 @@ def ensure_alignment_tracking_state(config):
     config._alignment_negative_steps = 0
     config._best_alignment_checkpoint = None
     config._last_alignment_save_step = -9999  # cooldown tracker
+    config._best_alignment_found = False
 
 
 def save_best_alignment_checkpoint(model, optimizer, global_step, config, stage_name, correct_sim):
@@ -309,6 +310,14 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
     stop_threshold = getattr(config, 'alignment_stop_threshold', 0.0)
     save_best = getattr(config, 'save_best_alignment_checkpoint', True)
     save_cooldown = getattr(config, 'alignment_save_cooldown', 100)
+    min_stop_steps = getattr(config, 'alignment_min_stop_steps', 0)
+    force_continue = getattr(config, 'force_continue', False)
+    force_continue_steps = getattr(config, 'force_continue_steps', 0)
+
+    # Minimum stopping step logic (alignment-based)
+    effective_min_stop = max(min_stop_steps, force_continue_steps if force_continue else 0)
+    if global_step < effective_min_stop:
+        return 0
 
     improved = correct_sim > (config._best_alignment_sim + min_delta)
     if improved:
@@ -316,6 +325,7 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
         config._best_alignment_step = global_step
         config._alignment_no_improve_steps = 0
         config._alignment_negative_steps = 0
+        config._best_alignment_found = True
 
         # Only persist checkpoint if cooldown has elapsed
         steps_since_save = global_step - config._last_alignment_save_step
@@ -353,6 +363,10 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
         print("\n⚠️  Alignment early stop: similarity stayed below threshold")
         print(f"   Threshold: {stop_threshold}, patience: {negative_patience} steps")
         return 2
+
+    # If force-continue is enabled and no best has been found yet, keep going
+    if force_continue and not config._best_alignment_found:
+        return 0
 
     return 0
 
@@ -1762,6 +1776,10 @@ def main():
     parser.add_argument('--alignment_mode', type=str, default='baseline',
                         choices=['baseline', 'fiber'],
                         help='Alignment mode: baseline (prefix-only) or fiber (fusion-in-backbone)')
+    parser.add_argument('--force-continue', action='store_true',
+                        help='If set, continue training until force_continue_steps even if best is found early')
+    parser.add_argument('--force-continue-steps', type=int, default=1500,
+                        help='Minimum steps to continue training when --force-continue is set (default: 1500)')
     parser.add_argument('--fiber_layers', type=str, default='6,8,10',
                         help='Comma-separated list of vision encoder layers for FIBER fusion (default: 6,8,10)')
     parser.add_argument('--itc_weight', type=float, default=1.0,
@@ -2003,6 +2021,10 @@ def main():
 
     if getattr(config, 'alignment_early_stop', False):
         ensure_alignment_tracking_state(config)
+
+    # Force-continue settings (only applied when flag is provided)
+    config.force_continue = bool(getattr(args, 'force_continue', False))
+    config.force_continue_steps = getattr(args, 'force_continue_steps', 0) if config.force_continue else 0
 
     # Initialize FLOPs estimation for carbon tracker
     if carbon_tracker is not None and is_main_process:

@@ -86,6 +86,8 @@ class TrainingConfig:
     alignment_negative_patience: int = 100
     save_best_alignment_checkpoint: bool = True
     alignment_save_cooldown: int = 100  # min steps between best-checkpoint saves
+    alignment_min_stop_steps: int = 0  # do not stop on alignment before this step
+    alignment_min_stop_steps: int = 0  # do not stop on alignment before this step
 
     # WandB
     use_wandb: bool = True
@@ -182,6 +184,7 @@ class Stage1Config(TrainingConfig):
     alignment_stop_threshold: float = 0.0
     alignment_negative_patience: int = 75
     alignment_save_cooldown: int = 100  # min steps between best-checkpoint saves
+    alignment_min_stop_steps: int = 1000  # allow training until step 1000 before stopping
 
     # Visualization settings
     log_interval: int = 25  # More frequent logging to track loss
