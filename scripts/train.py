@@ -1465,7 +1465,33 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             viz_attention_mask = fixed_samples['attention_mask'][:num_samples].to(
                                 text_device)
 
-                        # Handle both baseline (2 returns) and FIBER (4 returns) models
+                        # CRITICAL FIX: Run a full forward pass with viz samples to compute
+                        # the correct text-to-patch attention for THESE specific images.
+                        # Previously we were using attention from the training batch!
+                        text_to_patch_attn = None
+                        try:
+                            # Create dummy labels for forward pass (we only need attention, not loss)
+                            dummy_labels = viz_input_ids.clone()
+                            
+                            # Full forward pass to compute attention for viz samples
+                            viz_outputs = viz_model(
+                                images=viz_images,
+                                input_ids=viz_input_ids,
+                                attention_mask=viz_attention_mask,
+                                labels=dummy_labels,
+                                alignment_mode='fiber'  # Force fiber mode for text-to-patch attention
+                            )
+                            
+                            # Now get_text_to_patch_attention() returns attention for viz samples
+                            if hasattr(viz_model, 'get_text_to_patch_attention'):
+                                text_to_patch_attn = viz_model.get_text_to_patch_attention()
+                                if text_to_patch_attn is not None:
+                                    text_to_patch_attn = text_to_patch_attn[:num_samples].detach()
+                        except Exception as exc:
+                            print(f"Warning: unable to compute text-to-patch attention for viz samples: {exc}")
+                            text_to_patch_attn = None
+
+                        # Get prefix tokens and text embeddings for fallback attention
                         viz_encode_result = viz_model.encode_image(viz_images)
                         if len(viz_encode_result) == 4:
                             viz_prefix_tokens, _, _, _ = viz_encode_result
@@ -1473,6 +1499,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             viz_prefix_tokens, _ = viz_encode_result
                         viz_text_embeddings, _ = viz_model.encode_text(
                             viz_input_ids, viz_attention_mask)
+                        
+                        # Compute fallback embedding-based attention for stats
                         attention_from_lm = None
                         try:
                             # Temporarily set attention implementation to eager for visualization
@@ -1521,36 +1549,33 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             viz_prefix_tokens, viz_text_embeddings, attention_weights=attention_from_lm
                         )
 
-                        if not hasattr(visualizer, '_caption_tokenizer'):
-                            from transformers import AutoTokenizer
-                            tokenizer_name = getattr(config, 'text_model', None) or getattr(
-                                config, 'qwen_model', None)
-                            if tokenizer_name is None:
-                                raise ValueError(
-                                    "No text model or tokenizer specified in config")
-                            visualizer._caption_tokenizer = AutoTokenizer.from_pretrained(
-                                tokenizer_name)
-                        tokenizer = visualizer._caption_tokenizer
-                        captions = []
-                        for i in range(num_samples):
-                            if viz_attention_mask is not None:
-                                valid_len = int(
-                                    viz_attention_mask[i].sum().item())
-                                token_ids = viz_input_ids[i][:valid_len].tolist(
-                                )
-                            else:
-                                token_ids = viz_input_ids[i].tolist()
-                            caption = tokenizer.decode(
-                                token_ids, skip_special_tokens=True)
-                            captions.append(
-                                caption if caption.strip() else "(empty caption)")
-
-                        # Get text-to-patch attention if available (much better for visualization)
-                        text_to_patch_attn = None
-                        if hasattr(viz_model, 'get_text_to_patch_attention'):
-                            text_to_patch_attn = viz_model.get_text_to_patch_attention()
-                            if text_to_patch_attn is not None:
-                                text_to_patch_attn = text_to_patch_attn[:num_samples]
+                        # Get captions: prefer stored captions from fixed_samples, else decode
+                        captions = fixed_samples.get('captions', None)
+                        if captions is None or len(captions) < num_samples:
+                            if not hasattr(visualizer, '_caption_tokenizer'):
+                                from transformers import AutoTokenizer
+                                tokenizer_name = getattr(config, 'text_model', None) or getattr(
+                                    config, 'qwen_model', None)
+                                if tokenizer_name is None:
+                                    raise ValueError(
+                                        "No text model or tokenizer specified in config")
+                                visualizer._caption_tokenizer = AutoTokenizer.from_pretrained(
+                                    tokenizer_name)
+                            tokenizer = visualizer._caption_tokenizer
+                            captions = []
+                            for i in range(num_samples):
+                                if viz_attention_mask is not None:
+                                    valid_len = int(
+                                        viz_attention_mask[i].sum().item())
+                                    token_ids = viz_input_ids[i][:valid_len].tolist()
+                                else:
+                                    token_ids = viz_input_ids[i].tolist()
+                                caption = tokenizer.decode(
+                                    token_ids, skip_special_tokens=True)
+                                captions.append(
+                                    caption if caption.strip() else "(empty caption)")
+                        else:
+                            captions = captions[:num_samples]
 
                         sbs_path = Path(config.output_dir) / "visualizations" / \
                             f"attention_sidebyside_step_{global_step}.png"
