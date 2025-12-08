@@ -52,6 +52,7 @@ class TrainingConfig:
 
     # Alignment
     use_alignment: bool = True
+    alignment_mode: str = 'baseline'  # 'baseline' or 'fiber'
     alignment_temperature: float = 0.07
     freeze_vision: bool = False
     freeze_language: bool = True
@@ -132,6 +133,7 @@ class Stage1Config(TrainingConfig):
     - Max 5 epochs is safety cap (rarely reached with early stopping)
     """
     # Override defaults for Stage 1
+    alignment_mode: str = 'fiber'  # Use FIBER fusion for alignment
     use_memory: bool = False  # Disable memory in Stage 1
     num_epochs: int = 5  # Max epochs (early stopping usually triggers earlier)
     # Lower LR for stable contrastive learning (CLIP uses 5e-4 for full model)
@@ -203,6 +205,7 @@ class Stage2Config(TrainingConfig):
     Based on Larimar methodology
     """
     # Override defaults for Stage 2
+    alignment_mode: str = 'fiber'  # Must match Stage 1 checkpoint
     use_memory: bool = True  # Enable memory in Stage 2
     episode_size: int = 4  # Longer episodes for memory learning
     num_epochs: int = 5

@@ -2024,6 +2024,13 @@ def main():
         config = load_config(args.config)
         if is_main_process:
             print(f"Loaded configuration: {args.config}")
+    
+    # Use config's alignment_mode if user didn't explicitly override via CLI
+    # (CLI default is 'baseline', but stage configs may specify 'fiber')
+    if hasattr(config, 'alignment_mode') and args.alignment_mode == 'baseline':
+        args.alignment_mode = config.alignment_mode
+        if is_main_process:
+            print(f"Using alignment_mode from config: {args.alignment_mode}")
 
     # Create output directories
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
