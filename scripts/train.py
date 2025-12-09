@@ -2331,7 +2331,9 @@ def main():
         
         # Filter memory keys if transitioning from Stage 1 (no memory) to Stage 2 (with memory)
         if not ckpt_use_memory and current_use_memory:
-            memory_keys = [k for k in state_dict.keys() if 'episodic_memory' in k or 'scope_detector' in k]
+            # Match any key containing memory-related module names
+            memory_patterns = ['episodic_memory', 'scope_detector', 'memory_mean', 'memory_logvar', 'ben_cohen', 'w_logvar', 'lstm_z', 'W_M']
+            memory_keys = [k for k in state_dict.keys() if any(p in k for p in memory_patterns)]
             keys_to_remove.extend(memory_keys)
             if memory_keys and is_main_process:
                 print(f"   🔄 Stage transition: filtering {len(memory_keys)} untrained memory keys")
