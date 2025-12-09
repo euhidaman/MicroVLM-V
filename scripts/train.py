@@ -2050,6 +2050,16 @@ def main():
     with open(model_config_path, 'r') as f:
         model_config = json.load(f)
 
+    # Ensure memory_dim matches current language hidden size to avoid stale configs
+    model_dims = model_config.get('model_dimensions', {})
+    lang_hidden = model_dims.get('language_hidden_size')
+    mem_dim = model_dims.get('memory_dim')
+    if lang_hidden and mem_dim and lang_hidden != mem_dim:
+        if is_main_process:
+            print(f"⚠️  model_config memory_dim ({mem_dim}) != language_hidden_size ({lang_hidden}). Forcing match.")
+        model_dims['memory_dim'] = lang_hidden
+        model_config['model_dimensions'] = model_dims
+
     # Create run name
     run_name, run_counter = create_run_name(args.config)
     if hasattr(config, 'wandb_run_name') and config.wandb_run_name:
