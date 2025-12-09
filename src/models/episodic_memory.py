@@ -102,13 +102,19 @@ class EpisodicMemory(nn.Module):
         # Ordering: LSTM for sequential context (reduced for compact model)
         self.use_ordering = True
         if self.use_ordering:
+            lstm_hidden = self.code_size // 4  # Reduced from //2 for compact model
+            lstm_output_dim = lstm_hidden * 2  # Bidirectional doubles the output
             self.lstm_z = nn.LSTM(
                 input_size=self.code_size,
-                hidden_size=self.code_size // 4,  # Reduced from //2 for compact model
+                hidden_size=lstm_hidden,
                 num_layers=1,  # Reduced from 2 for compact model
                 bidirectional=True,
                 batch_first=True
             )
+            # Project LSTM output back to code_size
+            self.lstm_proj = nn.Linear(lstm_output_dim, self.code_size)
+            nn.init.xavier_uniform_(self.lstm_proj.weight)
+            nn.init.zeros_(self.lstm_proj.bias)
         
         self._init_weights()
     
@@ -363,8 +369,9 @@ class EpisodicMemory(nn.Module):
         if self.use_ordering:
             # LSTM requires float32
             z_for_lstm = z.transpose(0, 1).float()  # (batch_size, episode_size, code_size)
-            z, _ = self.lstm_z(z_for_lstm)  # (batch_size, episode_size, code_size)
-            z = z.transpose(0, 1)  # (episode_size, batch_size, code_size)
+            z_lstm, _ = self.lstm_z(z_for_lstm)  # (batch_size, episode_size, lstm_output_dim)
+            z_lstm = self.lstm_proj(z_lstm)  # Project back to (batch_size, episode_size, code_size)
+            z = z_lstm.transpose(0, 1)  # (episode_size, batch_size, code_size)
             z = z.to(self.compute_dtype)
         
         # Get prior with matching dtype
