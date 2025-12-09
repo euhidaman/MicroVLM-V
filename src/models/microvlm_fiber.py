@@ -126,6 +126,13 @@ class MicroVLM_FIBER(nn.Module):
         )
         
         # Episodic memory
+        # Debug: print memory config to diagnose dimension mismatch
+        mem_dim = config.get('memory_dim', 896)
+        lang_hidden = config.get('language_hidden_size', 896)
+        print(f"🔍 EpisodicMemory config: memory_dim={mem_dim}, language_hidden_size={lang_hidden}")
+        if mem_dim != lang_hidden:
+            print(f"   ⚠️ MISMATCH! Forcing memory_dim to {lang_hidden}")
+            config['memory_dim'] = lang_hidden
         self.episodic_memory = EpisodicMemory(config)
         
         if quantize_memory_158bit:

@@ -37,6 +37,14 @@ class EpisodicMemory(nn.Module):
         self.memory_size = config.get('memory_size', 64)  # K_mem (reduced from 512)
         self.code_size = config.get('memory_dim', 896)  # C_mem (matches Qwen hidden)
         self.qwen_hidden_dim = config.get('qwen_hidden_dim', 896)
+        
+        # Validate dimension match - code_size must match language hidden for fused embeddings
+        lang_hidden = config.get('language_hidden_size', 896)
+        if self.code_size != lang_hidden:
+            print(f"⚠️ EpisodicMemory: code_size ({self.code_size}) != language_hidden ({lang_hidden})")
+            print(f"   Forcing code_size = {lang_hidden} to avoid dimension mismatch")
+            self.code_size = lang_hidden
+        
         # W_M projection targets fewer layers/heads for size reduction
         self.num_layers = config.get('memory_num_layers', 6)  # Reduced from 24
         self.num_heads = config.get('memory_num_heads', 4)    # Reduced from 14

@@ -2361,11 +2361,25 @@ def main():
             if k in state_dict:
                 del state_dict[k]
         
+        # Debug: Print memory_mean shape BEFORE loading
+        if is_main_process:
+            base = model.module if hasattr(model, 'module') else model
+            if hasattr(base, 'episodic_memory'):
+                mem_shape = base.episodic_memory.memory_mean.shape
+                print(f"   🔍 Memory shape BEFORE load: {mem_shape} (code_size={mem_shape[1]})")
+        
         # Handle DDP/DP wrapped models - use strict=False to allow partial loading
         if hasattr(model, 'module'):
             missing, unexpected = model.module.load_state_dict(state_dict, strict=False)
         else:
             missing, unexpected = model.load_state_dict(state_dict, strict=False)
+        
+        # Debug: Print memory_mean shape AFTER loading
+        if is_main_process:
+            base = model.module if hasattr(model, 'module') else model
+            if hasattr(base, 'episodic_memory'):
+                mem_shape = base.episodic_memory.memory_mean.shape
+                print(f"   🔍 Memory shape AFTER load: {mem_shape} (code_size={mem_shape[1]})")
         
         # Report any mismatched keys (but don't crash)
         if is_main_process and (missing or unexpected):
