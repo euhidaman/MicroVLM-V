@@ -211,7 +211,7 @@ class Stage2Config(TrainingConfig):
     num_epochs: int = 10  # More epochs for memory learning
     learning_rate: float = 1e-4  # Lower LR with memory
     warmup_steps: int = 1000
-    batch_size: int = 64
+    batch_size: int = 96  # Increased from 64 to utilize more GPU memory
     num_workers: int = 12
 
     # Keep vision/language frozen, train adapter + memory
