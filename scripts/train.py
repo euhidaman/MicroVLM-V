@@ -2142,6 +2142,14 @@ def main():
         quantize_4bit = getattr(config, 'quantize_language_4bit', True)
         quantize_memory_158bit = getattr(config, 'quantize_memory_158bit', False)
         
+        # Debug: Print critical dimensions before model creation
+        if is_main_process:
+            dims = model_config['model_dimensions']
+            print(f"   🔍 Model dimensions from config:")
+            print(f"      - memory_dim: {dims.get('memory_dim', 'NOT SET')}")
+            print(f"      - language_hidden_size: {dims.get('language_hidden_size', 'NOT SET')}")
+            print(f"      - memory_size: {dims.get('memory_size', 'NOT SET')}")
+        
         model = create_microvlm_fiber(
             config=model_config['model_dimensions'],
             vision_checkpoint=getattr(
