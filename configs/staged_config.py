@@ -149,6 +149,16 @@ class Stage2Config:
     contrastive_loss_weight: float = 0.1
     alignment_loss_weight: float = 0.1
     
+    # Sliding Window Early Stopping
+    use_sliding_window_early_stop: bool = True
+    sliding_window_size: int = 300  # Number of steps in window
+    sliding_window_min_delta: float = 0.002  # Minimum improvement threshold
+    sliding_window_patience_steps: int = 3000  # Steps without improvement before stopping
+
+    # HuggingFace Auto-Push on Early Stop
+    push_to_hf_on_stop: bool = True
+    hf_stage2_repo_name: str = "MicroVLM-V-stage2-final"
+
     # Frozen components
     freeze_vision_encoder: bool = True
     freeze_language_model: bool = False  # Unfreeze for fine-tuning

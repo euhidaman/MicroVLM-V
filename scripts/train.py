@@ -1440,6 +1440,15 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
 
+                # Sliding window early stopping metrics
+                if sliding_window_stopper is not None:
+                    sw_status = sliding_window_stopper.get_status()
+                    wandb_logger.log_metrics({
+                        'sliding_window/best_window_loss': sw_status['best_window_loss'],
+                        'sliding_window/current_window_loss': sw_status['current_window_loss'],
+                        'sliding_window/steps_without_improvement': sw_status['steps_without_improvement'],
+                    }, step=global_step)
+
             # Legacy simple logging (fallback)
             elif wandb_run:
                 # Build metrics dict with safe access
@@ -1759,6 +1768,29 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
             model.train()
 
+        # ===== Sliding Window Early Stopping =====
+        # Check sliding window early stopping after each batch
+        if sliding_window_stopper is not None and is_main_process:
+            should_stop = sliding_window_stopper.add_loss(loss.item(), global_step)
+            if should_stop:
+                # Log final metrics
+                stopper_status = sliding_window_stopper.get_status()
+                stopper_status['final_lr'] = optimizer.param_groups[0]['lr']
+                stopper_status['final_epoch'] = epoch
+
+                if wandb_logger:
+                    wandb_logger.log_metrics({
+                        'early_stopping/triggered': 1.0,
+                        'early_stopping/stop_step': global_step,
+                        'early_stopping/best_window_loss': stopper_status['best_window_loss'],
+                        'early_stopping/current_window_loss': stopper_status['current_window_loss'],
+                        'early_stopping/steps_without_improvement': stopper_status['steps_without_improvement'],
+                    }, step=global_step)
+
+                # Return with sliding window stop signal
+                avg_loss = total_loss / max(batch_idx + 1, 1)
+                return avg_loss, global_step, 'sliding_window_plateau', stopper_status
+
         # Remove step-based checkpointing (only save at end of epoch)
 
     # End epoch tracking for carbon tracker
@@ -1769,7 +1801,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             wandb_logger.log_metrics(epoch_wandb_metrics, step=global_step)
 
     avg_loss = total_loss / len(train_loader)
-    return avg_loss, global_step, None
+    return avg_loss, global_step, None, None
 
 
 def count_parameters(model):
@@ -1777,8 +1809,7 @@ def count_parameters(model):
     # Handle DDP/DataParallel wrapped models
     base_model = model.module if hasattr(model, 'module') else model
     total_params = sum(p.numel() for p in base_model.parameters())
-    trainable_params = sum(p.numel()
-                           for p in base_model.parameters() if p.requires_grad)
+    trainable_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
     frozen_params = total_params - trainable_params
     return {
         'total': total_params,
@@ -2425,6 +2456,23 @@ def main():
         if is_main_process:
             print(f"\n📉 Early Stopping: patience={loss_early_stopper.patience}, min_delta={loss_early_stopper.min_delta}")
 
+    # Initialize sliding window early stopping (for step-based early stopping)
+    sliding_window_stopper = None
+    use_sliding_window = getattr(config, 'use_sliding_window_early_stop', False)
+    if use_sliding_window:
+        sliding_window_stopper = SlidingWindowEarlyStopping(
+            window_size=getattr(config, 'sliding_window_size', 300),
+            min_delta=getattr(config, 'sliding_window_min_delta', 0.002),
+            patience_steps=getattr(config, 'sliding_window_patience_steps', 3000),
+            verbose=is_main_process
+        )
+        if is_main_process:
+            print(f"\n🪟 Sliding Window Early Stopping:")
+            print(f"   Window size: {sliding_window_stopper.window_size} steps")
+            print(f"   Min delta: {sliding_window_stopper.min_delta}")
+            print(f"   Patience: {sliding_window_stopper.patience_steps} steps")
+            print(f"   Auto-push to HF: {getattr(config, 'push_to_hf_on_stop', True)}")
+
     # Training loop
     if is_main_process:
         print(f"Starting training for up to {config.num_epochs} epochs...")
@@ -2439,7 +2487,7 @@ def main():
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
         
-        avg_loss, global_step, stop_reason = train_epoch(
+        result = train_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
@@ -2453,9 +2501,17 @@ def main():
             is_distributed=is_distributed,
             is_main_process=is_main_process,
             carbon_tracker=carbon_tracker,
-            attention_monitor=attention_monitor
+            attention_monitor=attention_monitor,
+            sliding_window_stopper=sliding_window_stopper
         )
-        
+
+        # Unpack results (handle both old and new formats)
+        if len(result) == 4:
+            avg_loss, global_step, stop_reason, stopper_status = result
+        else:
+            avg_loss, global_step, stop_reason = result
+            stopper_status = None
+
         # Handle early stopping reason
         if stop_reason:
             if is_main_process:
@@ -2466,6 +2522,11 @@ def main():
                     print("   Reason: Alignment similarity plateaued")
                 elif stop_reason == 'alignment_negative':
                     print("   Reason: Alignment similarity stayed below threshold")
+                elif stop_reason == 'sliding_window_plateau':
+                    print("   Reason: Sliding window plateau - no meaningful training loss improvement")
+                    if stopper_status:
+                        print(f"   Best window loss: {stopper_status['best_window_loss']:.4f}")
+                        print(f"   Steps without improvement: {stopper_status['steps_without_improvement']}")
                 else:
                     print(f"   Reason: {stop_reason}")
                 print("   Saving final checkpoint before exit...")
@@ -2475,6 +2536,31 @@ def main():
                     f"{args.config}_early_stop"
                 )
                 print(f"   Emergency checkpoint saved: {checkpoint_path}")
+
+                # Handle sliding window early stopping with HF push
+                if stop_reason == 'sliding_window_plateau' and stopper_status:
+                    # Add current step info to training history
+                    training_history.append({
+                        'step': global_step,
+                        'loss': avg_loss,
+                        'lr': optimizer.param_groups[0]['lr'],
+                        'epoch': epoch
+                    })
+
+                    # Automatically push to HuggingFace if enabled
+                    if getattr(config, 'push_to_hf_on_stop', True):
+                        print(f"\n🚀 Automatically pushing Stage 2 final model to HuggingFace...")
+                        success = push_stage2_final_to_hf(
+                            checkpoint_path=checkpoint_path,
+                            config=config,
+                            early_stop_metrics=stopper_status,
+                            training_history=training_history,
+                            model_statistics=stats
+                        )
+                        if success:
+                            print(f"✅ Stage 2 final model successfully uploaded to HuggingFace!")
+                        else:
+                            print(f"⚠️  Failed to push Stage 2 final model to HuggingFace")
 
                 if stop_reason.startswith('alignment') and getattr(config, '_best_alignment_checkpoint', None):
                     print(f"   Best alignment checkpoint: {config._best_alignment_checkpoint}")
