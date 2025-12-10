@@ -151,9 +151,9 @@ class Stage2Config:
     
     # Sliding Window Early Stopping
     use_sliding_window_early_stop: bool = True
-    sliding_window_size: int = 300  # Number of steps in window
-    sliding_window_min_delta: float = 0.002  # Minimum improvement threshold
-    sliding_window_patience_steps: int = 3000  # Steps without improvement before stopping
+    sliding_window_size: int = 1000  # Number of steps in window (larger = more stable, ignores short-term noise)
+    sliding_window_min_delta: float = 0.01  # Minimum improvement threshold (0.01 = requires real progress beyond noise)
+    sliding_window_patience_steps: int = 2000  # Steps without improvement before stopping (reduced for faster stopping)
 
     # HuggingFace Auto-Push on Early Stop
     push_to_hf_on_stop: bool = True
