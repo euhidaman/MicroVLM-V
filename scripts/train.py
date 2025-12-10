@@ -93,6 +93,102 @@ class EarlyStopping:
         }
 
 
+class SlidingWindowEarlyStopping:
+    """
+    Sliding-window based early stopping using only training loss.
+    Stops training when no meaningful improvement is detected over a sliding window.
+    """
+
+    def __init__(self, window_size=300, min_delta=0.002, patience_steps=3000, verbose=True):
+        """
+        Args:
+            window_size: Number of steps to consider in each window
+            min_delta: Minimum loss improvement threshold to count as meaningful
+            patience_steps: Number of steps without improvement before stopping
+            verbose: Print status messages
+        """
+        self.window_size = window_size
+        self.min_delta = min_delta
+        self.patience_steps = patience_steps
+        self.verbose = verbose
+
+        self.loss_history = []  # Store all losses
+        self.best_window_loss = float('inf')
+        self.steps_without_improvement = 0
+        self.total_steps = 0
+        self.best_step = 0
+
+    def add_loss(self, loss_value, current_step):
+        """
+        Add a new loss value and check if training should stop.
+
+        Args:
+            loss_value: Current training loss
+            current_step: Current global step
+
+        Returns:
+            bool: True if training should stop (plateau detected)
+        """
+        self.loss_history.append(loss_value)
+        self.total_steps = current_step
+
+        # Only start checking after we have enough data for one window
+        if len(self.loss_history) < self.window_size:
+            return False
+
+        # Calculate current window loss (average of last window_size steps)
+        current_window = self.loss_history[-self.window_size:]
+        current_window_loss = sum(current_window) / len(current_window)
+
+        # Check if this is an improvement
+        improvement = self.best_window_loss - current_window_loss
+
+        if improvement >= self.min_delta:
+            # Meaningful improvement detected
+            self.best_window_loss = current_window_loss
+            self.steps_without_improvement = 0
+            self.best_step = current_step
+            if self.verbose:
+                print(f"  [SlidingWindow] Loss improved to {current_window_loss:.6f} (Δ={improvement:.6f})")
+        else:
+            # No meaningful improvement
+            self.steps_without_improvement += 1
+
+            if self.verbose and self.steps_without_improvement % 100 == 0:
+                print(f"  [SlidingWindow] No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
+                print(f"     Current window: {current_window_loss:.6f}, Best: {self.best_window_loss:.6f}, Δ={improvement:.6f}")
+
+        # Check if patience exceeded
+        if self.steps_without_improvement >= self.patience_steps:
+            if self.verbose:
+                print(f"\n🛑 SLIDING WINDOW PLATEAU DETECTED")
+                print(f"   No meaningful improvement for {self.patience_steps} steps")
+                print(f"   Best window loss: {self.best_window_loss:.6f} at step {self.best_step}")
+                print(f"   Current window loss: {current_window_loss:.6f}")
+                print(f"   Training stopped at step {current_step}\n")
+            return True
+
+        return False
+
+    def get_status(self):
+        """Get current status for logging"""
+        # Calculate current window loss if we have enough data
+        current_window_loss = self.best_window_loss
+        if len(self.loss_history) >= self.window_size:
+            current_window = self.loss_history[-self.window_size:]
+            current_window_loss = sum(current_window) / len(current_window)
+
+        return {
+            'best_window_loss': self.best_window_loss,
+            'current_window_loss': current_window_loss,
+            'steps_without_improvement': self.steps_without_improvement,
+            'total_steps': self.total_steps,
+            'best_step': self.best_step,
+            'window_size': self.window_size,
+            'patience_steps': self.patience_steps,
+        }
+
+
 def count_parameters(model):
     """Count total and trainable parameters"""
     # Handle DDP/DataParallel wrapped models
@@ -898,6 +994,247 @@ def push_to_huggingface(checkpoint_path, stats, epoch, total_epochs, stage_name,
         return False
 
 
+def push_stage2_final_to_hf(checkpoint_path, config, early_stop_metrics, training_history=None, model_statistics=None):
+    """
+    Push Stage 2 final model to a separate HuggingFace repository after early stopping.
+
+    Args:
+        checkpoint_path: Path to the final checkpoint
+        config: Training configuration
+        early_stop_metrics: Dictionary with early stopping metrics
+        training_history: List of training history entries
+        model_statistics: Model statistics dictionary
+
+    Returns:
+        bool: True if successful, False otherwise
+    """
+    try:
+        # Get HF token
+        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+        if not hf_token:
+            try:
+                from huggingface_hub import HfFolder
+                hf_token = HfFolder.get_token()
+            except:
+                pass
+
+        if not hf_token:
+            print("⚠️  Warning: No HuggingFace token found.")
+            print("   Run: huggingface-cli login")
+            return False
+
+        # Get Stage 2 specific repo name
+        stage2_repo_name = getattr(config, 'stage2_hf_repo_name', None)
+        if not stage2_repo_name:
+            # Default naming: add -stage2-final suffix
+            base_repo = getattr(config, 'hf_repo_name', 'MicroVLM-V')
+            stage2_repo_name = f"{base_repo}-stage2-final"
+
+        username = getattr(config, 'hf_username', 'euhidaman')
+        repo_id = f"{username}/{stage2_repo_name}"
+
+        print(f"\n🤗 Uploading Stage 2 Final Model to HuggingFace: {repo_id}")
+
+        # Create repo
+        api = HfApi()
+        try:
+            api.create_repo(
+                repo_id=repo_id,
+                token=hf_token,
+                exist_ok=True,
+                repo_type="model",
+                private=getattr(config, 'hf_private', False)
+            )
+            print(f"   ✓ Repository ready: https://huggingface.co/{repo_id}")
+        except Exception as e:
+            print(f"   ℹ Repository check: {e}")
+
+        # Generate Stage 2 specific model card
+        model_card = f"""---
+license: apache-2.0
+tags:
+- vision-language
+- multimodal
+- vision
+- microvlm
+- stage2
+- early-stopped
+language:
+- en
+library_name: pytorch
+pipeline_tag: image-text-to-text
+---
+
+# MicroVLM-V Stage 2 Final Model (Auto-Stopped)
+
+🔬 **Experimental Vision-Language Model** - Stage 2 Training Complete
+
+## 🛑 Early Stopping Information
+
+This model was automatically stopped using **Sliding Window Plateau Detection**.
+
+**Stop Reason:** `{early_stop_metrics.get('stop_reason', 'sliding_window_plateau')}`
+
+### Training Metrics at Stop
+
+- **Best Window Loss:** `{early_stop_metrics.get('best_window_loss', 'N/A'):.6f}`
+- **Current Window Loss:** `{early_stop_metrics.get('current_window_loss', 'N/A'):.6f}`
+- **Steps Without Improvement:** `{early_stop_metrics.get('steps_without_improvement', 'N/A')}`
+- **Total Training Steps:** `{early_stop_metrics.get('total_steps', 'N/A')}`
+- **Best Step:** `{early_stop_metrics.get('best_step', 'N/A')}`
+- **Final Learning Rate:** `{early_stop_metrics.get('final_lr', 'N/A')}`
+- **Final Epoch:** `{early_stop_metrics.get('final_epoch', 'N/A')}`
+
+### Early Stopping Configuration
+
+- **Window Size:** `{early_stop_metrics.get('window_size', 'N/A')}` steps
+- **Min Delta:** `{early_stop_metrics.get('min_delta', 'N/A')}`
+- **Patience:** `{early_stop_metrics.get('patience_steps', 'N/A')}` steps
+
+## 📊 Model Statistics
+"""
+
+        if model_statistics:
+            model_card += f"""
+- **Total Parameters:** {model_statistics.get('total_parameters', 'N/A'):,}
+- **Trainable Parameters:** {model_statistics.get('trainable_parameters', 'N/A'):,}
+- **Trainable %:** {model_statistics.get('trainable_percentage', 'N/A'):.2f}%
+"""
+
+        model_card += f"""
+## 🎯 Stage 2 Training
+
+Stage 2 focuses on:
+- Vision-language alignment with episodic memory
+- Caption generation capabilities
+- Multi-modal understanding
+
+## 📈 Training History
+
+"""
+
+        if training_history and len(training_history) > 0:
+            model_card += "Last 10 training checkpoints:\n\n"
+            model_card += "| Epoch | Step | Loss | LR |\n"
+            model_card += "|-------|------|------|----|\n"
+            for entry in training_history[-10:]:
+                model_card += f"| {entry.get('epoch', 'N/A')} | {entry.get('step', 'N/A')} | {entry.get('loss', 'N/A'):.6f} | {entry.get('lr', 'N/A'):.2e} |\n"
+
+        model_card += f"""
+
+## 🚀 Usage
+
+```python
+import torch
+from transformers import AutoTokenizer
+
+# Load checkpoint
+checkpoint = torch.load('model.pt', map_location='cpu')
+model = checkpoint['model']  # Or reconstruct from state_dict
+
+# Load tokenizer
+tokenizer = AutoTokenizer.from_pretrained('Qwen/Qwen2.5-0.5B-Instruct')
+
+# Inference
+model.eval()
+with torch.no_grad():
+    outputs = model(images=image_tensor, input_ids=input_ids, attention_mask=attention_mask)
+```
+
+## ⚠️ Limitations
+
+- This is a Stage 2 checkpoint - capabilities are limited to vision-language alignment
+- Training was automatically stopped due to loss plateau
+- Model may benefit from Stage 3 training (language model fine-tuning)
+
+## 📜 License
+
+Apache 2.0
+
+---
+
+*Model automatically uploaded by sliding window early stopping mechanism*
+
+*Stopped at: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}*
+"""
+
+        # Save model card locally
+        readme_path = Path(checkpoint_path).parent / "README_stage2_final.md"
+        with open(readme_path, 'w', encoding='utf-8') as f:
+            f.write(model_card)
+        print(f"   ✓ Generated Stage 2 final model card")
+
+        # Save comprehensive metrics JSON
+        metrics_json_path = Path(checkpoint_path).parent / "stage2_final_metrics.json"
+        metrics_data = {
+            'early_stop_metrics': early_stop_metrics,
+            'model_statistics': model_statistics,
+            'training_history': training_history[-20:] if training_history else [],
+            'timestamp': datetime.now().isoformat(),
+            'config': {
+                'stage': 'stage2',
+                'sliding_window_size': early_stop_metrics.get('window_size'),
+                'sliding_window_min_delta': early_stop_metrics.get('min_delta'),
+                'sliding_window_patience': early_stop_metrics.get('patience_steps'),
+            }
+        }
+
+        with open(metrics_json_path, 'w') as f:
+            json.dump(metrics_data, f, indent=2)
+        print(f"   ✓ Saved comprehensive metrics")
+
+        # Create consistent model filename
+        import shutil
+        model_pt_path = Path(checkpoint_path).parent / "stage2_final_model.pt"
+        shutil.copy(checkpoint_path, model_pt_path)
+
+        # Upload files
+        commit_message = f"Stage 2 Final Model - Auto-stopped at step {early_stop_metrics.get('total_steps')}"
+
+        print(f"   ⏳ Uploading stage2_final_model.pt...")
+        api.upload_file(
+            path_or_fileobj=str(model_pt_path),
+            path_in_repo="model.pt",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+
+        print(f"   ⏳ Uploading metrics...")
+        api.upload_file(
+            path_or_fileobj=str(metrics_json_path),
+            path_in_repo="stage2_final_metrics.json",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+
+        print(f"   ⏳ Uploading README...")
+        api.upload_file(
+            path_or_fileobj=str(readme_path),
+            path_in_repo="README.md",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+
+        # Cleanup temporary files
+        model_pt_path.unlink(missing_ok=True)
+
+        print(f"   ✅ Successfully uploaded Stage 2 final model!")
+        print(f"   🔗 View at: https://huggingface.co/{repo_id}")
+        return True
+
+    except Exception as e:
+        print(f"❌ Error pushing Stage 2 final model to HuggingFace: {e}")
+        import traceback
+        traceback.print_exc()
+        return False
+
+
 def setup_wandb(config, run_name):
     """Initialize WandB logging"""
     if config.use_wandb:
@@ -1138,7 +1475,7 @@ def compute_gradient_flow_metrics(model):
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, wandb_run=None, wandb_logger=None,
                 is_distributed=False, is_main_process=True, carbon_tracker=None,
-                attention_monitor=None):
+                attention_monitor=None, sliding_window_stopper=None):
     """Train for one epoch
     
     Args:
@@ -1156,6 +1493,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         is_main_process: Whether this is the main process (rank 0)
         carbon_tracker: CarbonComputeTracker for emissions/FLOPs tracking
         attention_monitor: AttentionQualityMonitor for tracking attention quality
+        sliding_window_stopper: SlidingWindowEarlyStopping object for plateau detection
     """
     model.train()
 
