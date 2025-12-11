@@ -235,12 +235,34 @@ class Stage2Config(TrainingConfig):
 
     # Stage 2 output directory and HF repo
     output_dir: str = "./checkpoints/stage2"
-    hf_repo_name: str = "MicroVLM-V-stage2"
+    hf_repo_name: str = "MicroVLM-V-stage2"  # Separate repo for Stage 2
 
     # Early stopping for Stage 2 (loss-based)
     use_early_stopping: bool = True
     early_stop_patience: int = 3  # More patience for memory learning
     early_stop_min_delta: float = 0.005  # Smaller delta for finer convergence
+
+    # Sliding Window Early Stopping (step-based, robust to noisy losses)
+    use_sliding_window_early_stop: bool = True
+    sliding_window_size: int = 1000  # 1000 steps per window
+    sliding_window_min_delta: float = 0.05  # Loss must improve by at least 0.05 (handles 1.31-1.67 range)
+    sliding_window_patience_steps: int = 3000  # Stop after 3000 steps without improvement
+    sliding_window_eval_interval: int = 100  # Evaluate every 100 steps
+    sliding_window_num_eval_windows: int = 8  # Need 8 flat windows to confirm plateau
+    sliding_window_variance_threshold: float = 0.01  # Max variance for stable window
+
+    # Auto-push to HuggingFace on early stop
+    push_to_hf_on_stop: bool = True
+
+    # Checkpoint saving
+    checkpoint_interval: int = 500  # Save checkpoint every 500 steps
+
+    # Best Stage 2 Model Tracking (multi-metric optimization)
+    track_best_stage2: bool = True  # Enable best model tracking
+    best_stage2_metrics: list = None  # Will be set to default metrics if None
+    best_stage2_weights: dict = None  # Metric weights for composite score
+    best_stage2_save_interval: int = 100  # Check for best model every N steps
+    best_stage2_min_improvement: float = 0.01  # Minimum improvement to save new best
 
     # Visualization
     visualize_interval: int = 100

@@ -95,28 +95,30 @@ class EarlyStopping:
 
 class SlidingWindowEarlyStopping:
     """
-    Robust sliding-window based early stopping with variance and trend analysis.
-    Stops training when loss plateaus or becomes noisy without meaningful improvement.
+    Simplified sliding-window based early stopping for training loss plateau detection.
+    Maintains a moving average window and stops when no meaningful improvement occurs.
+
+    Suitable for noisy loss signals (e.g., losses varying between 1.3-1.7).
     """
 
-    def __init__(self, window_size=500, min_delta=0.003, patience_steps=1500,
-                 eval_interval=100, num_eval_windows=8, variance_threshold=0.005, verbose=True):
+    def __init__(self, window_size=1000, min_delta=0.05, patience_steps=3000,
+                 eval_interval=100, num_eval_windows=8, variance_threshold=0.01, verbose=True):
         """
         Args:
-            window_size: Number of steps to consider in each window (increased for stability)
-            min_delta: Minimum loss improvement threshold (tuned based on typical noise)
-            patience_steps: Number of steps without improvement before stopping (reduced for promptness)
-            eval_interval: Steps between evaluation windows
-            num_eval_windows: Number of consecutive flat/increasing windows required to stop
-            variance_threshold: Maximum variance increase tolerated before flagging noise
+            window_size: Number of steps to consider in moving average window (default: 1000)
+            min_delta: Minimum loss improvement threshold (default: 0.05 for losses in 1.3-1.7 range)
+            patience_steps: Number of steps without improvement before stopping (default: 3000)
+            eval_interval: Kept for backward compatibility (unused in simplified version)
+            num_eval_windows: Kept for backward compatibility (unused in simplified version)
+            variance_threshold: Kept for backward compatibility (unused in simplified version)
             verbose: Print status messages
         """
         self.window_size = window_size
         self.min_delta = min_delta
         self.patience_steps = patience_steps
-        self.eval_interval = eval_interval
-        self.num_eval_windows = num_eval_windows
-        self.variance_threshold = variance_threshold
+        self.eval_interval = eval_interval  # Kept for config compatibility
+        self.num_eval_windows = num_eval_windows  # Kept for config compatibility
+        self.variance_threshold = variance_threshold  # Kept for config compatibility
         self.verbose = verbose
 
         self.loss_history = []
@@ -125,15 +127,10 @@ class SlidingWindowEarlyStopping:
         self.total_steps = 0
         self.best_step = 0
 
-        # Track evaluation windows for trend analysis
-        self.eval_window_losses = []
-        self.eval_window_variances = []
-        self.flat_window_count = 0
-
     def add_loss(self, loss_value, current_step):
         """
         Add a new loss value and check if training should stop.
-        Uses variance and trend checks to be robust against noisy loss signals.
+        Simplified logic: tracks moving average and stops when no improvement over patience period.
 
         Args:
             loss_value: Current training loss
@@ -149,21 +146,10 @@ class SlidingWindowEarlyStopping:
         if len(self.loss_history) < self.window_size:
             return False
 
-        # Calculate current window statistics
+        # Calculate current window average
         current_window = self.loss_history[-self.window_size:]
         current_window_loss = sum(current_window) / len(current_window)
         current_window_variance = sum((x - current_window_loss)**2 for x in current_window) / len(current_window)
-
-        # Periodic evaluation window check
-        if current_step % self.eval_interval == 0:
-            self.eval_window_losses.append(current_window_loss)
-            self.eval_window_variances.append(current_window_variance)
-
-            # Keep only recent evaluation windows
-            max_windows = self.num_eval_windows * 3
-            if len(self.eval_window_losses) > max_windows:
-                self.eval_window_losses = self.eval_window_losses[-max_windows:]
-                self.eval_window_variances = self.eval_window_variances[-max_windows:]
 
         # Check if this is a meaningful improvement
         improvement = self.best_window_loss - current_window_loss
@@ -172,52 +158,27 @@ class SlidingWindowEarlyStopping:
             # Meaningful improvement detected - reset counters
             self.best_window_loss = current_window_loss
             self.steps_without_improvement = 0
-            self.flat_window_count = 0
             self.best_step = current_step
             if self.verbose and current_step % 100 == 0:
-                print(f"  [RobustEarlyStop] Loss improved to {current_window_loss:.6f} (Δ={improvement:.6f}, var={current_window_variance:.6f})")
+                print(f"  [SlidingWindow] Loss improved to {current_window_loss:.4f} (Δ={improvement:.4f}, var={current_window_variance:.4f})")
         else:
             # No meaningful improvement
             self.steps_without_improvement += 1
 
-            # Check for sustained plateau using evaluation windows
-            if len(self.eval_window_losses) >= self.num_eval_windows:
-                recent_windows = self.eval_window_losses[-self.num_eval_windows:]
-                recent_variances = self.eval_window_variances[-self.num_eval_windows:]
+            if self.verbose and current_step % 100 == 0:
+                print(f"  [SlidingWindow] No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
+                print(f"     Current: {current_window_loss:.4f}, Best: {self.best_window_loss:.4f}, Δ={improvement:.4f}")
 
-                # Check if loss is flat or increasing over recent evaluation windows
-                is_flat_or_increasing = all(
-                    recent_windows[i] >= recent_windows[0] - self.min_delta
-                    for i in range(1, len(recent_windows))
-                )
-
-                # Check if variance is acceptable (not too noisy)
-                avg_variance = sum(recent_variances) / len(recent_variances)
-                is_variance_acceptable = avg_variance < self.variance_threshold
-
-                if is_flat_or_increasing:
-                    self.flat_window_count += 1
-                else:
-                    self.flat_window_count = 0
-
-                if self.verbose and current_step % 200 == 0:
-                    print(f"  [RobustEarlyStop] No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
-                    print(f"     Current: {current_window_loss:.6f}, Best: {self.best_window_loss:.6f}, Δ={improvement:.6f}")
-                    print(f"     Flat windows: {self.flat_window_count}/{self.num_eval_windows}, Variance: {avg_variance:.6f}")
-
-        # Stop if patience exceeded AND we have sustained flat/increasing trend
-        should_stop = (
-            self.steps_without_improvement >= self.patience_steps and
-            self.flat_window_count >= self.num_eval_windows
-        )
+        # Stop if patience exceeded
+        should_stop = self.steps_without_improvement >= self.patience_steps
 
         if should_stop:
             if self.verbose:
-                print(f"\n🛑 ROBUST EARLY STOPPING TRIGGERED")
-                print(f"   No meaningful improvement for {self.patience_steps} steps")
-                print(f"   Sustained plateau detected over {self.flat_window_count} evaluation windows")
-                print(f"   Best window loss: {self.best_window_loss:.6f} at step {self.best_step}")
-                print(f"   Current window loss: {current_window_loss:.6f}")
+                print(f"\n🛑 SLIDING WINDOW EARLY STOPPING TRIGGERED")
+                print(f"   No meaningful improvement (Δ >= {self.min_delta}) for {self.patience_steps} steps")
+                print(f"   Best window loss: {self.best_window_loss:.4f} at step {self.best_step}")
+                print(f"   Current window loss: {current_window_loss:.4f}")
+                print(f"   Loss improvement: {improvement:.4f} (below threshold {self.min_delta})")
                 print(f"   Training stopped at step {current_step}\n")
             return True
 
@@ -238,11 +199,225 @@ class SlidingWindowEarlyStopping:
             'current_window_loss': current_window_loss,
             'current_window_variance': current_window_variance,
             'steps_without_improvement': self.steps_without_improvement,
-            'flat_window_count': self.flat_window_count,
             'total_steps': self.total_steps,
             'best_step': self.best_step,
             'window_size': self.window_size,
             'patience_steps': self.patience_steps,
+            'min_delta': self.min_delta,
+            'stop_reason': 'sliding_window_plateau',
+        }
+
+
+class BestStage2ModelTracker:
+    """
+    Tracks the best Stage 2 model based on multiple metrics (not just loss).
+    Maintains a 'best-stage2' checkpoint that gets updated when improvements occur.
+
+    Metrics considered:
+    - Training loss (lower is better)
+    - Memory KL divergence (lower is better, indicates better memory usage)
+    - Alignment loss (lower is better, indicates better vision-language alignment)
+    - Gradient stability (lower variance is better)
+    - Learning progress (consistent improvement trend)
+    """
+
+    def __init__(self, metrics=None, weights=None, min_improvement=0.01,
+                 save_interval=100, verbose=True):
+        """
+        Args:
+            metrics: List of metric names to track (default: ['loss', 'memory_kl', 'alignment_loss'])
+            weights: Dict of metric weights for composite score (default: equal weights)
+            min_improvement: Minimum improvement in composite score to save new best
+            save_interval: Steps between best model checks
+            verbose: Print status messages
+        """
+        # Default metrics for Stage 2 optimization
+        if metrics is None:
+            metrics = ['loss', 'memory_kl', 'alignment_loss', 'gradient_norm']
+
+        # Default equal weights, normalized to sum to 1.0
+        if weights is None:
+            weights = {m: 1.0 / len(metrics) for m in metrics}
+
+        self.metrics = metrics
+        self.weights = weights
+        self.min_improvement = min_improvement
+        self.save_interval = save_interval
+        self.verbose = verbose
+
+        # Tracking state
+        self.best_composite_score = float('inf')  # Lower is better
+        self.best_metrics = {}
+        self.best_step = 0
+        self.best_checkpoint_path = None
+        self.metric_history = {m: [] for m in metrics}
+        self.checks_without_improvement = 0
+
+        # Normalization ranges (will be updated dynamically)
+        self.metric_ranges = {m: {'min': float('inf'), 'max': float('-inf')} for m in metrics}
+
+    def update_metric_ranges(self, metrics_dict):
+        """Update min/max ranges for normalization"""
+        for metric_name in self.metrics:
+            if metric_name in metrics_dict:
+                value = metrics_dict[metric_name]
+                if value is not None and not math.isnan(value) and not math.isinf(value):
+                    self.metric_ranges[metric_name]['min'] = min(
+                        self.metric_ranges[metric_name]['min'], value)
+                    self.metric_ranges[metric_name]['max'] = max(
+                        self.metric_ranges[metric_name]['max'], value)
+
+    def normalize_metric(self, metric_name, value):
+        """Normalize metric to [0, 1] range using observed min/max"""
+        if value is None or math.isnan(value) or math.isinf(value):
+            return 1.0  # Worst score for invalid values
+
+        min_val = self.metric_ranges[metric_name]['min']
+        max_val = self.metric_ranges[metric_name]['max']
+
+        # If range not established yet, return raw value
+        if min_val == float('inf') or max_val == float('-inf'):
+            return value
+
+        # Avoid division by zero
+        if max_val == min_val:
+            return 0.0
+
+        # Normalize to [0, 1] where 0 is best (min value)
+        normalized = (value - min_val) / (max_val - min_val)
+        return max(0.0, min(1.0, normalized))
+
+    def compute_composite_score(self, metrics_dict):
+        """
+        Compute weighted composite score from multiple metrics.
+        Lower score is better.
+        """
+        score = 0.0
+        valid_metrics = 0
+
+        for metric_name in self.metrics:
+            if metric_name in metrics_dict:
+                value = metrics_dict[metric_name]
+                if value is not None and not math.isnan(value) and not math.isinf(value):
+                    # Normalize and weight
+                    normalized = self.normalize_metric(metric_name, value)
+                    weight = self.weights.get(metric_name, 1.0 / len(self.metrics))
+                    score += normalized * weight
+                    valid_metrics += 1
+
+        # If no valid metrics, return worst score
+        if valid_metrics == 0:
+            return float('inf')
+
+        return score
+
+    def check_and_update(self, metrics_dict, model, optimizer, global_step, config, stage_name="stage2"):
+        """
+        Check if current metrics represent a new best model.
+        If so, save and push to HuggingFace.
+
+        Args:
+            metrics_dict: Dictionary with current metric values
+            model: Model to save
+            optimizer: Optimizer to save
+            global_step: Current training step
+            config: Training config
+            stage_name: Stage name for checkpoint
+
+        Returns:
+            bool: True if new best model was saved
+        """
+        # Only check at specified intervals
+        if global_step % self.save_interval != 0:
+            return False
+
+        # Update metric ranges for normalization
+        self.update_metric_ranges(metrics_dict)
+
+        # Compute composite score
+        current_score = self.compute_composite_score(metrics_dict)
+
+        # Check if this is an improvement
+        improvement = self.best_composite_score - current_score
+
+        if improvement >= self.min_improvement:
+            # New best model found!
+            self.best_composite_score = current_score
+            self.best_metrics = {k: v for k, v in metrics_dict.items() if k in self.metrics}
+            self.best_step = global_step
+            self.checks_without_improvement = 0
+
+            # Save best checkpoint
+            checkpoint_path = self._save_best_checkpoint(
+                model, optimizer, global_step, config, stage_name, metrics_dict
+            )
+            self.best_checkpoint_path = checkpoint_path
+
+            if self.verbose:
+                print(f"\n✨ NEW BEST STAGE 2 MODEL at step {global_step}!")
+                print(f"   Composite score: {current_score:.6f} (improvement: {improvement:.6f})")
+                print(f"   Metrics:")
+                for metric_name in self.metrics:
+                    if metric_name in metrics_dict:
+                        value = metrics_dict[metric_name]
+                        if value is not None:
+                            normalized = self.normalize_metric(metric_name, value)
+                            print(f"     {metric_name}: {value:.6f} (normalized: {normalized:.4f})")
+                print(f"   Saved: {checkpoint_path}\n")
+
+            return True
+        else:
+            self.checks_without_improvement += 1
+
+            if self.verbose and global_step % (self.save_interval * 5) == 0:
+                print(f"  [BestTracker] No improvement for {self.checks_without_improvement} checks")
+                print(f"     Current score: {current_score:.6f}, Best: {self.best_composite_score:.6f}")
+
+        return False
+
+    def _save_best_checkpoint(self, model, optimizer, global_step, config, stage_name, metrics_dict):
+        """Save best Stage 2 checkpoint and push to HuggingFace"""
+        checkpoint_dir = Path(config.output_dir) / "checkpoints"
+        checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+        # Always use same filename for best checkpoint (overwrites previous best)
+        checkpoint_path = checkpoint_dir / "best-stage2-checkpoint.pt"
+
+        # Save checkpoint
+        torch.save({
+            'global_step': global_step,
+            'model_state_dict': model.state_dict(),
+            'optimizer_state_dict': optimizer.state_dict(),
+            'config': vars(config),
+            'stage_name': stage_name,
+            'alignment_mode': getattr(config, 'alignment_mode', 'baseline'),
+            'best_metrics': self.best_metrics,
+            'composite_score': self.best_composite_score,
+            'all_metrics': metrics_dict,
+        }, checkpoint_path)
+
+        print(f"💾 Best Stage 2 checkpoint saved: {checkpoint_path}")
+
+        # Push to HuggingFace in checkpoints/best-stage2/ folder
+        push_checkpoint_to_hf(
+            checkpoint_path=checkpoint_path,
+            global_step=global_step,
+            config=config,
+            checkpoint_type="best-stage2",
+            correct_sim=self.best_composite_score  # Use composite score
+        )
+
+        return checkpoint_path
+
+    def get_status(self):
+        """Get current best model tracking status"""
+        return {
+            'best_composite_score': self.best_composite_score,
+            'best_metrics': self.best_metrics,
+            'best_step': self.best_step,
+            'best_checkpoint_path': str(self.best_checkpoint_path) if self.best_checkpoint_path else None,
+            'checks_without_improvement': self.checks_without_improvement,
+            'metric_ranges': self.metric_ranges,
         }
 
 
@@ -471,6 +646,9 @@ def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type=
         if checkpoint_type == "best":
             path_in_repo = f"checkpoints/best/{checkpoint_name}"
             commit_msg = f"Best alignment checkpoint (step {global_step}, sim={correct_sim:.4f})"
+        elif checkpoint_type == "best-stage2":
+            path_in_repo = f"checkpoints/best-stage2/{checkpoint_name}"
+            commit_msg = f"Best Stage 2 model (step {global_step}, score={correct_sim:.6f})"
         else:
             path_in_repo = f"checkpoints/step_{global_step}/{checkpoint_name}"
             commit_msg = f"Step {global_step} checkpoint"
@@ -1532,7 +1710,7 @@ def compute_gradient_flow_metrics(model):
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, wandb_run=None, wandb_logger=None,
                 is_distributed=False, is_main_process=True, carbon_tracker=None,
-                attention_monitor=None, sliding_window_stopper=None):
+                attention_monitor=None, sliding_window_stopper=None, best_stage2_tracker=None):
     """Train for one epoch
     
     Args:
@@ -1551,6 +1729,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         carbon_tracker: CarbonComputeTracker for emissions/FLOPs tracking
         attention_monitor: AttentionQualityMonitor for tracking attention quality
         sliding_window_stopper: SlidingWindowEarlyStopping object for plateau detection
+        best_stage2_tracker: BestStage2ModelTracker for tracking optimal Stage 2 model
     """
     model.train()
 
@@ -1689,18 +1868,62 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         global_step += 1
 
-        # Step-based checkpointing (every 300 steps) on main process only
-        # Only save periodic checkpoints before force_continue_steps threshold
-        force_continue_steps = getattr(config, 'force_continue_steps', 1500)
-        if is_main_process and global_step % 300 == 0 and global_step <= force_continue_steps:
-            save_step_checkpoint(
+        # Check for best Stage 2 model (main process only)
+        if best_stage2_tracker is not None and is_main_process:
+            # Prepare metrics dictionary for evaluation
+            current_metrics = {
+                'loss': loss.item(),
+                'gradient_norm': total_norm,
+            }
+
+            # Add optional metrics if available
+            if memory_kl_val is not None:
+                current_metrics['memory_kl'] = memory_kl_val.item()
+            if alignment_loss_val is not None:
+                current_metrics['alignment_loss'] = alignment_loss_val.item()
+            if itc_loss_val is not None:
+                current_metrics['itc_loss'] = itc_loss_val.item()
+            if itm_loss_val is not None:
+                current_metrics['itm_loss'] = itm_loss_val.item()
+
+            # Check and update best model
+            stage_name = getattr(config, 'stage_name', 'stage2')
+            best_stage2_tracker.check_and_update(
+                metrics_dict=current_metrics,
                 model=model,
                 optimizer=optimizer,
                 global_step=global_step,
                 config=config,
-                stage_name=getattr(config, 'stage_name', 'default')
+                stage_name=stage_name
             )
-        
+
+        # Step-based checkpointing (every 500 steps) on main process only
+        # Save checkpoints throughout training for Stage 2
+        checkpoint_interval = getattr(config, 'checkpoint_interval', 500)
+        stage_name = getattr(config, 'stage_name', 'default')
+
+        # For Stage 2, always save checkpoints every 500 steps
+        if is_main_process and global_step % checkpoint_interval == 0:
+            if 'stage2' in stage_name.lower():
+                save_step_checkpoint(
+                    model=model,
+                    optimizer=optimizer,
+                    global_step=global_step,
+                    config=config,
+                    stage_name=stage_name
+                )
+            else:
+                # For other stages, only save before force_continue threshold
+                force_continue_steps = getattr(config, 'force_continue_steps', 1500)
+                if global_step <= force_continue_steps:
+                    save_step_checkpoint(
+                        model=model,
+                        optimizer=optimizer,
+                        global_step=global_step,
+                        config=config,
+                        stage_name=stage_name
+                    )
+
         # Alignment-specific tracking (Stage 1)
         alignment_stop_code = 0
         alignment_stats = outputs.get('alignment_stats')
@@ -1835,7 +2058,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
 
-                # Robust sliding window early stopping metrics
+                # Sliding window early stopping metrics
                 if sliding_window_stopper is not None:
                     sw_status = sliding_window_stopper.get_status()
                     wandb_logger.log_metrics({
@@ -1843,7 +2066,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         'sliding_window/current_window_loss': sw_status['current_window_loss'],
                         'sliding_window/current_window_variance': sw_status['current_window_variance'],
                         'sliding_window/steps_without_improvement': sw_status['steps_without_improvement'],
-                        'sliding_window/flat_window_count': sw_status['flat_window_count'],
+                        'sliding_window/min_delta_threshold': sw_status['min_delta'],
                     }, step=global_step)
 
             # Legacy simple logging (fallback)
@@ -2186,7 +2409,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             'early_stopping/best_window_loss': stopper_status['best_window_loss'],
                             'early_stopping/current_window_loss': stopper_status['current_window_loss'],
                             'early_stopping/steps_without_improvement': stopper_status['steps_without_improvement'],
-                            'early_stopping/flat_window_count': stopper_status['flat_window_count'],
+                            'early_stopping/min_delta': stopper_status['min_delta'],
                         }, step=global_step)
 
             # Broadcast stop decision from rank 0 to all other ranks
@@ -2890,14 +3113,38 @@ def main():
             verbose=is_main_process
         )
         if is_main_process:
-            print(f"\n🪟 Robust Sliding Window Early Stopping:")
+            print(f"\n🪟 Sliding Window Early Stopping:")
             print(f"   Window size: {sliding_window_stopper.window_size} steps")
-            print(f"   Min delta: {sliding_window_stopper.min_delta}")
+            print(f"   Min delta: {sliding_window_stopper.min_delta} (loss must improve by at least this amount)")
             print(f"   Patience: {sliding_window_stopper.patience_steps} steps")
-            print(f"   Eval interval: {sliding_window_stopper.eval_interval} steps")
-            print(f"   Required flat windows: {sliding_window_stopper.num_eval_windows}")
-            print(f"   Variance threshold: {sliding_window_stopper.variance_threshold}")
             print(f"   Auto-push to HF: {getattr(config, 'push_to_hf_on_stop', True)}")
+
+    # Initialize Best Stage 2 Model Tracker (for optimal model selection)
+    best_stage2_tracker = None
+    track_best_stage2 = getattr(config, 'track_best_stage2', False)
+
+    if track_best_stage2 and args.config == 'stage2':
+        # Get metrics and weights from config
+        metrics = getattr(config, 'best_stage2_metrics', None)
+        weights = getattr(config, 'best_stage2_weights', None)
+        save_interval = getattr(config, 'best_stage2_save_interval', 100)
+        min_improvement = getattr(config, 'best_stage2_min_improvement', 0.01)
+
+        best_stage2_tracker = BestStage2ModelTracker(
+            metrics=metrics,
+            weights=weights,
+            min_improvement=min_improvement,
+            save_interval=save_interval,
+            verbose=is_main_process
+        )
+
+        if is_main_process:
+            print(f"\n⭐ Best Stage 2 Model Tracking:")
+            print(f"   Metrics: {best_stage2_tracker.metrics}")
+            print(f"   Check interval: {save_interval} steps")
+            print(f"   Min improvement: {min_improvement}")
+            print(f"   Checkpoint: checkpoints/best-stage2/best-stage2-checkpoint.pt")
+            print(f"   HuggingFace path: checkpoints/best-stage2/")
 
     # Training loop with KeyboardInterrupt handling
     if is_main_process:
@@ -2930,7 +3177,8 @@ def main():
                 is_main_process=is_main_process,
                 carbon_tracker=carbon_tracker,
                 attention_monitor=attention_monitor,
-                sliding_window_stopper=sliding_window_stopper
+                sliding_window_stopper=sliding_window_stopper,
+                best_stage2_tracker=best_stage2_tracker
             )
 
             # Unpack results (handle both old and new formats)
@@ -2954,7 +3202,9 @@ def main():
                         print("   Reason: Sliding window plateau - no meaningful training loss improvement")
                         if stopper_status:
                             print(f"   Best window loss: {stopper_status['best_window_loss']:.4f}")
+                            print(f"   Current window loss: {stopper_status['current_window_loss']:.4f}")
                             print(f"   Steps without improvement: {stopper_status['steps_without_improvement']}")
+                            print(f"   Improvement threshold: {stopper_status['min_delta']:.4f}")
                     else:
                         print(f"   Reason: {stop_reason}")
                     print("   Saving final checkpoint before exit...")
@@ -2965,30 +3215,16 @@ def main():
                     )
                     print(f"   Emergency checkpoint saved: {checkpoint_path}")
 
-                    # Handle sliding window early stopping with HF push
-                    if stop_reason == 'sliding_window_plateau' and stopper_status:
-                        # Add current step info to training history
-                        training_history.append({
-                            'step': global_step,
-                            'loss': avg_loss,
-                            'lr': optimizer.param_groups[0]['lr'],
-                            'epoch': epoch
-                        })
-
-                        # Automatically push to HuggingFace if enabled
-                        if getattr(config, 'push_to_hf_on_stop', True):
-                            print(f"\n🚀 Automatically pushing Stage 2 final model to HuggingFace...")
-                            success = push_stage2_final_to_hf(
-                                checkpoint_path=checkpoint_path,
-                                config=config,
-                                early_stop_metrics=stopper_status,
-                                training_history=training_history,
-                                model_statistics=stats
-                            )
-                            if success:
-                                print(f"✅ Stage 2 final model successfully uploaded to HuggingFace!")
-                            else:
-                                print(f"⚠️  Failed to push Stage 2 final model to HuggingFace")
+                    # Show best Stage 2 model info if available
+                    if best_stage2_tracker is not None and best_stage2_tracker.best_checkpoint_path:
+                        print(f"\n⭐ Best Stage 2 Model Information:")
+                        print(f"   Checkpoint: {best_stage2_tracker.best_checkpoint_path}")
+                        print(f"   Step: {best_stage2_tracker.best_step}")
+                        print(f"   Composite Score: {best_stage2_tracker.best_composite_score:.6f}")
+                        print(f"   Best Metrics:")
+                        for metric_name, value in best_stage2_tracker.best_metrics.items():
+                            print(f"     {metric_name}: {value:.6f}")
+                        print(f"   Location on HuggingFace: checkpoints/best-stage2/")
 
                     if stop_reason.startswith('alignment') and getattr(config, '_best_alignment_checkpoint', None):
                         print(f"   Best alignment checkpoint: {config._best_alignment_checkpoint}")
