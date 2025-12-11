@@ -1,14 +1,85 @@
 """
-Quantized Episodic Memory with 1.58-bit Weight Quantization
-Applies BitNet-style quantization during training for memory efficiency
+Quantized Episodic Memory with Mixed-Precision Quantization
+- 1.58-bit for MLP projections (W_M, scope detector)
+- 4-bit for memory slots (memory_mean, memory_logvar)
+Applies BitNet-style quantization with 4-bit memory storage
 """
 
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from .quantize_158bit import quantize_weights_158bit, dequantize_weights_158bit
+from .quantize_158bit import quantize_weights_158bit, dequantize_weights_158bit, quantize_activations_int8
+from .quantize_4bit import quantize_4bit_symmetric, dequantize_4bit_symmetric
 
 EPSILON = 1e-6
+
+
+class QuantizedMemorySlots4bit(nn.Module):
+    """
+    4-bit quantized memory slots for episodic memory
+    Stores memory_mean and memory_logvar in 4-bit precision
+    """
+
+    def __init__(self, memory_size, code_size):
+        super().__init__()
+
+        self.memory_size = memory_size
+        self.code_size = code_size
+
+        # Store quantized memory slots (4-bit stored as int8)
+        self.register_buffer('memory_mean_quantized',
+                           torch.zeros(memory_size, code_size, dtype=torch.int8))
+        self.register_buffer('memory_mean_scale',
+                           torch.ones(memory_size, 1))
+
+        self.register_buffer('memory_logvar_quantized',
+                           torch.zeros(memory_size, code_size, dtype=torch.int8))
+        self.register_buffer('memory_logvar_scale',
+                           torch.ones(memory_size, 1))
+
+    def quantize_memory(self, memory_mean, memory_logvar):
+        """
+        Quantize memory slots to 4-bit
+
+        Args:
+            memory_mean: (memory_size, code_size) float tensor
+            memory_logvar: (memory_size, code_size) float tensor
+        """
+        # Quantize memory_mean per-slot
+        for i in range(self.memory_size):
+            quant, scale = quantize_4bit_symmetric(memory_mean[i], bits=4)
+            self.memory_mean_quantized[i] = quant.to(torch.int8)
+            self.memory_mean_scale[i] = scale.view(1)
+
+        # Quantize memory_logvar per-slot
+        for i in range(self.memory_size):
+            quant, scale = quantize_4bit_symmetric(memory_logvar[i], bits=4)
+            self.memory_logvar_quantized[i] = quant.to(torch.int8)
+            self.memory_logvar_scale[i] = scale.view(1)
+
+    def dequantize_memory(self):
+        """
+        Dequantize memory slots back to float
+
+        Returns:
+            memory_mean: (memory_size, code_size) float tensor
+            memory_logvar: (memory_size, code_size) float tensor
+        """
+        memory_mean = self.memory_mean_quantized.float() * self.memory_mean_scale
+        memory_logvar = self.memory_logvar_quantized.float() * self.memory_logvar_scale
+
+        return memory_mean, memory_logvar
+
+    def get_memory_quantization_stats(self):
+        """Get quantization statistics for monitoring"""
+        return {
+            'memory_mean_scale_mean': self.memory_mean_scale.mean().item(),
+            'memory_mean_scale_std': self.memory_mean_scale.std().item(),
+            'memory_logvar_scale_mean': self.memory_logvar_scale.mean().item(),
+            'memory_logvar_scale_std': self.memory_logvar_scale.std().item(),
+            'memory_bits_per_param': 4.0,
+            'memory_mean_sparsity': (self.memory_mean_quantized == 0).float().mean().item(),
+        }
 
 
 class QuantizedLinear158BitGrad(nn.Module):
@@ -37,6 +108,7 @@ class QuantizedLinear158BitGrad(nn.Module):
     def forward(self, x):
         """
         Forward with straight-through estimator for gradients
+        Uses BitNet-style 1.58-bit weight quantization
         """
         # Quantize weights during forward pass
         quantized_weight, scale = quantize_weights_158bit(self.weight)
@@ -47,30 +119,55 @@ class QuantizedLinear158BitGrad(nn.Module):
             self.quant_error.fill_((self.weight - dequantized_weight).abs().mean())
         
         # Straight-through estimator: forward uses quantized, backward uses full precision
-        # This is done by adding zero in forward but preserving gradients
         quantized_weight_ste = dequantized_weight + (self.weight - self.weight.detach())
         
+        # Optional: quantize activations for full BitNet emulation
+        if self.training:
+            x_quant, act_scale = quantize_activations_int8(x)
+            x = x_quant.float() / act_scale
+
         return F.linear(x, quantized_weight_ste, self.bias)
     
     def get_quantization_stats(self):
         """Return quantization error for monitoring"""
+        quantized_weight, _ = quantize_weights_158bit(self.weight)
+        sparsity = (quantized_weight == 0).float().mean()
+
         return {
             'quant_error': self.quant_error.item(),
-            'weight_sparsity': (self.weight.abs() < 0.1).float().mean().item()
+            'weight_sparsity': sparsity.item(),
+            'bits_per_param': 1.58
         }
 
 
-def apply_158bit_quantization_to_memory(episodic_memory_module):
+def apply_mixed_precision_quantization_to_memory(episodic_memory_module, memory_size, code_size):
     """
-    Replace Linear layers in episodic memory with quantized versions
-    
+    Apply mixed-precision quantization to episodic memory:
+    - 1.58-bit for W_M and scope detector MLPs
+    - 4-bit for memory slots (memory_mean, memory_logvar)
+
     Args:
         episodic_memory_module: EpisodicMemory instance
-    
+        memory_size: number of memory slots
+        code_size: memory code dimension
+
     Returns:
-        Modified module with quantized linear layers
+        Modified module with quantized components
     """
-    # Quantize W_M projection (memory to KV)
+    # Add 4-bit quantized memory slots
+    quantized_memory = QuantizedMemorySlots4bit(memory_size, code_size)
+
+    # If memory already exists, quantize it
+    if hasattr(episodic_memory_module, 'memory_mean'):
+        with torch.no_grad():
+            memory_mean = episodic_memory_module.memory_mean.data
+            memory_logvar = episodic_memory_module.memory_logvar.data
+            quantized_memory.quantize_memory(memory_mean, memory_logvar)
+
+    # Attach to module
+    episodic_memory_module.quantized_memory_slots = quantized_memory
+
+    # Quantize W_M projection with 1.58-bit (memory to KV)
     if hasattr(episodic_memory_module, 'W_M'):
         old_layer = episodic_memory_module.W_M
         new_layer = QuantizedLinear158BitGrad(
@@ -83,7 +180,7 @@ def apply_158bit_quantization_to_memory(episodic_memory_module):
             new_layer.bias.data = old_layer.bias.data.clone()
         episodic_memory_module.W_M = new_layer
     
-    # Quantize ScopeDetector MLP
+    # Quantize ScopeDetector MLP with 1.58-bit
     if hasattr(episodic_memory_module, 'scope_detector'):
         scope_detector = episodic_memory_module.scope_detector
         if hasattr(scope_detector, 'mlp'):
@@ -105,25 +202,31 @@ def apply_158bit_quantization_to_memory(episodic_memory_module):
 
 def get_memory_quantization_stats(episodic_memory_module):
     """
-    Collect quantization statistics from all quantized layers
-    
+    Collect quantization statistics from all quantized components
+
     Args:
         episodic_memory_module: EpisodicMemory with quantized layers
     
     Returns:
-        dict: Statistics for monitoring
+        dict: Statistics for monitoring and WandB logging
     """
     stats = {}
     
-    # W_M stats
+    # 4-bit memory slot stats
+    if hasattr(episodic_memory_module, 'quantized_memory_slots'):
+        memory_stats = episodic_memory_module.quantized_memory_slots.get_memory_quantization_stats()
+        stats.update({f'memory_slots/{k}': v for k, v in memory_stats.items()})
+
+    # 1.58-bit W_M stats
     if hasattr(episodic_memory_module, 'W_M') and isinstance(
         episodic_memory_module.W_M, QuantizedLinear158BitGrad
     ):
         w_m_stats = episodic_memory_module.W_M.get_quantization_stats()
-        stats['W_M_quant_error'] = w_m_stats['quant_error']
-        stats['W_M_sparsity'] = w_m_stats['weight_sparsity']
-    
-    # ScopeDetector stats
+        stats['W_M_158bit/quant_error'] = w_m_stats['quant_error']
+        stats['W_M_158bit/sparsity'] = w_m_stats['weight_sparsity']
+        stats['W_M_158bit/bits_per_param'] = w_m_stats['bits_per_param']
+
+    # 1.58-bit ScopeDetector stats
     if hasattr(episodic_memory_module, 'scope_detector'):
         scope_detector = episodic_memory_module.scope_detector
         if hasattr(scope_detector, 'mlp'):
@@ -136,7 +239,8 @@ def get_memory_quantization_stats(episodic_memory_module):
                     sparsities.append(layer_stats['weight_sparsity'])
             
             if quant_errors:
-                stats['scope_detector_quant_error'] = sum(quant_errors) / len(quant_errors)
-                stats['scope_detector_sparsity'] = sum(sparsities) / len(sparsities)
-    
+                stats['scope_detector_158bit/quant_error'] = sum(quant_errors) / len(quant_errors)
+                stats['scope_detector_158bit/sparsity'] = sum(sparsities) / len(sparsities)
+                stats['scope_detector_158bit/bits_per_param'] = 1.58
+
     return stats

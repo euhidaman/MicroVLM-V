@@ -469,15 +469,17 @@ class WandBLogger:
             
             self.wandb_run.log(metrics, step=global_step)
     
-    def log_memory_heatmap(self, memory_state, addressing_weights, global_step):
+    def log_memory_heatmap(self, memory_state, addressing_weights, global_step, episodic_memory_module=None):
         """
         Create and log episodic memory temporal evolution heatmaps.
         Shows how memory slots evolve across training rather than single snapshots.
+        IMPORTANT: Visualizes QUANTIZED values (4-bit) when quantization is enabled.
 
         Args:
             memory_state: tuple (mean, cov) from episodic memory
             addressing_weights: (episode_size, batch, memory_size)
             global_step: global training step
+            episodic_memory_module: Optional episodic memory module for quantization stats
         """
         if not self.enabled:
             return
@@ -485,9 +487,19 @@ class WandBLogger:
         with torch.no_grad():
             memory_mean, memory_cov = memory_state
             
-            # Memory mean heatmap (memory_size x code_size)
-            memory_mean_np = memory_mean[0].cpu().numpy()  # Take first batch
-            memory_norms = np.linalg.norm(memory_mean_np, axis=1)
+            # Check if memory is quantized and use quantized values for visualization
+            use_quantized = False
+            if episodic_memory_module is not None and hasattr(episodic_memory_module, 'quantized_memory_slots'):
+                use_quantized = True
+                quant_memory = episodic_memory_module.quantized_memory_slots
+                # Use QUANTIZED values (4-bit INT8) for visualization
+                memory_mean_quantized = quant_memory.memory_mean_quantized.cpu().numpy()
+                # Compute norms from quantized values (preserves quantization visibility)
+                memory_norms = np.linalg.norm(memory_mean_quantized, axis=1).astype(np.float32)
+            else:
+                # Fallback to dequantized/full-precision values
+                memory_mean_np = memory_mean[0].cpu().numpy()  # Take first batch
+                memory_norms = np.linalg.norm(memory_mean_np, axis=1)
 
             # Average addressing weights over batch and episode
             addr_weights_np = addressing_weights.mean(dim=1).cpu().numpy()
@@ -512,8 +524,16 @@ class WandBLogger:
                 'memory/min_activation': np.min(memory_norms),
                 'memory/active_slots': np.sum(memory_norms > 0.1),
                 'memory/addressing_entropy': addressing_entropy,
-                'memory/addressing_sparsity': np.sum(avg_addressing < 0.01) / len(avg_addressing)
+                'memory/addressing_sparsity': np.sum(avg_addressing < 0.01) / len(avg_addressing),
+                'memory/is_quantized': 1.0 if use_quantized else 0.0
             }
+
+            # Add quantization-specific metrics if available
+            if use_quantized and episodic_memory_module is not None:
+                from ..quantization.quantized_episodic_memory import get_memory_quantization_stats
+                quant_stats = get_memory_quantization_stats(episodic_memory_module)
+                metrics.update(quant_stats)
+
             self.wandb_run.log(metrics, step=global_step)
             
             # Generate temporal evolution heatmaps when we have multiple snapshots
@@ -614,7 +634,7 @@ class WandBLogger:
         except Exception as e:
             warnings.warn(f"Failed to create temporal evolution visualization: {e}")
 
-    def log_cross_modal_attention(self, attention_weights, global_step, 
+    def log_cross_modal_attention(self, attention_weights, global_step,
                                   text_tokens=None, prefix="alignment"):
         """
         Log cross-modal attention heatmap
