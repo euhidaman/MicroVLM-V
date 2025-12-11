@@ -43,7 +43,7 @@ class QuantizedMemorySlots4bit(nn.Module):
 
         Args:
             memory_mean: (memory_size, code_size) float tensor
-            memory_logvar: (memory_size, code_size) float tensor
+            memory_logvar: (memory_size, code_size) float tensor OR (1,) scalar buffer
         """
         # Quantize memory_mean per-slot
         for i in range(self.memory_size):
@@ -51,11 +51,22 @@ class QuantizedMemorySlots4bit(nn.Module):
             self.memory_mean_quantized[i] = quant.to(torch.int8)
             self.memory_mean_scale[i] = scale.view(1)
 
-        # Quantize memory_logvar per-slot
-        for i in range(self.memory_size):
-            quant, scale = quantize_4bit_symmetric(memory_logvar[i], bits=4)
-            self.memory_logvar_quantized[i] = quant.to(torch.int8)
-            self.memory_logvar_scale[i] = scale.view(1)
+        # Handle memory_logvar: check if it's a scalar buffer (shape (1,)) or full matrix
+        if memory_logvar.numel() == 1:
+            # Scalar buffer case: replicate the single value for all slots
+            scalar_val = memory_logvar.item()
+            for i in range(self.memory_size):
+                # Create a dummy tensor with the scalar value repeated
+                dummy_tensor = torch.full((self.code_size,), scalar_val, device=memory_logvar.device)
+                quant, scale = quantize_4bit_symmetric(dummy_tensor, bits=4)
+                self.memory_logvar_quantized[i] = quant.to(torch.int8)
+                self.memory_logvar_scale[i] = scale.view(1)
+        else:
+            # Full matrix case: quantize per-slot
+            for i in range(self.memory_size):
+                quant, scale = quantize_4bit_symmetric(memory_logvar[i], bits=4)
+                self.memory_logvar_quantized[i] = quant.to(torch.int8)
+                self.memory_logvar_scale[i] = scale.view(1)
 
     def dequantize_memory(self):
         """
@@ -302,4 +313,5 @@ def apply_158bit_quantization_to_memory(module, memory_size=None, code_size=None
             setattr(module, name, quant_layer)
 
     return module
+
 
