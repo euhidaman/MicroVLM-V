@@ -88,7 +88,6 @@ class TrainingConfig:
     save_best_alignment_checkpoint: bool = True
     alignment_save_cooldown: int = 100  # min steps between best-checkpoint saves
     alignment_min_stop_steps: int = 0  # do not stop on alignment before this step
-    alignment_min_stop_steps: int = 0  # do not stop on alignment before this step
 
     # WandB
     use_wandb: bool = True
@@ -251,6 +250,60 @@ class Stage2Config(TrainingConfig):
 
 
 @dataclass
+class Stage3Config(TrainingConfig):
+    """
+    Stage 3: Instruction Tuning
+    Fine-tune on instruction-following data after Stage 2 memory integration
+    """
+    # Override defaults for Stage 3
+    alignment_mode: str = 'fiber'  # Must match Stage 1/2 checkpoints
+    use_memory: bool = True  # Keep memory from Stage 2
+    num_epochs: int = 3
+    learning_rate: float = 1e-5  # Very low LR for instruction tuning
+    warmup_steps: int = 500
+    batch_size: int = 8
+    gradient_accumulation_steps: int = 8  # Effective batch = 64
+    num_workers: int = 4
+    weight_decay: float = 0.01
+    gradient_clip: float = 1.0
+
+    # Loss weights for Stage 3 - INSTRUCTION TUNING ONLY
+    lm_loss_weight: float = 1.0  # Primary objective
+    alignment_loss_weight: float = 0.0  # Disable alignment loss
+    contrastive_loss_weight: float = 0.0  # Disable contrastive
+    fine_grained_loss_weight: float = 0.0  # Disable fine-grained
+    skip_lm_loss: bool = False  # Enable LM forward pass
+
+    # Frozen components - only train language model + adapter
+    freeze_vision: bool = True  # Keep vision frozen
+    freeze_language: bool = False  # Unfreeze language for instruction tuning
+    freeze_adapter: bool = False  # Keep adapter trainable
+    unfreeze_last_n_layers: int = 8  # Unfreeze more layers for instruction tuning
+
+    # Quantization - match Stage 2 settings
+    enable_quantization: bool = True
+    quantize_memory_158bit: bool = True
+    quantize_vision_4bit: bool = False
+    quantize_language_4bit: bool = False
+
+    # Stage 3 output directory
+    output_dir: str = "./checkpoints/stage3"
+    hf_repo_name: str = "MicroVLM-V-stage3-instruct"
+
+    # Early stopping for Stage 3
+    use_early_stopping: bool = True
+    early_stop_patience: int = 2  # Stop quickly if overfitting
+    early_stop_min_delta: float = 0.005
+
+    # Visualization
+    log_interval: int = 50
+    visualize_interval: int = 200
+    viz_save_interval: int = 2000
+
+    wandb_run_name: str = "stage3_instruct"
+
+
+@dataclass
 class TestConfig(TrainingConfig):
     """Quick test configuration for debugging"""
     batch_size: int = 8
@@ -273,7 +326,6 @@ class TestConfig(TrainingConfig):
     device: str = "cuda"
     train_metadata: str = "train_metadata.json"
     val_metadata: str = "val_metadata.json"
-    max_samples: int = 5000
 
 
 @dataclass
@@ -311,7 +363,7 @@ def load_config(config_name: str = "default") -> TrainingConfig:
     Load configuration by name
 
     Args:
-        config_name: One of ['stage1', 'stage2', 'test', 'full_quantized', 'default']
+        config_name: One of ['stage1', 'stage2', 'stage3', 'test', 'full_quantized', 'default']
 
     Returns:
         TrainingConfig instance
@@ -319,6 +371,7 @@ def load_config(config_name: str = "default") -> TrainingConfig:
     configs = {
         'stage1': Stage1Config,
         'stage2': Stage2Config,
+        'stage3': Stage3Config,
         'test': TestConfig,
         'full_quantized': FullQuantizedConfig,
         'default': TrainingConfig,

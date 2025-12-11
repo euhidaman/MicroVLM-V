@@ -22,12 +22,13 @@ def quantize_4bit_symmetric(tensor, bits=4):
     """
     # Compute scale: max absolute value
     qmax = 2 ** (bits - 1) - 1  # 7 for 4-bit
-    scale = tensor.abs().max() / qmax
-    
-    if scale == 0:
-        return torch.zeros_like(tensor), scale
-    
-    # Quantize
+    max_val = tensor.abs().max()
+
+    # CRITICAL: Prevent division by zero with proper epsilon clamping
+    scale = max_val / qmax
+    scale = scale.clamp(min=1e-8)  # Ensure scale is never zero
+
+    # Quantize (scale is guaranteed non-zero)
     quantized = torch.round(tensor / scale).clamp(-qmax - 1, qmax)
     
     return quantized, scale
@@ -68,13 +69,11 @@ class FakeQuantize4bit(nn.Module):
         Returns:
             quantized: fake-quantized tensor (maintains gradients)
         """
-        # Compute scale
-        scale = x.abs().max() / self.qmax
-        
-        if scale == 0:
-            return x
-        
-        # Quantize and dequantize
+        # Compute scale with safe minimum
+        max_val = x.abs().max()
+        scale = (max_val / self.qmax).clamp(min=1e-8)
+
+        # Quantize and dequantize (scale is guaranteed non-zero)
         quantized = torch.round(x / scale).clamp(-self.qmax - 1, self.qmax)
         dequantized = quantized * scale
         
