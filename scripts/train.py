@@ -2911,151 +2911,151 @@ def main():
 
     try:
         for epoch in range(start_epoch, config.num_epochs):
-        # Set epoch for distributed sampler (ensures proper shuffling)
-        if train_sampler is not None:
-            train_sampler.set_epoch(epoch)
-        
-        result = train_epoch(
-            model=model,
-            train_loader=train_loader,
-            optimizer=optimizer,
-            scheduler=scheduler,
-            config=config,
-            visualizer=visualizer,
-            epoch=epoch,
-            global_step=global_step,
-            wandb_run=wandb_run,
-            wandb_logger=wandb_logger,
-            is_distributed=is_distributed,
-            is_main_process=is_main_process,
-            carbon_tracker=carbon_tracker,
-            attention_monitor=attention_monitor,
-            sliding_window_stopper=sliding_window_stopper
-        )
+            # Set epoch for distributed sampler (ensures proper shuffling)
+            if train_sampler is not None:
+                train_sampler.set_epoch(epoch)
 
-        # Unpack results (handle both old and new formats)
-        if len(result) == 4:
-            avg_loss, global_step, stop_reason, stopper_status = result
-        else:
-            avg_loss, global_step, stop_reason = result
-            stopper_status = None
+            result = train_epoch(
+                model=model,
+                train_loader=train_loader,
+                optimizer=optimizer,
+                scheduler=scheduler,
+                config=config,
+                visualizer=visualizer,
+                epoch=epoch,
+                global_step=global_step,
+                wandb_run=wandb_run,
+                wandb_logger=wandb_logger,
+                is_distributed=is_distributed,
+                is_main_process=is_main_process,
+                carbon_tracker=carbon_tracker,
+                attention_monitor=attention_monitor,
+                sliding_window_stopper=sliding_window_stopper
+            )
 
-        # Handle early stopping reason
-        if stop_reason:
-            if is_main_process:
-                print(f"\n⚠️  Training stopped early at epoch {epoch}, step {global_step}")
-                if stop_reason == 'attention':
-                    print("   Reason: Attention quality degraded below threshold")
-                elif stop_reason == 'alignment_plateau':
-                    print("   Reason: Alignment similarity plateaued")
-                elif stop_reason == 'alignment_negative':
-                    print("   Reason: Alignment similarity stayed below threshold")
-                elif stop_reason == 'sliding_window_plateau':
-                    print("   Reason: Sliding window plateau - no meaningful training loss improvement")
-                    if stopper_status:
-                        print(f"   Best window loss: {stopper_status['best_window_loss']:.4f}")
-                        print(f"   Steps without improvement: {stopper_status['steps_without_improvement']}")
-                else:
-                    print(f"   Reason: {stop_reason}")
-                print("   Saving final checkpoint before exit...")
+            # Unpack results (handle both old and new formats)
+            if len(result) == 4:
+                avg_loss, global_step, stop_reason, stopper_status = result
+            else:
+                avg_loss, global_step, stop_reason = result
+                stopper_status = None
 
-                checkpoint_path, stats = save_epoch_checkpoint(
-                    model, optimizer, epoch, global_step, config,
-                    f"{args.config}_early_stop"
-                )
-                print(f"   Emergency checkpoint saved: {checkpoint_path}")
-
-                # Handle sliding window early stopping with HF push
-                if stop_reason == 'sliding_window_plateau' and stopper_status:
-                    # Add current step info to training history
-                    training_history.append({
-                        'step': global_step,
-                        'loss': avg_loss,
-                        'lr': optimizer.param_groups[0]['lr'],
-                        'epoch': epoch
-                    })
-
-                    # Automatically push to HuggingFace if enabled
-                    if getattr(config, 'push_to_hf_on_stop', True):
-                        print(f"\n🚀 Automatically pushing Stage 2 final model to HuggingFace...")
-                        success = push_stage2_final_to_hf(
-                            checkpoint_path=checkpoint_path,
-                            config=config,
-                            early_stop_metrics=stopper_status,
-                            training_history=training_history,
-                            model_statistics=stats
-                        )
-                        if success:
-                            print(f"✅ Stage 2 final model successfully uploaded to HuggingFace!")
-                        else:
-                            print(f"⚠️  Failed to push Stage 2 final model to HuggingFace")
-
-                if stop_reason.startswith('alignment') and getattr(config, '_best_alignment_checkpoint', None):
-                    print(f"   Best alignment checkpoint: {config._best_alignment_checkpoint}")
-                    print(f"   Best correct_sim: {config._best_alignment_sim:.4f} (step {config._best_alignment_step})")
-            break
-
-        # Check loss-based early stopping
-        if loss_early_stopper is not None:
-            loss_converged = loss_early_stopper(epoch, avg_loss)
-            if loss_converged:
+            # Handle early stopping reason
+            if stop_reason:
                 if is_main_process:
-                    # Save final checkpoint before stopping
-                    stage_name = args.config if hasattr(args, 'config') else 'default'
+                    print(f"\n⚠️  Training stopped early at epoch {epoch}, step {global_step}")
+                    if stop_reason == 'attention':
+                        print("   Reason: Attention quality degraded below threshold")
+                    elif stop_reason == 'alignment_plateau':
+                        print("   Reason: Alignment similarity plateaued")
+                    elif stop_reason == 'alignment_negative':
+                        print("   Reason: Alignment similarity stayed below threshold")
+                    elif stop_reason == 'sliding_window_plateau':
+                        print("   Reason: Sliding window plateau - no meaningful training loss improvement")
+                        if stopper_status:
+                            print(f"   Best window loss: {stopper_status['best_window_loss']:.4f}")
+                            print(f"   Steps without improvement: {stopper_status['steps_without_improvement']}")
+                    else:
+                        print(f"   Reason: {stop_reason}")
+                    print("   Saving final checkpoint before exit...")
+
                     checkpoint_path, stats = save_epoch_checkpoint(
-                        model, optimizer, epoch, global_step, config, stage_name
+                        model, optimizer, epoch, global_step, config,
+                        f"{args.config}_early_stop"
                     )
-                    push_to_huggingface(
-                        checkpoint_path=checkpoint_path,
-                        stats=stats,
-                        epoch=epoch,
-                        total_epochs=epoch + 1,
-                        stage_name=stage_name,
-                        config=config,
-                        training_history=training_history
-                    )
+                    print(f"   Emergency checkpoint saved: {checkpoint_path}")
+
+                    # Handle sliding window early stopping with HF push
+                    if stop_reason == 'sliding_window_plateau' and stopper_status:
+                        # Add current step info to training history
+                        training_history.append({
+                            'step': global_step,
+                            'loss': avg_loss,
+                            'lr': optimizer.param_groups[0]['lr'],
+                            'epoch': epoch
+                        })
+
+                        # Automatically push to HuggingFace if enabled
+                        if getattr(config, 'push_to_hf_on_stop', True):
+                            print(f"\n🚀 Automatically pushing Stage 2 final model to HuggingFace...")
+                            success = push_stage2_final_to_hf(
+                                checkpoint_path=checkpoint_path,
+                                config=config,
+                                early_stop_metrics=stopper_status,
+                                training_history=training_history,
+                                model_statistics=stats
+                            )
+                            if success:
+                                print(f"✅ Stage 2 final model successfully uploaded to HuggingFace!")
+                            else:
+                                print(f"⚠️  Failed to push Stage 2 final model to HuggingFace")
+
+                    if stop_reason.startswith('alignment') and getattr(config, '_best_alignment_checkpoint', None):
+                        print(f"   Best alignment checkpoint: {config._best_alignment_checkpoint}")
+                        print(f"   Best correct_sim: {config._best_alignment_sim:.4f} (step {config._best_alignment_step})")
                 break
 
-        if is_main_process:
-            print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+            # Check loss-based early stopping
+            if loss_early_stopper is not None:
+                loss_converged = loss_early_stopper(epoch, avg_loss)
+                if loss_converged:
+                    if is_main_process:
+                        # Save final checkpoint before stopping
+                        stage_name = args.config if hasattr(args, 'config') else 'default'
+                        checkpoint_path, stats = save_epoch_checkpoint(
+                            model, optimizer, epoch, global_step, config, stage_name
+                        )
+                        push_to_huggingface(
+                            checkpoint_path=checkpoint_path,
+                            stats=stats,
+                            epoch=epoch,
+                            total_epochs=epoch + 1,
+                            stage_name=stage_name,
+                            config=config,
+                            training_history=training_history
+                        )
+                    break
 
-            # Log weight histograms at end of epoch (if wandb_logger available)
-            if wandb_logger and (epoch % max(1, config.num_epochs // 5) == 0):
-                wandb_logger.log_model_weights_histogram(model, global_step)
+            if is_main_process:
+                print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
 
-            # Determine stage name for HF commit message
-            stage_name = args.config if hasattr(args, 'config') else 'default'
+                # Log weight histograms at end of epoch (if wandb_logger available)
+                if wandb_logger and (epoch % max(1, config.num_epochs // 5) == 0):
+                    wandb_logger.log_model_weights_histogram(model, global_step)
 
-            # Save epoch checkpoint with statistics
-            checkpoint_path, stats = save_epoch_checkpoint(
-                model, optimizer, epoch, global_step, config, stage_name
-            )
+                # Determine stage name for HF commit message
+                stage_name = args.config if hasattr(args, 'config') else 'default'
 
-            # Add to training history (for model card)
-            training_history.append({
-                'epoch': epoch,
-                'train_loss': avg_loss,
-                'alignment_loss': stats.get('alignment_loss', 0),
-                'learning_rate': optimizer.param_groups[0]['lr'],
-                'gradient_norm': stats.get('gradient_norm', 0)
-            })
+                # Save epoch checkpoint with statistics
+                checkpoint_path, stats = save_epoch_checkpoint(
+                    model, optimizer, epoch, global_step, config, stage_name
+                )
 
-            # Log statistics to WandB
-            if wandb_logger:
-                wandb_logger.log_metrics(
-                    stats, step=global_step, prefix="model_stats")
+                # Add to training history (for model card)
+                training_history.append({
+                    'epoch': epoch,
+                    'train_loss': avg_loss,
+                    'alignment_loss': stats.get('alignment_loss', 0),
+                    'learning_rate': optimizer.param_groups[0]['lr'],
+                    'gradient_norm': stats.get('gradient_norm', 0)
+                })
 
-            # Push ONLY latest checkpoint to HuggingFace (replaces previous)
-            push_to_huggingface(
-                checkpoint_path=checkpoint_path,
-                stats=stats,
-                epoch=epoch,
-                total_epochs=config.num_epochs,
-                stage_name=stage_name,
-                config=config,
-                training_history=training_history
-            )
-        
+                # Log statistics to WandB
+                if wandb_logger:
+                    wandb_logger.log_metrics(
+                        stats, step=global_step, prefix="model_stats")
+
+                # Push ONLY latest checkpoint to HuggingFace (replaces previous)
+                push_to_huggingface(
+                    checkpoint_path=checkpoint_path,
+                    stats=stats,
+                    epoch=epoch,
+                    total_epochs=config.num_epochs,
+                    stage_name=stage_name,
+                    config=config,
+                    training_history=training_history
+                )
+
             # Synchronize all processes before next epoch
             if is_distributed:
                 dist.barrier()
