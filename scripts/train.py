@@ -2382,7 +2382,7 @@ def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_na
 def main():
     parser = argparse.ArgumentParser(description="Train MicroVLM-V")
     parser.add_argument('--config', type=str, default='default',
-                        choices=['test', 'stage1', 'stage2',
+                        choices=['test', 'stage1', 'stage2', 'stage3',
                                  'default', 'full_quantized'],
                         help='Training configuration')
     parser.add_argument('--resume', type=str, default=None,
@@ -2458,7 +2458,7 @@ def main():
     is_main_process = (not is_distributed) or (dist.get_rank() == 0)
 
     # Load configuration - prioritize staged config if requested
-    if args.use_staged_config or args.config in ['stage1', 'stage2', 'full_quantized']:
+    if args.use_staged_config or args.config in ['stage1', 'stage2', 'stage3', 'full_quantized']:
         config = load_staged_config(args.config)
         if is_main_process:
             print(f"Loaded STAGED configuration: {args.config}")
@@ -2776,7 +2776,7 @@ def main():
             new_state_dict[new_key] = v
         state_dict = new_state_dict
         
-        # Detect stage transition (Stage 1 -> Stage 2)
+        # Detect stage transitions (Stage 1 -> Stage 2, Stage 2 -> Stage 3)
         ckpt_config = checkpoint.get('config', {})
         ckpt_use_memory = ckpt_config.get('use_memory', False)
         current_use_memory = getattr(config, 'use_memory', False)
@@ -2787,6 +2787,17 @@ def main():
         
         keys_to_remove = []
         
+        # Detect stage name from checkpoint config
+        ckpt_stage_name = ckpt_config.get('wandb_run_name', '')
+        current_stage_name = getattr(config, 'wandb_run_name', '')
+
+        if is_main_process:
+            if 'stage2' in ckpt_stage_name and 'stage3' in current_stage_name:
+                print(f"   🔄 Stage 2 → Stage 3 transition detected")
+                print(f"      Memory: preserved, Vision: frozen, Language: unfreezing more layers")
+            elif 'stage1' in ckpt_stage_name and 'stage2' in current_stage_name:
+                print(f"   🔄 Stage 1 → Stage 2 transition detected")
+
         # Filter memory keys if transitioning from Stage 1 (no memory) to Stage 2 (with memory)
         if not ckpt_use_memory and current_use_memory:
             # Match any key containing memory-related module names
@@ -2794,8 +2805,8 @@ def main():
             memory_keys = [k for k in state_dict.keys() if any(p in k for p in memory_patterns)]
             keys_to_remove.extend(memory_keys)
             if memory_keys and is_main_process:
-                print(f"   🔄 Stage transition: filtering {len(memory_keys)} untrained memory keys")
-        
+                print(f"      Filtering {len(memory_keys)} untrained memory keys")
+
         # Filter language model keys if quantization settings differ
         # (4-bit quantized weights have incompatible shapes with non-quantized model)
         if ckpt_quantize_lm != current_quantize_lm:
