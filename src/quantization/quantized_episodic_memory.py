@@ -244,3 +244,62 @@ def get_memory_quantization_stats(episodic_memory_module):
                 stats['scope_detector_158bit/bits_per_param'] = 1.58
 
     return stats
+
+
+def apply_158bit_quantization_to_memory(module, memory_size=None, code_size=None):
+    """
+    Backward-compatible wrapper for legacy imports.
+    Delegates to apply_mixed_precision_quantization_to_memory for episodic memory modules.
+
+    Args:
+        module: Module to quantize (EpisodicMemory or ScopeDetector)
+        memory_size: Number of memory slots (optional, will be inferred)
+        code_size: Memory code dimension (optional, will be inferred)
+
+    Returns:
+        module: Quantized module
+    """
+    # EpisodicMemory-style module with memory buffers
+    if hasattr(module, 'memory_mean') and hasattr(module, 'memory_logvar'):
+        # Infer dimensions from module if not provided
+        inferred_memory_size = memory_size or getattr(module, 'memory_size', None)
+        inferred_code_size = code_size or getattr(module, 'code_size', None) or getattr(module, 'memory_dim', None)
+
+        if inferred_memory_size is None or inferred_code_size is None:
+            raise ValueError(
+                f"Cannot quantize episodic memory: memory_size={inferred_memory_size}, "
+                f"code_size={inferred_code_size}. Both must be specified or inferrable."
+            )
+
+        return apply_mixed_precision_quantization_to_memory(module, inferred_memory_size, inferred_code_size)
+
+    # ScopeDetector or other modules with MLP
+    if hasattr(module, 'mlp'):
+        for i, submodule in enumerate(module.mlp):
+            if isinstance(submodule, nn.Linear):
+                quant_layer = QuantizedLinear158BitGrad(
+                    submodule.in_features,
+                    submodule.out_features,
+                    bias=(submodule.bias is not None)
+                )
+                quant_layer.weight.data = submodule.weight.data.clone()
+                if submodule.bias is not None:
+                    quant_layer.bias.data = submodule.bias.data.clone()
+                module.mlp[i] = quant_layer
+        return module
+
+    # Fallback: quantize any direct Linear children
+    for name, submodule in module.named_children():
+        if isinstance(submodule, nn.Linear):
+            quant_layer = QuantizedLinear158BitGrad(
+                submodule.in_features,
+                submodule.out_features,
+                bias=(submodule.bias is not None)
+            )
+            quant_layer.weight.data = submodule.weight.data.clone()
+            if submodule.bias is not None:
+                quant_layer.bias.data = submodule.bias.data.clone()
+            setattr(module, name, quant_layer)
+
+    return module
+
