@@ -471,8 +471,9 @@ class WandBLogger:
     
     def log_memory_heatmap(self, memory_state, addressing_weights, global_step):
         """
-        Create and log episodic memory heatmap visualization
-        
+        Create and log episodic memory temporal evolution heatmaps.
+        Shows how memory slots evolve across training rather than single snapshots.
+
         Args:
             memory_state: tuple (mean, cov) from episodic memory
             addressing_weights: (episode_size, batch, memory_size)
@@ -486,124 +487,133 @@ class WandBLogger:
             
             # Memory mean heatmap (memory_size x code_size)
             memory_mean_np = memory_mean[0].cpu().numpy()  # Take first batch
-            
-            fig, axes = plt.subplots(2, 2, figsize=(16, 12))
-            
-            # 1. Memory state heatmap
-            ax = axes[0, 0]
-            im1 = ax.imshow(memory_mean_np, aspect='auto', cmap='viridis')
-            ax.set_title(f'Memory State (Step {global_step})')
-            ax.set_xlabel('Code Dimension')
-            ax.set_ylabel('Memory Slots')
-            plt.colorbar(im1, ax=ax)
-            
-            # 2. Memory activation (norm per slot)
-            ax = axes[0, 1]
             memory_norms = np.linalg.norm(memory_mean_np, axis=1)
-            ax.bar(range(len(memory_norms)), memory_norms)
-            ax.set_title('Memory Slot Activation')
-            ax.set_xlabel('Memory Slot')
-            ax.set_ylabel('L2 Norm')
-            ax.grid(True, alpha=0.3)
-            
-            # 3. Addressing weights heatmap
-            ax = axes[1, 0]
-            # Average over batch: (episode_size, memory_size)
+
+            # Average addressing weights over batch and episode
             addr_weights_np = addressing_weights.mean(dim=1).cpu().numpy()
-            im3 = ax.imshow(addr_weights_np, aspect='auto', cmap='hot')
-            ax.set_title('Addressing Weights')
-            ax.set_xlabel('Memory Slots')
-            ax.set_ylabel('Episode Steps')
-            plt.colorbar(im3, ax=ax)
-            
-            # 4. Memory usage distribution
-            ax = axes[1, 1]
             avg_addressing = addr_weights_np.mean(axis=0)
-            ax.bar(range(len(avg_addressing)), avg_addressing)
-            ax.set_title('Average Memory Usage')
-            ax.set_xlabel('Memory Slot')
-            ax.set_ylabel('Average Addressing Weight')
-            ax.grid(True, alpha=0.3)
-            
-            plt.tight_layout()
-            
-            self.wandb_run.log({
-                'memory/state_heatmap': wandb.Image(fig)
-            }, step=global_step)
-            
-            plt.close(fig)
-            
-            # Memory statistics with numerical stability
-            # Compute entropy safely by filtering out near-zero values
+
+            # Store snapshot for temporal evolution (sample every 5000 steps for efficiency)
+            if global_step % 5000 == 0 or len(self.memory_states) == 0:
+                self.memory_states.append((global_step, memory_norms.copy()))
+                self.memory_addressing_history.append((global_step, avg_addressing.copy()))
+
+            # Log numerical metrics
             avg_addressing_nonzero = avg_addressing[avg_addressing > 1e-10]
             if len(avg_addressing_nonzero) > 0:
-                # Normalize only the non-zero values
                 avg_addressing_prob = avg_addressing_nonzero / np.sum(avg_addressing_nonzero)
                 addressing_entropy = -np.sum(avg_addressing_prob * np.log(avg_addressing_prob))
             else:
-                # If all values are zero, entropy is 0
                 addressing_entropy = 0.0
             
             metrics = {
                 'memory/mean_activation': np.mean(memory_norms),
                 'memory/max_activation': np.max(memory_norms),
                 'memory/min_activation': np.min(memory_norms),
-                'memory/active_slots': np.sum(memory_norms > 0.1),  # Threshold for "active"
+                'memory/active_slots': np.sum(memory_norms > 0.1),
                 'memory/addressing_entropy': addressing_entropy,
                 'memory/addressing_sparsity': np.sum(avg_addressing < 0.01) / len(avg_addressing)
             }
-            
             self.wandb_run.log(metrics, step=global_step)
             
-            # Store for temporal visualization
-            self.memory_states.append((global_step, memory_mean_np.copy()))
-            self.memory_addressing_history.append((global_step, avg_addressing.copy()))
-            
-            # Create temporal evolution plot every N steps
-            if len(self.memory_states) > 1 and global_step % 1000 == 0:
-                self._visualize_memory_evolution(global_step)
-    
-    def _visualize_memory_evolution(self, global_step):
+            # Generate temporal evolution heatmaps when we have multiple snapshots
+            if len(self.memory_states) >= 2:
+                self._visualize_memory_temporal_evolution(global_step)
+
+    def _visualize_memory_temporal_evolution(self, global_step):
         """
-        Visualize how memory evolves over training
-        
+        Create temporal evolution heatmaps showing how memory slots change across training.
+        Replaces 4-panel static diagnostics with side-by-side progression view.
+
         Args:
-            global_step: global training step
+            global_step: current training step
         """
         if len(self.memory_states) < 2:
             return
         
-        # Extract data
-        steps = [s for s, _ in self.memory_states]
-        
-        # Plot memory slot activation over time
-        fig, ax = plt.subplots(figsize=(12, 6))
-        
-        # Get activation norms for each checkpoint
-        activations = []
-        for _, mem_state in self.memory_states:
-            norms = np.linalg.norm(mem_state, axis=1)
-            activations.append(norms)
-        
-        activations = np.array(activations).T  # (memory_slots, time_steps)
-        
-        # Plot each memory slot
-        for i in range(min(20, activations.shape[0])):  # Plot first 20 slots
-            ax.plot(steps, activations[i], alpha=0.6, label=f'Slot {i}' if i < 5 else None)
-        
-        ax.set_xlabel('Training Step')
-        ax.set_ylabel('Memory Slot Activation')
-        ax.set_title('Memory Learning Evolution')
-        ax.grid(True, alpha=0.3)
-        if activations.shape[0] <= 5:
-            ax.legend()
-        
-        self.wandb_run.log({
-            'memory/evolution_over_time': wandb.Image(fig)
-        }, step=global_step)
-        
-        plt.close(fig)
-    
+        try:
+            # Extract snapshots
+            steps = np.array([s for s, _ in self.memory_states])
+            num_snapshots = len(steps)
+
+            # Memory Slot Activation Evolution (Primary Visualization)
+            memory_activations = np.array([norms for _, norms in self.memory_states])  # (num_snapshots, num_slots)
+            num_slots = memory_activations.shape[1]
+
+            # Create side-by-side heatmap figure
+            fig = plt.figure(figsize=(20, 8))
+
+            # 1. Main heatmap: Memory Slot Evolution (Y=slots, X=time)
+            ax1 = plt.subplot(2, 1, 1)
+            im1 = ax1.imshow(memory_activations.T, aspect='auto', cmap='RdYlBu_r',
+                            interpolation='nearest')
+            ax1.set_xlabel('Training Snapshot', fontsize=12)
+            ax1.set_ylabel('Memory Slot ID', fontsize=12)
+            ax1.set_title(f'Memory Slot Activation Evolution (Step {global_step})', fontsize=14, fontweight='bold')
+
+            # Set x-axis to show actual steps
+            tick_indices = np.linspace(0, num_snapshots-1, min(8, num_snapshots), dtype=int)
+            ax1.set_xticks(tick_indices)
+            ax1.set_xticklabels([f'{steps[i]:,}' for i in tick_indices], rotation=45)
+
+            # Colorbar
+            cbar1 = plt.colorbar(im1, ax=ax1)
+            cbar1.set_label('L2 Norm Activation', fontsize=10)
+
+            # 2. Addressing Weight Evolution (Secondary Visualization)
+            if len(self.memory_addressing_history) >= 2:
+                ax2 = plt.subplot(2, 1, 2)
+                addressing_evolution = np.array([addr for _, addr in self.memory_addressing_history])  # (num_snapshots, num_slots)
+
+                im2 = ax2.imshow(addressing_evolution.T, aspect='auto', cmap='YlOrRd',
+                               interpolation='nearest')
+                ax2.set_xlabel('Training Snapshot', fontsize=12)
+                ax2.set_ylabel('Memory Slot ID', fontsize=12)
+                ax2.set_title('Memory Addressing Weight Evolution', fontsize=14, fontweight='bold')
+
+                ax2.set_xticks(tick_indices)
+                ax2.set_xticklabels([f'{steps[i]:,}' for i in tick_indices], rotation=45)
+
+                cbar2 = plt.colorbar(im2, ax=ax2)
+                cbar2.set_label('Avg. Addressing Weight', fontsize=10)
+
+            plt.tight_layout()
+
+            # Log to WandB
+            self.wandb_run.log({
+                'memory/temporal_evolution_heatmap': wandb.Image(fig)
+            }, step=global_step)
+
+            plt.close(fig)
+
+            # Additional temporal metrics
+            # Track how many slots become active over time
+            active_slots_over_time = (memory_activations > 0.1).sum(axis=1)
+            final_active_slots = active_slots_over_time[-1]
+            initial_active_slots = active_slots_over_time[0]
+
+            # Track variance in slot usage (higher = more diverse usage)
+            slot_variance = memory_activations.var(axis=0).mean()
+
+            # Track temporal stability (lower = more stable memory)
+            if num_snapshots >= 3:
+                temporal_stability = np.mean([
+                    np.linalg.norm(memory_activations[i+1] - memory_activations[i])
+                    for i in range(num_snapshots-1)
+                ])
+            else:
+                temporal_stability = 0.0
+
+            self.wandb_run.log({
+                'memory/active_slots_final': final_active_slots,
+                'memory/active_slots_initial': initial_active_slots,
+                'memory/slot_usage_variance': slot_variance,
+                'memory/temporal_stability': temporal_stability
+            }, step=global_step)
+
+        except Exception as e:
+            warnings.warn(f"Failed to create temporal evolution visualization: {e}")
+
     def log_cross_modal_attention(self, attention_weights, global_step, 
                                   text_tokens=None, prefix="alignment"):
         """

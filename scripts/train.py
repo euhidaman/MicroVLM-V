@@ -95,32 +95,45 @@ class EarlyStopping:
 
 class SlidingWindowEarlyStopping:
     """
-    Sliding-window based early stopping using only training loss.
-    Stops training when no meaningful improvement is detected over a sliding window.
+    Robust sliding-window based early stopping with variance and trend analysis.
+    Stops training when loss plateaus or becomes noisy without meaningful improvement.
     """
 
-    def __init__(self, window_size=300, min_delta=0.002, patience_steps=3000, verbose=True):
+    def __init__(self, window_size=500, min_delta=0.003, patience_steps=1500,
+                 eval_interval=100, num_eval_windows=8, variance_threshold=0.005, verbose=True):
         """
         Args:
-            window_size: Number of steps to consider in each window
-            min_delta: Minimum loss improvement threshold to count as meaningful
-            patience_steps: Number of steps without improvement before stopping
+            window_size: Number of steps to consider in each window (increased for stability)
+            min_delta: Minimum loss improvement threshold (tuned based on typical noise)
+            patience_steps: Number of steps without improvement before stopping (reduced for promptness)
+            eval_interval: Steps between evaluation windows
+            num_eval_windows: Number of consecutive flat/increasing windows required to stop
+            variance_threshold: Maximum variance increase tolerated before flagging noise
             verbose: Print status messages
         """
         self.window_size = window_size
         self.min_delta = min_delta
         self.patience_steps = patience_steps
+        self.eval_interval = eval_interval
+        self.num_eval_windows = num_eval_windows
+        self.variance_threshold = variance_threshold
         self.verbose = verbose
 
-        self.loss_history = []  # Store all losses
+        self.loss_history = []
         self.best_window_loss = float('inf')
         self.steps_without_improvement = 0
         self.total_steps = 0
         self.best_step = 0
 
+        # Track evaluation windows for trend analysis
+        self.eval_window_losses = []
+        self.eval_window_variances = []
+        self.flat_window_count = 0
+
     def add_loss(self, loss_value, current_step):
         """
         Add a new loss value and check if training should stop.
+        Uses variance and trend checks to be robust against noisy loss signals.
 
         Args:
             loss_value: Current training loss
@@ -136,33 +149,73 @@ class SlidingWindowEarlyStopping:
         if len(self.loss_history) < self.window_size:
             return False
 
-        # Calculate current window loss (average of last window_size steps)
+        # Calculate current window statistics
         current_window = self.loss_history[-self.window_size:]
         current_window_loss = sum(current_window) / len(current_window)
+        current_window_variance = sum((x - current_window_loss)**2 for x in current_window) / len(current_window)
 
-        # Check if this is an improvement
+        # Periodic evaluation window check
+        if current_step % self.eval_interval == 0:
+            self.eval_window_losses.append(current_window_loss)
+            self.eval_window_variances.append(current_window_variance)
+
+            # Keep only recent evaluation windows
+            max_windows = self.num_eval_windows * 3
+            if len(self.eval_window_losses) > max_windows:
+                self.eval_window_losses = self.eval_window_losses[-max_windows:]
+                self.eval_window_variances = self.eval_window_variances[-max_windows:]
+
+        # Check if this is a meaningful improvement
         improvement = self.best_window_loss - current_window_loss
 
         if improvement >= self.min_delta:
-            # Meaningful improvement detected
+            # Meaningful improvement detected - reset counters
             self.best_window_loss = current_window_loss
             self.steps_without_improvement = 0
+            self.flat_window_count = 0
             self.best_step = current_step
-            if self.verbose:
-                print(f"  [SlidingWindow] Loss improved to {current_window_loss:.6f} (Δ={improvement:.6f})")
+            if self.verbose and current_step % 100 == 0:
+                print(f"  [RobustEarlyStop] Loss improved to {current_window_loss:.6f} (Δ={improvement:.6f}, var={current_window_variance:.6f})")
         else:
             # No meaningful improvement
             self.steps_without_improvement += 1
 
-            if self.verbose and self.steps_without_improvement % 100 == 0:
-                print(f"  [SlidingWindow] No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
-                print(f"     Current window: {current_window_loss:.6f}, Best: {self.best_window_loss:.6f}, Δ={improvement:.6f}")
+            # Check for sustained plateau using evaluation windows
+            if len(self.eval_window_losses) >= self.num_eval_windows:
+                recent_windows = self.eval_window_losses[-self.num_eval_windows:]
+                recent_variances = self.eval_window_variances[-self.num_eval_windows:]
 
-        # Check if patience exceeded
-        if self.steps_without_improvement >= self.patience_steps:
+                # Check if loss is flat or increasing over recent evaluation windows
+                is_flat_or_increasing = all(
+                    recent_windows[i] >= recent_windows[0] - self.min_delta
+                    for i in range(1, len(recent_windows))
+                )
+
+                # Check if variance is acceptable (not too noisy)
+                avg_variance = sum(recent_variances) / len(recent_variances)
+                is_variance_acceptable = avg_variance < self.variance_threshold
+
+                if is_flat_or_increasing:
+                    self.flat_window_count += 1
+                else:
+                    self.flat_window_count = 0
+
+                if self.verbose and current_step % 200 == 0:
+                    print(f"  [RobustEarlyStop] No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
+                    print(f"     Current: {current_window_loss:.6f}, Best: {self.best_window_loss:.6f}, Δ={improvement:.6f}")
+                    print(f"     Flat windows: {self.flat_window_count}/{self.num_eval_windows}, Variance: {avg_variance:.6f}")
+
+        # Stop if patience exceeded AND we have sustained flat/increasing trend
+        should_stop = (
+            self.steps_without_improvement >= self.patience_steps and
+            self.flat_window_count >= self.num_eval_windows
+        )
+
+        if should_stop:
             if self.verbose:
-                print(f"\n🛑 SLIDING WINDOW PLATEAU DETECTED")
+                print(f"\n🛑 ROBUST EARLY STOPPING TRIGGERED")
                 print(f"   No meaningful improvement for {self.patience_steps} steps")
+                print(f"   Sustained plateau detected over {self.flat_window_count} evaluation windows")
                 print(f"   Best window loss: {self.best_window_loss:.6f} at step {self.best_step}")
                 print(f"   Current window loss: {current_window_loss:.6f}")
                 print(f"   Training stopped at step {current_step}\n")
@@ -172,16 +225,20 @@ class SlidingWindowEarlyStopping:
 
     def get_status(self):
         """Get current status for logging"""
-        # Calculate current window loss if we have enough data
+        # Calculate current window statistics if we have enough data
         current_window_loss = self.best_window_loss
+        current_window_variance = 0.0
         if len(self.loss_history) >= self.window_size:
             current_window = self.loss_history[-self.window_size:]
             current_window_loss = sum(current_window) / len(current_window)
+            current_window_variance = sum((x - current_window_loss)**2 for x in current_window) / len(current_window)
 
         return {
             'best_window_loss': self.best_window_loss,
             'current_window_loss': current_window_loss,
+            'current_window_variance': current_window_variance,
             'steps_without_improvement': self.steps_without_improvement,
+            'flat_window_count': self.flat_window_count,
             'total_steps': self.total_steps,
             'best_step': self.best_step,
             'window_size': self.window_size,
@@ -1778,13 +1835,15 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
 
-                # Sliding window early stopping metrics
+                # Robust sliding window early stopping metrics
                 if sliding_window_stopper is not None:
                     sw_status = sliding_window_stopper.get_status()
                     wandb_logger.log_metrics({
                         'sliding_window/best_window_loss': sw_status['best_window_loss'],
                         'sliding_window/current_window_loss': sw_status['current_window_loss'],
+                        'sliding_window/current_window_variance': sw_status['current_window_variance'],
                         'sliding_window/steps_without_improvement': sw_status['steps_without_improvement'],
+                        'sliding_window/flat_window_count': sw_status['flat_window_count'],
                     }, step=global_step)
 
             # Legacy simple logging (fallback)
@@ -2106,25 +2165,37 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
             model.train()
 
-        # ===== Sliding Window Early Stopping =====
-        # Check sliding window early stopping after each batch
-        if sliding_window_stopper is not None and is_main_process:
-            should_stop = sliding_window_stopper.add_loss(loss.item(), global_step)
+        # ===== Robust Sliding Window Early Stopping =====
+        # Check early stopping - only main process decides, then broadcasts to all ranks
+        should_stop = False
+        stopper_status = None
+
+        if sliding_window_stopper is not None:
+            if is_main_process:
+                should_stop = sliding_window_stopper.add_loss(loss.item(), global_step)
+                if should_stop:
+                    # Log final metrics
+                    stopper_status = sliding_window_stopper.get_status()
+                    stopper_status['final_lr'] = optimizer.param_groups[0]['lr']
+                    stopper_status['final_epoch'] = epoch
+
+                    if wandb_logger:
+                        wandb_logger.log_metrics({
+                            'early_stopping/triggered': 1.0,
+                            'early_stopping/stop_step': global_step,
+                            'early_stopping/best_window_loss': stopper_status['best_window_loss'],
+                            'early_stopping/current_window_loss': stopper_status['current_window_loss'],
+                            'early_stopping/steps_without_improvement': stopper_status['steps_without_improvement'],
+                            'early_stopping/flat_window_count': stopper_status['flat_window_count'],
+                        }, step=global_step)
+
+            # Broadcast stop decision from rank 0 to all other ranks
+            if is_distributed:
+                stop_tensor = torch.tensor([1 if should_stop else 0], device=config.device, dtype=torch.int32)
+                dist.broadcast(stop_tensor, src=0)
+                should_stop = bool(stop_tensor.item())
+
             if should_stop:
-                # Log final metrics
-                stopper_status = sliding_window_stopper.get_status()
-                stopper_status['final_lr'] = optimizer.param_groups[0]['lr']
-                stopper_status['final_epoch'] = epoch
-
-                if wandb_logger:
-                    wandb_logger.log_metrics({
-                        'early_stopping/triggered': 1.0,
-                        'early_stopping/stop_step': global_step,
-                        'early_stopping/best_window_loss': stopper_status['best_window_loss'],
-                        'early_stopping/current_window_loss': stopper_status['current_window_loss'],
-                        'early_stopping/steps_without_improvement': stopper_status['steps_without_improvement'],
-                    }, step=global_step)
-
                 # Return with sliding window stop signal
                 avg_loss = total_loss / max(batch_idx + 1, 1)
                 return avg_loss, global_step, 'sliding_window_plateau', stopper_status
@@ -2794,24 +2865,30 @@ def main():
         if is_main_process:
             print(f"\n📉 Early Stopping: patience={loss_early_stopper.patience}, min_delta={loss_early_stopper.min_delta}")
 
-    # Initialize sliding window early stopping (for step-based early stopping)
+    # Initialize robust sliding window early stopping (for step-based early stopping)
     sliding_window_stopper = None
     use_sliding_window = getattr(config, 'use_sliding_window_early_stop', False)
     if use_sliding_window:
         sliding_window_stopper = SlidingWindowEarlyStopping(
-            window_size=getattr(config, 'sliding_window_size', 300),
-            min_delta=getattr(config, 'sliding_window_min_delta', 0.002),
-            patience_steps=getattr(config, 'sliding_window_patience_steps', 3000),
+            window_size=getattr(config, 'sliding_window_size', 500),
+            min_delta=getattr(config, 'sliding_window_min_delta', 0.003),
+            patience_steps=getattr(config, 'sliding_window_patience_steps', 1500),
+            eval_interval=getattr(config, 'sliding_window_eval_interval', 100),
+            num_eval_windows=getattr(config, 'sliding_window_num_eval_windows', 8),
+            variance_threshold=getattr(config, 'sliding_window_variance_threshold', 0.005),
             verbose=is_main_process
         )
         if is_main_process:
-            print(f"\n🪟 Sliding Window Early Stopping:")
+            print(f"\n🪟 Robust Sliding Window Early Stopping:")
             print(f"   Window size: {sliding_window_stopper.window_size} steps")
             print(f"   Min delta: {sliding_window_stopper.min_delta}")
             print(f"   Patience: {sliding_window_stopper.patience_steps} steps")
+            print(f"   Eval interval: {sliding_window_stopper.eval_interval} steps")
+            print(f"   Required flat windows: {sliding_window_stopper.num_eval_windows}")
+            print(f"   Variance threshold: {sliding_window_stopper.variance_threshold}")
             print(f"   Auto-push to HF: {getattr(config, 'push_to_hf_on_stop', True)}")
 
-    # Training loop
+    # Training loop with KeyboardInterrupt handling
     if is_main_process:
         print(f"Starting training for up to {config.num_epochs} epochs...")
 
@@ -2819,8 +2896,10 @@ def main():
     training_history = []
     early_stop = False
     loss_converged = False
+    keyboard_interrupted = False
 
-    for epoch in range(start_epoch, config.num_epochs):
+    try:
+        for epoch in range(start_epoch, config.num_epochs):
         # Set epoch for distributed sampler (ensures proper shuffling)
         if train_sampler is not None:
             train_sampler.set_epoch(epoch)
@@ -2966,7 +3045,48 @@ def main():
                 training_history=training_history
             )
         
-        # Synchronize all processes before next epoch
+            # Synchronize all processes before next epoch
+            if is_distributed:
+                dist.barrier()
+
+    except KeyboardInterrupt:
+        keyboard_interrupted = True
+        if is_main_process:
+            print(f"\n⚠️  Training interrupted by user at epoch {epoch}, step {global_step}")
+            print("   Saving checkpoint before exit...")
+
+            # Save checkpoint
+            stage_name = args.config if hasattr(args, 'config') else 'default'
+            checkpoint_path, stats = save_epoch_checkpoint(
+                model, optimizer, epoch, global_step, config,
+                f"{stage_name}_interrupted"
+            )
+            print(f"   ✓ Checkpoint saved: {checkpoint_path}")
+
+            # Add to training history
+            training_history.append({
+                'epoch': epoch,
+                'train_loss': avg_loss if 'avg_loss' in locals() else float('inf'),
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                'interrupted': True
+            })
+
+            # Push to HuggingFace if enabled
+            try:
+                push_to_huggingface(
+                    checkpoint_path=checkpoint_path,
+                    stats=stats,
+                    epoch=epoch,
+                    total_epochs=epoch + 1,
+                    stage_name=f"{stage_name}_interrupted",
+                    config=config,
+                    training_history=training_history
+                )
+                print("   ✓ Checkpoint pushed to HuggingFace")
+            except Exception as e:
+                print(f"   ⚠️  Failed to push to HuggingFace: {e}")
+
+        # Synchronize processes before cleanup
         if is_distributed:
             dist.barrier()
 
