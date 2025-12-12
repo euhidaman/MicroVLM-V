@@ -20,7 +20,7 @@ def quantize_weights_158bit(weight):
         weight: torch.Tensor of any shape
     
     Returns:
-        quantized_weight: torch.Tensor with values in {-1, 0, 1}
+        quantized_weight: torch.Tensor with values in {-1, 0, 1} stored as int8
         scale: scaling factor (gamma) for dequantization
     """
     # Compute scale (gamma) as mean absolute value following BitNet
@@ -31,9 +31,68 @@ def quantize_weights_158bit(weight):
     
     # Quantize to {-1, 0, +1} using sign and threshold
     # BitNet uses: round(clip(w/gamma, -1, 1))
+    # Use 0.5 threshold to create sparsity
     quantized = torch.sign(normalized) * (normalized.abs() > 0.5).float()
 
     return quantized, scale
+
+
+def pack_ternary_weights(weight_ternary):
+    """
+    Pack ternary weights {-1, 0, 1} into 2-bit representation for storage.
+    This enables actual size reduction (8 weights per 2 bytes instead of 8 bytes per weight).
+
+    Encoding: -1 -> 0b00, 0 -> 0b01, +1 -> 0b10
+
+    Args:
+        weight_ternary: torch.Tensor with values in {-1, 0, 1}
+
+    Returns:
+        packed: torch.Tensor of uint8 with 4 ternary values packed per byte
+    """
+    shape = weight_ternary.shape
+    flat = weight_ternary.flatten()
+
+    # Convert to encoding: -1->0, 0->1, 1->2
+    encoded = (weight_ternary + 1).to(torch.uint8).flatten()
+
+    # Pad to multiple of 4
+    if len(encoded) % 4 != 0:
+        padding = 4 - (len(encoded) % 4)
+        encoded = torch.cat([encoded, torch.ones(padding, dtype=torch.uint8, device=encoded.device)])
+
+    # Pack 4 values (2 bits each) into each uint8
+    packed = torch.zeros(len(encoded) // 4, dtype=torch.uint8, device=encoded.device)
+    for i in range(4):
+        packed |= (encoded[i::4] << (i * 2))
+
+    return packed, shape
+
+
+def unpack_ternary_weights(packed, shape):
+    """
+    Unpack ternary weights from 2-bit representation.
+
+    Args:
+        packed: torch.Tensor of uint8 with packed values
+        shape: original tensor shape
+
+    Returns:
+        weight_ternary: torch.Tensor with values in {-1, 0, 1}
+    """
+    num_elements = torch.prod(torch.tensor(shape)).item()
+
+    # Unpack 4 values from each byte
+    unpacked = []
+    for i in range(4):
+        unpacked.append((packed >> (i * 2)) & 0b11)
+
+    encoded = torch.cat(unpacked)[:num_elements]
+
+    # Decode: 0->-1, 1->0, 2->1
+    decoded = encoded.to(torch.float32) - 1
+
+    return decoded.reshape(shape)
 
 
 def quantize_activations_int8(activation):
@@ -73,7 +132,7 @@ def dequantize_weights_158bit(quantized_weight, scale):
 class QuantizedLinear158(nn.Module):
     """
     Linear layer with 1.58-bit weight quantization and INT8 activation quantization
-    Follows BitNet b1.58 architecture
+    Follows BitNet b1.58 architecture with bit-packed storage
     """
     
     def __init__(self, in_features, out_features, bias=True):
@@ -82,9 +141,10 @@ class QuantizedLinear158(nn.Module):
         self.in_features = in_features
         self.out_features = out_features
         
-        # Store quantized weights {-1, 0, 1} as int8
-        self.register_buffer('quantized_weight',
-                           torch.zeros(out_features, in_features, dtype=torch.int8))
+        # Store bit-packed weights (2 bits per weight, 4 weights per byte)
+        packed_size = ((out_features * in_features) + 3) // 4  # Ceil division
+        self.register_buffer('packed_weight', torch.zeros(packed_size, dtype=torch.uint8))
+        self.register_buffer('weight_shape', torch.tensor([out_features, in_features]))
         self.register_buffer('weight_scale', torch.ones(1))
         
         # Bias kept in full precision (standard practice)
@@ -95,15 +155,17 @@ class QuantizedLinear158(nn.Module):
     
     def quantize_and_pack(self, weight):
         """
-        Quantize weight matrix to 1.58-bit and pack
+        Quantize weight matrix to 1.58-bit and pack for storage
 
         Args:
             weight: (out_features, in_features) float tensor
         """
         quantized, scale = quantize_weights_158bit(weight)
         
-        # Store as int8 for efficient computation
-        self.quantized_weight.data = quantized.to(torch.int8)
+        # Pack weights into 2-bit representation
+        packed, shape = pack_ternary_weights(quantized)
+
+        self.packed_weight.data = packed
         self.weight_scale.data = scale.view(1)
     
     def forward(self, x):
@@ -116,31 +178,42 @@ class QuantizedLinear158(nn.Module):
         Returns:
             output: (*, out_features) float tensor
         """
-        # Step 1: Quantize input activations to INT8
-        x_quant, act_scale = quantize_activations_int8(x)
+        # Step 1: Unpack weights from 2-bit representation
+        shape = tuple(self.weight_shape.tolist())
+        weight_ternary = unpack_ternary_weights(self.packed_weight, shape)
 
-        # Step 2: INT8 x INT2 (1.58-bit) matrix multiplication
-        # Dequantize for computation (in practice, use optimized kernel)
-        weight_dequant = self.quantized_weight.float() * self.weight_scale
-        x_dequant = x_quant.float() / act_scale
+        # Step 2: Scale to original magnitude
+        weight_dequant = weight_ternary * self.weight_scale
 
-        # Step 3: Compute output
+        # Step 3: Quantize input activations to INT8 (optional for performance)
+        if self.training:
+            x_quant, act_scale = quantize_activations_int8(x)
+            x_dequant = x_quant.float() / act_scale
+        else:
+            x_dequant = x
+
+        # Step 4: Compute output
         output = torch.nn.functional.linear(x_dequant, weight_dequant, self.bias)
 
         return output
 
     def get_quantization_info(self):
         """Get quantization statistics for monitoring"""
-        weight_sparsity = (self.quantized_weight == 0).float().mean()
-        weight_pos = (self.quantized_weight == 1).float().mean()
-        weight_neg = (self.quantized_weight == -1).float().mean()
+        # Unpack weights to compute statistics
+        shape = tuple(self.weight_shape.tolist())
+        weight_ternary = unpack_ternary_weights(self.packed_weight, shape)
+
+        weight_sparsity = (weight_ternary == 0).float().mean()
+        weight_pos = (weight_ternary == 1).float().mean()
+        weight_neg = (weight_ternary == -1).float().mean()
 
         return {
             'weight_scale': self.weight_scale.item(),
             'weight_sparsity': weight_sparsity.item(),
             'weight_positive_ratio': weight_pos.item(),
             'weight_negative_ratio': weight_neg.item(),
-            'bits_per_param': 1.58
+            'bits_per_param': 2.0,  # Actual storage: 2 bits per weight
+            'compression_ratio': 16.0  # 32-bit float -> 2-bit ternary
         }
 
 

@@ -17,7 +17,7 @@ EPSILON = 1e-6
 class QuantizedMemorySlots4bit(nn.Module):
     """
     4-bit quantized memory slots for episodic memory
-    Stores memory_mean and memory_logvar in 4-bit precision
+    Stores memory_mean and memory_logvar in 4-bit precision with proper bit packing
     """
 
     def __init__(self, memory_size, code_size):
@@ -26,29 +26,32 @@ class QuantizedMemorySlots4bit(nn.Module):
         self.memory_size = memory_size
         self.code_size = code_size
 
-        # Store quantized memory slots (4-bit stored as int8)
+        # Store quantized memory slots (4-bit packed as uint8, 2 values per byte)
+        packed_size = (code_size + 1) // 2  # Ceil division for 2 values per byte
         self.register_buffer('memory_mean_quantized',
-                           torch.zeros(memory_size, code_size, dtype=torch.int8))
+                           torch.zeros(memory_size, packed_size, dtype=torch.uint8))
         self.register_buffer('memory_mean_scale',
                            torch.ones(memory_size, 1))
 
         self.register_buffer('memory_logvar_quantized',
-                           torch.zeros(memory_size, code_size, dtype=torch.int8))
+                           torch.zeros(memory_size, packed_size, dtype=torch.uint8))
         self.register_buffer('memory_logvar_scale',
                            torch.ones(memory_size, 1))
 
     def quantize_memory(self, memory_mean, memory_logvar):
         """
-        Quantize memory slots to 4-bit
+        Quantize memory slots to 4-bit with proper bit packing
 
         Args:
             memory_mean: (memory_size, code_size) float tensor
             memory_logvar: (memory_size, code_size) float tensor OR (1,) scalar buffer
         """
-        # Quantize memory_mean per-slot
+        # Quantize memory_mean per-slot with bit packing
         for i in range(self.memory_size):
             quant, scale = quantize_4bit_symmetric(memory_mean[i], bits=4)
-            self.memory_mean_quantized[i] = quant.to(torch.int8)
+            # Pack two 4-bit values into each uint8
+            packed = self._pack_4bit(quant.to(torch.int8))
+            self.memory_mean_quantized[i] = packed
             self.memory_mean_scale[i] = scale.view(1)
 
         # Handle memory_logvar: check if it's a scalar buffer (shape (1,)) or full matrix
@@ -56,28 +59,68 @@ class QuantizedMemorySlots4bit(nn.Module):
             # Scalar buffer case: replicate the single value for all slots
             scalar_val = memory_logvar.item()
             for i in range(self.memory_size):
-                # Create a dummy tensor with the scalar value repeated
                 dummy_tensor = torch.full((self.code_size,), scalar_val, device=memory_logvar.device)
                 quant, scale = quantize_4bit_symmetric(dummy_tensor, bits=4)
-                self.memory_logvar_quantized[i] = quant.to(torch.int8)
+                packed = self._pack_4bit(quant.to(torch.int8))
+                self.memory_logvar_quantized[i] = packed
                 self.memory_logvar_scale[i] = scale.view(1)
         else:
             # Full matrix case: quantize per-slot
             for i in range(self.memory_size):
                 quant, scale = quantize_4bit_symmetric(memory_logvar[i], bits=4)
-                self.memory_logvar_quantized[i] = quant.to(torch.int8)
+                packed = self._pack_4bit(quant.to(torch.int8))
+                self.memory_logvar_quantized[i] = packed
                 self.memory_logvar_scale[i] = scale.view(1)
+
+    def _pack_4bit(self, values_int8):
+        """Pack two 4-bit values into each uint8 byte"""
+        # Ensure values are in [-8, 7] range for 4-bit signed
+        values_int8 = values_int8.clamp(-8, 7)
+        # Convert to unsigned [0, 15] for packing
+        values_uint = (values_int8 + 8).to(torch.uint8)
+
+        # Pad to even length
+        if len(values_uint) % 2 == 1:
+            values_uint = torch.cat([values_uint, torch.zeros(1, dtype=torch.uint8, device=values_uint.device)])
+
+        # Pack: lower 4 bits from even indices, upper 4 bits from odd indices
+        packed = values_uint[::2] | (values_uint[1::2] << 4)
+        return packed
+
+    def _unpack_4bit(self, packed, original_size):
+        """Unpack 4-bit values from uint8 bytes"""
+        # Unpack lower and upper nibbles
+        lower = packed & 0x0F
+        upper = (packed >> 4) & 0x0F
+
+        # Interleave
+        unpacked = torch.zeros(len(packed) * 2, dtype=torch.uint8, device=packed.device)
+        unpacked[::2] = lower
+        unpacked[1::2] = upper
+
+        # Trim to original size and convert back to signed [-8, 7]
+        unpacked = unpacked[:original_size]
+        return (unpacked.to(torch.int8) - 8)
 
     def dequantize_memory(self):
         """
-        Dequantize memory slots back to float
+        Dequantize memory slots back to float with unpacking
 
         Returns:
             memory_mean: (memory_size, code_size) float tensor
             memory_logvar: (memory_size, code_size) float tensor
         """
-        memory_mean = self.memory_mean_quantized.float() * self.memory_mean_scale
-        memory_logvar = self.memory_logvar_quantized.float() * self.memory_logvar_scale
+        # Unpack and dequantize memory_mean
+        memory_mean = torch.zeros(self.memory_size, self.code_size, device=self.memory_mean_quantized.device)
+        for i in range(self.memory_size):
+            unpacked = self._unpack_4bit(self.memory_mean_quantized[i], self.code_size)
+            memory_mean[i] = unpacked.float() * self.memory_mean_scale[i]
+
+        # Unpack and dequantize memory_logvar
+        memory_logvar = torch.zeros(self.memory_size, self.code_size, device=self.memory_logvar_quantized.device)
+        for i in range(self.memory_size):
+            unpacked = self._unpack_4bit(self.memory_logvar_quantized[i], self.code_size)
+            memory_logvar[i] = unpacked.float() * self.memory_logvar_scale[i]
 
         return memory_mean, memory_logvar
 

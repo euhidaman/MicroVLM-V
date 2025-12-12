@@ -639,21 +639,67 @@ class MicroVLM_FIBER(nn.Module):
         return sum(p.numel() for p in self.parameters() if p.requires_grad)
     
     def save_checkpoint(self, path: str):
-        """Save model checkpoint"""
+        """Save model checkpoint with quantization"""
+        # Get state dict
+        state_dict = self.state_dict()
+
+        # If quantization is enabled, convert weights to quantized format
+        if self.quantize_memory_158bit:
+            # Episodic memory should already have quantized weights
+            if hasattr(self.episodic_memory, 'quantized_memory_slots'):
+                pass
+
+            # Convert 1.58-bit quantized layers to int8 storage
+            from ..quantization.quantize_158bit import quantize_weights_158bit
+            for key in list(state_dict.keys()):
+                if ('episodic_memory' in key or 'scope_detector' in key) and 'weight' in key and '.W_' not in key:
+                    if state_dict[key].dim() >= 2:
+                        weight = state_dict[key]
+                        quantized, scale = quantize_weights_158bit(weight)
+                        state_dict[key] = quantized.to(torch.int8)
+                        state_dict[key.replace('weight', 'weight_scale')] = scale
+
         checkpoint = {
-            'model_state_dict': self.state_dict(),
+            'model_state_dict': state_dict,
             'config': self.config,
             'memory_state': self.memory_state,
             'alignment_mode': self.alignment_mode,
-            'fiber_config': self.fiber_config.__dict__ if self.fiber_config else None
+            'fiber_config': self.fiber_config.__dict__ if self.fiber_config else None,
+            'quantize_4bit': self.quantize_4bit,
+            'quantize_memory_158bit': self.quantize_memory_158bit
         }
         torch.save(checkpoint, path)
-        print(f"Checkpoint saved to {path}")
-    
+
+        # Calculate actual file size
+        import os
+        file_size_mb = os.path.getsize(path) / (1024 * 1024)
+        print(f"Checkpoint saved to {path} ({file_size_mb:.2f} MB)")
+
     def load_checkpoint(self, path: str):
-        """Load model checkpoint"""
+        """Load model checkpoint and handle quantized weights"""
         checkpoint = torch.load(path, map_location='cpu')
-        self.load_state_dict(checkpoint['model_state_dict'])
+        state_dict = checkpoint['model_state_dict']
+
+        # Check if checkpoint was saved with quantization
+        quantize_memory_158bit = checkpoint.get('quantize_memory_158bit', False)
+
+        if quantize_memory_158bit:
+            # Dequantize 1.58-bit weights for inference
+            from ..quantization.quantize_158bit import dequantize_weights_158bit
+            for key in list(state_dict.keys()):
+                if key.endswith('_scale'):
+                    continue
+                if ('episodic_memory' in key or 'scope_detector' in key) and 'weight' in key:
+                    if state_dict[key].dtype == torch.int8:
+                        scale_key = key.replace('weight', 'weight_scale')
+                        if scale_key in state_dict:
+                            quantized = state_dict[key]
+                            scale = state_dict[scale_key]
+                            dequantized = dequantize_weights_158bit(quantized.float(), scale)
+                            state_dict[key] = dequantized
+                            del state_dict[scale_key]
+
+        self.load_state_dict(state_dict, strict=False)
         self.memory_state = checkpoint.get('memory_state', None)
         print(f"Checkpoint loaded from {path}")
 

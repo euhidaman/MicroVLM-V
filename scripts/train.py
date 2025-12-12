@@ -605,8 +605,8 @@ def _unique_path(path: Path) -> Path:
 
 def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type="step", correct_sim=None):
     """
-    Push a checkpoint to HuggingFace Hub.
-    
+    Push a checkpoint to HuggingFace Hub with consistent naming (overwrites previous).
+
     Args:
         checkpoint_path: Path to the checkpoint file
         global_step: Current training step
@@ -641,19 +641,19 @@ def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type=
         except Exception:
             pass  # Repo likely exists
         
-        # Determine path in repo
-        checkpoint_name = Path(checkpoint_path).name
+        # Use consistent path naming (overwrites previous checkpoints)
         if checkpoint_type == "best":
-            path_in_repo = f"checkpoints/best/{checkpoint_name}"
+            path_in_repo = f"checkpoints/best/best-checkpoint.pt"
             commit_msg = f"Best alignment checkpoint (step {global_step}, sim={correct_sim:.4f})"
         elif checkpoint_type == "best-stage2":
-            path_in_repo = f"checkpoints/best-stage2/{checkpoint_name}"
+            path_in_repo = f"checkpoints/best-stage2/best-stage2-checkpoint.pt"
             commit_msg = f"Best Stage 2 model (step {global_step}, score={correct_sim:.6f})"
         else:
-            path_in_repo = f"checkpoints/step_{global_step}/{checkpoint_name}"
-            commit_msg = f"Step {global_step} checkpoint"
-        
-        # Upload
+            # Not used anymore - step checkpoints removed
+            path_in_repo = f"checkpoints/latest/checkpoint.pt"
+            commit_msg = f"Latest checkpoint (step {global_step})"
+
+        # Upload (this will overwrite the previous file)
         print(f"   🤗 Uploading to HuggingFace: {path_in_repo}")
         api.upload_file(
             path_or_fileobj=str(checkpoint_path),
@@ -663,7 +663,7 @@ def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type=
             commit_message=commit_msg,
             token=hf_token
         )
-        print(f"   ✅ Uploaded to https://huggingface.co/{repo_id}")
+        print(f"   ✅ Uploaded to https://huggingface.co/{repo_id} (overwrote previous)")
         return True
         
     except Exception as e:
@@ -671,29 +671,7 @@ def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type=
         return False
 
 
-def save_step_checkpoint(model, optimizer, global_step, config, stage_name="default"):
-    """Save checkpoint at fixed step intervals without overwriting previous ones."""
-    checkpoint_dir = Path(config.output_dir) / "checkpoints"
-    checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
-    checkpoint_path = checkpoint_dir / f"checkpoint-{global_step}.pt"
-    checkpoint_path = _unique_path(checkpoint_path)
-
-    torch.save({
-        'global_step': global_step,
-        'model_state_dict': model.state_dict(),
-        'optimizer_state_dict': optimizer.state_dict(),
-        'config': vars(config),
-        'stage_name': stage_name,
-        'alignment_mode': getattr(config, 'alignment_mode', 'baseline')
-    }, checkpoint_path)
-
-    print(f"💾 Step checkpoint saved: {checkpoint_path}")
-    
-    # Push to HuggingFace
-    push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type="step")
-    
-    return checkpoint_path
 
 
 def ensure_alignment_tracking_state(config):
@@ -1897,32 +1875,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 stage_name=stage_name
             )
 
-        # Step-based checkpointing (every 500 steps) on main process only
-        # Save checkpoints throughout training for Stage 2
-        checkpoint_interval = getattr(config, 'checkpoint_interval', 500)
-        stage_name = getattr(config, 'stage_name', 'default')
-
-        # For Stage 2, always save checkpoints every 500 steps
-        if is_main_process and global_step % checkpoint_interval == 0:
-            if 'stage2' in stage_name.lower():
-                save_step_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    global_step=global_step,
-                    config=config,
-                    stage_name=stage_name
-                )
-            else:
-                # For other stages, only save before force_continue threshold
-                force_continue_steps = getattr(config, 'force_continue_steps', 1500)
-                if global_step <= force_continue_steps:
-                    save_step_checkpoint(
-                        model=model,
-                        optimizer=optimizer,
-                        global_step=global_step,
-                        config=config,
-                        stage_name=stage_name
-                    )
+        # Step-based checkpointing disabled - only epoch checkpoints used
+        # This ensures consistent checkpoint behavior across all stages
 
         # Alignment-specific tracking (Stage 1)
         alignment_stop_code = 0
