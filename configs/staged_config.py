@@ -144,8 +144,8 @@ class Stage2Config:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     
-    batch_size: int = 8  # Reduced for FIBER + episodic memory
-    gradient_accumulation_steps: int = 8  # Effective batch = 64
+    batch_size: int = 64  # Optimized for 2x A100 80GB
+    gradient_accumulation_steps: int = 2  # Effective batch = 128
 
     num_epochs: int = 5
     

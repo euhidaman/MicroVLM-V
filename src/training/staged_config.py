@@ -210,9 +210,9 @@ class Stage2Config(TrainingConfig):
     num_epochs: int = 10  # More epochs for memory learning
     learning_rate: float = 1e-4  # Lower LR with memory
     warmup_steps: int = 1000
-    batch_size: int = 16  # Reduced for FIBER + memory (effective 64 with grad accum)
-    gradient_accumulation_steps: int = 4  # Effective batch = 64
-    num_workers: int = 12
+    batch_size: int = 64  # Increased from 16 to utilize A100 80GB memory
+    gradient_accumulation_steps: int = 2  # Effective batch = 128
+    num_workers: int = 16  # Increased for better data loading
 
     # Keep vision/language frozen, train adapter + memory
     freeze_vision: bool = False

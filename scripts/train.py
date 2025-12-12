@@ -24,6 +24,7 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
+from torch.cuda.amp import autocast, GradScaler
 from pathlib import Path
 import argparse
 from tqdm import tqdm
@@ -1686,7 +1687,7 @@ def compute_gradient_flow_metrics(model):
 
 
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
-                epoch, global_step, wandb_run=None, wandb_logger=None,
+                epoch, global_step, scaler=None, wandb_run=None, wandb_logger=None,
                 is_distributed=False, is_main_process=True, carbon_tracker=None,
                 attention_monitor=None, sliding_window_stopper=None, best_stage2_tracker=None):
     """Train for one epoch
@@ -1744,57 +1745,58 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # Labels for language modeling (shifted in model)
         labels = input_ids.clone()
 
-        # Forward pass - different path for FIBER vs baseline
-        # Get base model (unwrap DDP/DP if needed)
+        # Forward pass with mixed precision
         base_model = model.module if hasattr(model, 'module') else model
         
-        if use_fiber and isinstance(base_model, MicroVLMFIBER):
-            # FIBER forward pass with ITC + ITM losses
-            outputs = model(
-                images=images,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                use_memory=config.use_memory,
-                use_alignment=True  # Always use alignment in FIBER mode
-            )
-        else:
-            # Baseline forward pass
-            outputs = model(
-                images=images,
-                input_ids=input_ids,
-                attention_mask=attention_mask,
-                labels=labels,
-                use_memory=config.use_memory,
-                use_alignment=config.use_alignment,
-                episode_size=config.episode_size
-            )
+        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+            if use_fiber and isinstance(base_model, MicroVLMFIBER):
+                outputs = model(
+                    images=images,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    use_memory=config.use_memory,
+                    use_alignment=True
+                )
+            else:
+                outputs = model(
+                    images=images,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    use_memory=config.use_memory,
+                    use_alignment=config.use_alignment,
+                    episode_size=config.episode_size
+                )
 
-        loss = outputs['loss']
+            loss = outputs['loss']
 
-        # Debug: Check for NaN/Inf in loss components
+        # Check for NaN/Inf
         if torch.isnan(loss) or torch.isinf(loss):
             if is_main_process:
                 print(f"\n⚠️ Invalid loss detected at step {global_step} - skipping batch")
             optimizer.zero_grad()
+            scaler.update()
             continue
 
-        # Backward pass
+        # Backward pass with gradient scaling
         optimizer.zero_grad()
 
-        # Use gradient scaling for mixed precision stability
-        if hasattr(loss, 'backward'):
-            try:
-                loss.backward()
-            except RuntimeError as e:
-                if is_main_process:
-                    print(f"\n⚠️ Backward pass failed at step {global_step}: {e}")
-                optimizer.zero_grad()
-                continue
+        try:
+            scaler.scale(loss).backward()
+        except RuntimeError as e:
+            if is_main_process:
+                print(f"\n⚠️ Backward pass failed at step {global_step}: {e}")
+            optimizer.zero_grad()
+            scaler.update()
+            continue
 
-        # Check and sanitize gradients immediately after backward
+        # Unscale gradients for NaN check
+        scaler.unscale_(optimizer)
+
+        # Check and sanitize gradients
         has_nan = False
-        for name, param in model.named_parameters():
+        for param in model.parameters():
             if param.grad is not None:
                 if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
                     has_nan = True
@@ -1804,6 +1806,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             if is_main_process and global_step % 10 == 0:
                 print(f"\n⚠️ NaN gradients detected at step {global_step} - zeroed and continuing")
             optimizer.zero_grad()
+            scaler.update()
             continue
 
         # Compute gradient norm before clipping
@@ -1814,16 +1817,18 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
 
-        # Aggressive gradient clipping for stability
+        # Gradient clipping
         if config.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(), min(config.gradient_clip, 1.0))
 
-        # Log gradient norm periodically (main process only)
+        # Log gradient norm periodically
         if is_main_process and global_step % 100 == 0:
             print(f"\n  [Step {global_step}] Gradient norm: {total_norm:.4f}")
 
-        optimizer.step()
+        # Optimizer step with gradient scaling
+        scaler.step(optimizer)
+        scaler.update()
 
         if scheduler is not None:
             scheduler.step()
@@ -2931,6 +2936,11 @@ def main():
     total_steps = len(train_loader) * config.num_epochs
     scheduler = create_scheduler(optimizer, config, total_steps)
 
+    # Enable mixed precision training for better GPU utilization
+    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    if is_main_process:
+        print("Mixed precision training enabled with GradScaler")
+
     # Resume from checkpoint if specified
     start_epoch = 0
     global_step = 0
@@ -3129,6 +3139,7 @@ def main():
                 visualizer=visualizer,
                 epoch=epoch,
                 global_step=global_step,
+                scaler=scaler,
                 wandb_run=wandb_run,
                 wandb_logger=wandb_logger,
                 is_distributed=is_distributed,
