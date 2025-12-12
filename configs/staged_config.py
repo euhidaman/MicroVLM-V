@@ -144,9 +144,9 @@ class Stage2Config:
     weight_decay: float = 0.01
     max_grad_norm: float = 1.0
     
-    batch_size: int = 16
-    gradient_accumulation_steps: int = 4
-    
+    batch_size: int = 8  # Reduced for FIBER + episodic memory
+    gradient_accumulation_steps: int = 8  # Effective batch = 64
+
     num_epochs: int = 5
     
     # Loss weights (enable LM loss)
