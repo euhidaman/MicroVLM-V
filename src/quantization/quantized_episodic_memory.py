@@ -164,25 +164,35 @@ class QuantizedLinear158BitGrad(nn.Module):
         Forward with straight-through estimator for gradients
         Uses BitNet-style 1.58-bit weight quantization
         """
+        # Save original dtype for output
         input_dtype = x.dtype
+
+        # Convert input to float32 for stable computation
         x = x.to(torch.float32)
-        quantized_weight, scale = quantize_weights_158bit(self.weight)
+
+        # Quantize weights (operates on self.weight which should be float32)
+        weight_float32 = self.weight.to(torch.float32)
+        quantized_weight, scale = quantize_weights_158bit(weight_float32)
         dequantized_weight = dequantize_weights_158bit(quantized_weight, scale)
         
         # Track quantization error
         with torch.no_grad():
-            self.quant_error.fill_((self.weight - dequantized_weight).abs().mean())
-        
+            self.quant_error.fill_((weight_float32 - dequantized_weight).abs().mean())
+
         # Straight-through estimator: forward uses quantized, backward uses full precision
-        quantized_weight_ste = dequantized_weight + (self.weight - self.weight.detach())
-        
+        quantized_weight_ste = dequantized_weight + (weight_float32 - weight_float32.detach())
+
         # Optional: quantize activations for full BitNet emulation
         if self.training:
             x_quant, act_scale = quantize_activations_int8(x)
             x = x_quant.float() / act_scale
 
-        output = F.linear(x, quantized_weight_ste, self.bias)
-        return output.to(input_dtype) if output.dtype != input_dtype else output
+        # Perform linear operation in float32
+        bias_float32 = self.bias.to(torch.float32) if self.bias is not None else None
+        output = F.linear(x, quantized_weight_ste, bias_float32)
+
+        # Convert output back to original dtype
+        return output.to(input_dtype)
 
     def get_quantization_stats(self):
         """Return quantization error for monitoring"""
@@ -358,4 +368,5 @@ def apply_158bit_quantization_to_memory(module, memory_size=None, code_size=None
             setattr(module, name, quant_layer)
 
     return module
+
 
