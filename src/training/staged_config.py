@@ -220,11 +220,11 @@ class Stage2Config(TrainingConfig):
     train_memory: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Disable quantization for higher compute (memory still uses 1.58-bit)
+    # Enable quantization for compact model (<800MB target)
     enable_quantization: bool = True
     quantize_memory_158bit: bool = True
     quantize_vision_4bit: bool = False
-    quantize_language_4bit: bool = False
+    quantize_language_4bit: bool = True  # 4-bit Qwen reduces ~2GB to ~500MB
 
     # Memory-specific settings (from Larimar)
     memory_size: int = 512
@@ -302,11 +302,11 @@ class Stage3Config(TrainingConfig):
     freeze_adapter: bool = False  # Keep adapter trainable
     unfreeze_last_n_layers: int = 8  # Unfreeze more layers for instruction tuning
 
-    # Quantization - match Stage 2 settings
+    # Quantization - match Stage 2 settings for compact model
     enable_quantization: bool = True
     quantize_memory_158bit: bool = True
     quantize_vision_4bit: bool = False
-    quantize_language_4bit: bool = False
+    quantize_language_4bit: bool = True  # Keep 4-bit for <800MB model
 
     # Stage 3 output directory
     output_dir: str = "./checkpoints/stage3"
