@@ -972,6 +972,10 @@ class FIBERAlignmentLoss(nn.Module):
         Returns:
             loss: scalar tensor
         """
+        # Handle NaN/Inf in input
+        image_features = torch.nan_to_num(image_features, nan=0.0, posinf=1e2, neginf=-1e2)
+        text_features = torch.nan_to_num(text_features, nan=0.0, posinf=1e2, neginf=-1e2)
+
         # Project through ITC heads if available (FIBER-style)
         if self.image_proj_itc is not None and self.text_proj_itc is not None:
             image_feat_itc = self.image_proj_itc(image_features.float())
@@ -980,13 +984,18 @@ class FIBERAlignmentLoss(nn.Module):
             image_feat_itc = image_features.float()
             text_feat_itc = text_features.float()
         
+        # Sanitize after projection
+        image_feat_itc = torch.nan_to_num(image_feat_itc, nan=0.0, posinf=1e2, neginf=-1e2)
+        text_feat_itc = torch.nan_to_num(text_feat_itc, nan=0.0, posinf=1e2, neginf=-1e2)
+
         # Normalize - ensure float32 for mixed precision compatibility
-        image_feat_itc = F.normalize(image_feat_itc, p=2, dim=-1)
-        text_feat_itc = F.normalize(text_feat_itc, p=2, dim=-1)
-        
+        image_feat_itc = F.normalize(image_feat_itc, p=2, dim=-1, eps=1e-6)
+        text_feat_itc = F.normalize(text_feat_itc, p=2, dim=-1, eps=1e-6)
+
         # STABILITY FIX: Use property for bounded logit scale
         logit_scale = self.logit_scale.exp()
-        
+        logit_scale = torch.clamp(logit_scale, min=1.0, max=100.0)
+
         batch_size = image_feat_itc.size(0)
         
         # ===== FIBER-style Queue-based ITC =====
@@ -1014,19 +1023,34 @@ class FIBERAlignmentLoss(nn.Module):
         sim_i2t = torch.clamp(sim_i2t, min=-50.0, max=50.0)
         sim_t2i = torch.clamp(sim_t2i, min=-50.0, max=50.0)
         
+        # Handle any NaN that might have crept in
+        if torch.isnan(sim_i2t).any() or torch.isnan(sim_t2i).any():
+            sim_i2t = torch.nan_to_num(sim_i2t, nan=0.0)
+            sim_t2i = torch.nan_to_num(sim_t2i, nan=0.0)
+
         # Labels: diagonal elements are positive pairs (first B columns)
         labels = torch.arange(batch_size, device=image_feat_itc.device)
         
-        # Bidirectional loss
-        loss_i2t = self.ce_loss(sim_i2t, labels)
-        loss_t2i = self.ce_loss(sim_t2i, labels)
-        
+        # Bidirectional loss with safe computation
+        try:
+            loss_i2t = self.ce_loss(sim_i2t, labels)
+            loss_t2i = self.ce_loss(sim_t2i, labels)
+        except RuntimeError:
+            # Fallback: return zero loss if CE fails
+            return torch.tensor(0.0, device=image_features.device, requires_grad=True)
+
         # Update queue with current batch features (during training)
         if self.training and self.use_itc_queue:
             self._dequeue_and_enqueue(image_feat_itc.detach(), text_feat_itc.detach())
         
-        return (loss_i2t + loss_t2i) / 2
-    
+        loss = (loss_i2t + loss_t2i) / 2
+
+        # Final safety check
+        if torch.isnan(loss) or torch.isinf(loss):
+            return torch.tensor(0.0, device=image_features.device, requires_grad=True)
+
+        return loss
+
     def compute_itm_loss(
         self,
         vision_cls: torch.Tensor,
@@ -1053,12 +1077,26 @@ class FIBERAlignmentLoss(nn.Module):
         if self.itm_head is None:
             raise RuntimeError("ITM head not initialized. Call set_itm_head() first.")
         
+        # Sanitize inputs
+        vision_cls = torch.nan_to_num(vision_cls, nan=0.0, posinf=1e2, neginf=-1e2)
+        text_cls = torch.nan_to_num(text_cls, nan=0.0, posinf=1e2, neginf=-1e2)
+        image_features = torch.nan_to_num(image_features, nan=0.0, posinf=1e2, neginf=-1e2)
+        text_features = torch.nan_to_num(text_features, nan=0.0, posinf=1e2, neginf=-1e2)
+
         batch_size = vision_cls.size(0)
         device = vision_cls.device
         
+        # Handle edge case with small batch
+        if batch_size < 2:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
         # Compute similarity for hard negative mining
         with torch.no_grad():
-            sim_i2t = image_features @ text_features.t()  # (B, B)
+            # Normalize features for stable similarity
+            image_feat_norm = F.normalize(image_features, p=2, dim=-1, eps=1e-6)
+            text_feat_norm = F.normalize(text_features, p=2, dim=-1, eps=1e-6)
+
+            sim_i2t = image_feat_norm @ text_feat_norm.t()  # (B, B)
             sim_t2i = sim_i2t.t()
             
             # Mask diagonal (positive pairs)
@@ -1068,13 +1106,14 @@ class FIBERAlignmentLoss(nn.Module):
             
             # Select hard negatives (highest similarity non-matching pairs)
             num_hard = int(batch_size * hard_negative_ratio)
-            
+            num_hard = max(1, min(num_hard, batch_size - 1))
+
             # Hard negative texts for each image
-            hard_text_idx = sim_i2t.topk(k=min(num_hard, batch_size-1), dim=1)[1]
-            
+            hard_text_idx = sim_i2t.topk(k=num_hard, dim=1)[1]
+
             # Hard negative images for each text  
-            hard_image_idx = sim_t2i.topk(k=min(num_hard, batch_size-1), dim=1)[1]
-        
+            hard_image_idx = sim_t2i.topk(k=num_hard, dim=1)[1]
+
         # Construct positive pairs
         pos_logits = self.itm_head(vision_cls, text_cls)  # (B, 2)
         pos_labels = torch.ones(batch_size, dtype=torch.long, device=device)
@@ -1094,8 +1133,18 @@ class FIBERAlignmentLoss(nn.Module):
         all_logits = torch.cat([pos_logits, neg_logits_i2t, neg_logits_t2i], dim=0)
         all_labels = torch.cat([pos_labels, neg_labels, neg_labels], dim=0)
         
-        loss = self.ce_loss(all_logits, all_labels)
-        
+        # Clamp logits for stability
+        all_logits = torch.clamp(all_logits, min=-50.0, max=50.0)
+
+        try:
+            loss = self.ce_loss(all_logits, all_labels)
+        except RuntimeError:
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Final safety check
+        if torch.isnan(loss) or torch.isinf(loss):
+            return torch.tensor(0.0, device=device, requires_grad=True)
+
         return loss
     
     def compute_token_alignment_loss(

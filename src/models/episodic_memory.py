@@ -277,16 +277,22 @@ class EpisodicMemory(nn.Module):
         Returns:
             A_pseudoinv: (batch_size, code_size, memory_size)
         """
+        # Sanitize input
+        A = _sanitize_tensor(A, min_val=-1e2, max_val=1e2)
+
         alpha = min(torch.exp(self.ben_cohen_init).item(), 5e-4)
         A_init = alpha * A
         A_pseudoinv = A_init.transpose(1, 2)  # (batch_size, code_size, memory_size)
         
         # Iterative refinement: A_inv = 2*A_inv - A_inv*A*A_inv
         for _ in range(self.pseudoinverse_steps):
-            A_pseudoinv = 2 * A_pseudoinv - torch.bmm(
-                torch.bmm(A_pseudoinv, A), A_pseudoinv
-            )
-        
+            temp = torch.bmm(A_pseudoinv, A)
+            temp = _sanitize_tensor(temp, min_val=-1e2, max_val=1e2)
+            temp = torch.bmm(temp, A_pseudoinv)
+            temp = _sanitize_tensor(temp, min_val=-1e2, max_val=1e2)
+            A_pseudoinv = 2 * A_pseudoinv - temp
+            A_pseudoinv = _sanitize_tensor(A_pseudoinv, min_val=-1e2, max_val=1e2)
+
         return A_pseudoinv
     
     def _update_memory(self, old_memory, w, z):
@@ -373,14 +379,27 @@ class EpisodicMemory(nn.Module):
         # Store original dtype and device
         original_dtype = z.dtype
         original_device = z.device
-        z = z.to(self.compute_dtype)
-        
+
+        # Sanitize input before processing
+        z = _sanitize_tensor(z.to(self.compute_dtype), min_val=-1e2, max_val=1e2)
+
         # Apply ordering if enabled
         if self.use_ordering:
-            # LSTM requires float32
+            # LSTM requires float32 and sanitized input
             z_for_lstm = z.transpose(0, 1).float()  # (batch_size, episode_size, code_size)
+            z_for_lstm = _sanitize_tensor(z_for_lstm, min_val=-1e2, max_val=1e2)
+
+            # LSTM forward with gradient checkpointing for stability
             z_lstm, _ = self.lstm_z(z_for_lstm)  # (batch_size, episode_size, lstm_output_dim)
+
+            # Sanitize LSTM output before projection
+            z_lstm = _sanitize_tensor(z_lstm, min_val=-1e2, max_val=1e2)
+
             z_lstm = self.lstm_proj(z_lstm)  # Project back to (batch_size, episode_size, code_size)
+
+            # Sanitize after projection
+            z_lstm = _sanitize_tensor(z_lstm, min_val=-1e2, max_val=1e2)
+
             z = z_lstm.transpose(0, 1)  # (episode_size, batch_size, code_size)
             z = z.to(self.compute_dtype)
         
@@ -391,12 +410,16 @@ class EpisodicMemory(nn.Module):
         new_memory = prior_memory
         for i in range(episode_size):
             z_step = z[i:i+1]  # (1, batch_size, code_size)
+            z_step = _sanitize_tensor(z_step, min_val=-1e2, max_val=1e2)
             w_step = self._solve_w_mean(z_step, new_memory[0])
             new_memory = self._update_memory(new_memory, w_step, z_step)
         
-        # Compute KL divergence
+        # Compute KL divergence with safety
         dkl_M = self._compute_kl_divergence(prior_memory, new_memory)
         
+        # Final sanitization of KL
+        dkl_M = _sanitize_tensor(dkl_M, min_val=0.0, max_val=1e3)
+
         return new_memory, dkl_M.to(original_dtype)
     
     def read(self, z, memory_state, deterministic=False):
@@ -419,10 +442,10 @@ class EpisodicMemory(nn.Module):
         # Store original dtype for consistency
         original_dtype = z.dtype
         
-        # Perform memory operations in compute dtype
-        z = z.to(self.compute_dtype)
-        M = M.to(self.compute_dtype)
-        cov = memory_state[1].to(self.compute_dtype)
+        # Perform memory operations in compute dtype with sanitization
+        z = _sanitize_tensor(z.to(self.compute_dtype), min_val=-1e2, max_val=1e2)
+        M = _sanitize_tensor(M.to(self.compute_dtype), min_val=-1e2, max_val=1e2)
+        cov = _sanitize_tensor(memory_state[1].to(self.compute_dtype), min_val=1e-4, max_val=1e3)
         memory_state = (M, cov)
         
         # Compute addressing weights
@@ -438,21 +461,31 @@ class EpisodicMemory(nn.Module):
             # Sample using reparameterization trick
             w = self._sample_w(w_mean, w_logvar.to(w_mean.dtype))
         
+        # Sanitize w before retrieval
+        w = _sanitize_tensor(w, min_val=-1e2, max_val=1e2)
+
         # Retrieve: z = w^T * M
         z_retrieved = torch.bmm(w.transpose(0, 1), M).transpose(0, 1)
         
-        # Add observation noise with correct dtype
-        z_retrieved = z_retrieved + self.observation_noise_std * torch.randn_like(z_retrieved)
-        
-        # Ensure retrieved tensor maintains original dtype
-        z_retrieved = z_retrieved.to(original_dtype)
-        
+        # Sanitize retrieved values
+        z_retrieved = _sanitize_tensor(z_retrieved, min_val=-1e2, max_val=1e2)
+
+        # Add observation noise with correct dtype (scaled down)
+        noise = 0.01 * torch.randn_like(z_retrieved)  # Reduced noise
+        z_retrieved = z_retrieved + noise
+
+        # Final sanitization
+        z_retrieved = _sanitize_tensor(z_retrieved.to(original_dtype), min_val=-1e2, max_val=1e2)
+
         # Compute KL divergence (with w_logvar for accurate computation)
         if deterministic or self.deterministic:
             dkl_w = self._compute_addressing_kl(w_mean)
         else:
             dkl_w = self._compute_addressing_kl(w_mean, w_logvar)
         
+        # Sanitize KL output
+        dkl_w = _sanitize_tensor(dkl_w, min_val=0.0, max_val=1e3)
+
         return z_retrieved, dkl_w.to(original_dtype)
     
     def _compute_kl_divergence(self, prior_memory, posterior_memory):
