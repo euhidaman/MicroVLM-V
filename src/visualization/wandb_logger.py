@@ -749,6 +749,17 @@ class WandBLogger:
             if image.shape[0] in [1, 3]:  # CHW format
                 image = image.permute(1, 2, 0)
 
+            # Denormalize if needed (assume ImageNet normalization)
+            image = image.cpu().numpy()
+            if image.max() <= 1.0 and image.min() >= -1.0:
+                # Denormalize ImageNet
+                mean = np.array([0.485, 0.456, 0.406])
+                std = np.array([0.229, 0.224, 0.225])
+                image = image * std + mean
+                image = np.clip(image, 0, 1)
+
+        self.wandb_run.log({name: wandb.Image(image)}, step=step)
+
     def log_quantization_metrics(self, model, global_step, config=None):
         """
         Log comprehensive quantization metrics for 4-bit and 1.58-bit quantized components.
@@ -887,3 +898,4 @@ class WandBLogger:
 
             # Log all quantization metrics
             self.wandb_run.log(metrics, step=global_step)
+

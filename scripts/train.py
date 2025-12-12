@@ -1857,6 +1857,21 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         global_step += 1
 
+        # Log per-step loss immediately (every step) to ensure it's always visible in wandb
+        if is_main_process and wandb_logger:
+            immediate_loss_metrics = {
+                'train/step_loss': loss.item(),
+                'train/step': global_step,
+            }
+            if lm_loss_val is not None:
+                immediate_loss_metrics['train/step_lm_loss'] = lm_loss_val.item()
+            if alignment_loss_val is not None:
+                immediate_loss_metrics['train/step_alignment_loss'] = alignment_loss_val.item()
+            if memory_kl_val is not None:
+                immediate_loss_metrics['train/step_memory_kl'] = memory_kl_val.item()
+
+            wandb_logger.log_metrics(immediate_loss_metrics, step=global_step)
+
         # Check for best Stage 2 model (main process only)
         if best_stage2_tracker is not None and is_main_process:
             # Prepare metrics dictionary for evaluation
@@ -1877,7 +1892,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
             # Check and update best model
             stage_name = getattr(config, 'stage_name', 'stage2')
-            best_stage2_tracker.check_and_update(
+            is_new_best = best_stage2_tracker.check_and_update(
                 metrics_dict=current_metrics,
                 model=model,
                 optimizer=optimizer,
@@ -1885,6 +1900,21 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 config=config,
                 stage_name=stage_name
             )
+
+            # Log best stage 2 tracking metrics to wandb
+            if wandb_logger and global_step % config.log_interval == 0:
+                best_tracker_metrics = {
+                    'best_stage2/composite_score': best_stage2_tracker.best_composite_score,
+                    'best_stage2/best_step': best_stage2_tracker.best_step,
+                    'best_stage2/checks_without_improvement': best_stage2_tracker.checks_without_improvement,
+                    'best_stage2/is_new_best': 1.0 if is_new_best else 0.0,
+                }
+
+                # Log individual best metrics
+                for metric_name, metric_value in best_stage2_tracker.best_metrics.items():
+                    best_tracker_metrics[f'best_stage2/best_{metric_name}'] = metric_value
+
+                wandb_logger.log_metrics(best_tracker_metrics, step=global_step)
 
         # Step-based checkpointing disabled - only epoch checkpoints used
         # This ensures consistent checkpoint behavior across all stages
@@ -2028,6 +2058,28 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 # Language model metrics
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
+
+                # Memory metrics (if using memory) - log at every interval for visibility
+                if config.use_memory:
+                    base_model_for_memory = model.module if hasattr(model, 'module') else model
+                    if hasattr(base_model_for_memory, 'memory_state') and base_model_for_memory.memory_state is not None:
+                        memory_mean, memory_cov = base_model_for_memory.memory_state
+                        if memory_mean is not None and memory_mean.numel() > 0:
+                            # Log basic memory statistics every log_interval
+                            memory_metrics = {
+                                'memory/mean_norm': torch.norm(memory_mean, dim=-1).mean().item(),
+                                'memory/mean_std': memory_mean.std().item(),
+                                'memory/cov_mean': memory_cov.mean().item() if memory_cov is not None else 0.0,
+                            }
+
+                            # Check for quantized memory stats
+                            if hasattr(base_model_for_memory, 'episodic_memory'):
+                                if hasattr(base_model_for_memory.episodic_memory, 'quantized_memory_slots'):
+                                    memory_metrics['memory/is_quantized'] = 1.0
+                                else:
+                                    memory_metrics['memory/is_quantized'] = 0.0
+
+                            wandb_logger.log_metrics(memory_metrics, step=global_step)
 
                 # Sliding window early stopping metrics
                 if sliding_window_stopper is not None:
