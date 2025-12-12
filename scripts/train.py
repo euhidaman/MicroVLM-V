@@ -1745,10 +1745,12 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # Labels for language modeling (shifted in model)
         labels = input_ids.clone()
 
-        # Forward pass with mixed precision
+        # Forward pass with conditional mixed precision
+        # Disable autocast if using 4-bit quantized model (BitsAndBytes already optimized)
         base_model = model.module if hasattr(model, 'module') else model
-        
-        with torch.cuda.amp.autocast(enabled=True, dtype=torch.float16):
+        use_autocast = not getattr(config, 'quantize_language_4bit', False)
+
+        with torch.cuda.amp.autocast(enabled=use_autocast, dtype=torch.float16):
             if use_fiber and isinstance(base_model, MicroVLMFIBER):
                 outputs = model(
                     images=images,
@@ -2937,9 +2939,14 @@ def main():
     scheduler = create_scheduler(optimizer, config, total_steps)
 
     # Enable mixed precision training for better GPU utilization
-    scaler = torch.cuda.amp.GradScaler(enabled=True)
+    # Note: Disabled when using 4-bit quantization (BitsAndBytes already optimized)
+    use_mixed_precision = not getattr(config, 'quantize_language_4bit', False)
+    scaler = torch.cuda.amp.GradScaler(enabled=use_mixed_precision)
     if is_main_process:
-        print("Mixed precision training enabled with GradScaler")
+        if use_mixed_precision:
+            print("✓ Mixed precision training (FP16) enabled with GradScaler")
+        else:
+            print("✓ Using 4-bit quantized model (BitsAndBytes) - FP16 autocast disabled")
 
     # Resume from checkpoint if specified
     start_epoch = 0
