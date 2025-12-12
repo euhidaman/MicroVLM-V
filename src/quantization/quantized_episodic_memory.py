@@ -164,7 +164,8 @@ class QuantizedLinear158BitGrad(nn.Module):
         Forward with straight-through estimator for gradients
         Uses BitNet-style 1.58-bit weight quantization
         """
-        # Quantize weights during forward pass
+        input_dtype = x.dtype
+        x = x.to(torch.float32)
         quantized_weight, scale = quantize_weights_158bit(self.weight)
         dequantized_weight = dequantize_weights_158bit(quantized_weight, scale)
         
@@ -180,8 +181,9 @@ class QuantizedLinear158BitGrad(nn.Module):
             x_quant, act_scale = quantize_activations_int8(x)
             x = x_quant.float() / act_scale
 
-        return F.linear(x, quantized_weight_ste, self.bias)
-    
+        output = F.linear(x, quantized_weight_ste, self.bias)
+        return output.to(input_dtype) if output.dtype != input_dtype else output
+
     def get_quantization_stats(self):
         """Return quantization error for monitoring"""
         quantized_weight, _ = quantize_weights_158bit(self.weight)
@@ -356,5 +358,4 @@ def apply_158bit_quantization_to_memory(module, memory_size=None, code_size=None
             setattr(module, name, quant_layer)
 
     return module
-
 
