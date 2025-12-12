@@ -138,8 +138,8 @@ class Stage1Config(TrainingConfig):
     # Lower LR for stable contrastive learning (CLIP uses 5e-4 for full model)
     learning_rate: float = 5e-5
     warmup_steps: int = 2000  # ~10% of epoch, critical for contrastive stability
-    batch_size: int = 512  # Optimized for 2x A100 80GB (320 per GPU)
-    num_workers: int = 32  # Match GPU throughput
+    batch_size: int = 128  # Conservative for 2x A100 80GB (64 per GPU)
+    num_workers: int = 16  # Balanced for data loading
     gradient_clip: float = 1.0  # Standard clipping
     weight_decay: float = 0.1  # Higher weight decay for regularization
 
@@ -210,9 +210,9 @@ class Stage2Config(TrainingConfig):
     num_epochs: int = 10  # More epochs for memory learning
     learning_rate: float = 1e-4  # Lower LR with memory
     warmup_steps: int = 1000
-    batch_size: int = 512  # Optimized for 4-bit quantized model on A100 80GB
-    gradient_accumulation_steps: int = 2  # Effective batch = 192
-    num_workers: int = 32  # Increased for better data loading
+    batch_size: int = 128  # Conservative batch size for 4-bit quantized model on A100 80GB
+    gradient_accumulation_steps: int = 2  # Effective batch = 256
+    num_workers: int = 16  # Balanced for data loading
 
     # Keep vision/language frozen, train adapter + memory
     freeze_vision: bool = False
@@ -228,7 +228,7 @@ class Stage2Config(TrainingConfig):
     quantize_language_4bit: bool = True  # 4-bit Qwen reduces ~2GB to ~500MB
 
     # Memory-specific settings (from Larimar)
-    memory_size: int = 512 # Reduced from 512 to prevent OOM
+    memory_size: int = 512  # Memory slots for episodic storage
     observation_noise_std: float = 0.000001
     pseudoinverse_steps: int = 15
     memory_kl_weight: float = 0.02
