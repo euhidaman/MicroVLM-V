@@ -640,24 +640,38 @@ class MicroVLM_FIBER(nn.Module):
     
     def save_checkpoint(self, path: str):
         """Save model checkpoint with quantization"""
-        # Get state dict
+        import os
+
+        # For BitsAndBytes quantized models, we need special handling
+        if self.quantize_4bit and hasattr(self.language_model, 'model'):
+            print("Saving 4-bit quantized language model (BitsAndBytes format)...")
+
+        # Get state dict (BitsAndBytes weights are already quantized here)
         state_dict = self.state_dict()
 
-        # If quantization is enabled, convert weights to quantized format
+        # If memory quantization is enabled, apply bit-packing
         if self.quantize_memory_158bit:
-            # Episodic memory should already have quantized weights
-            if hasattr(self.episodic_memory, 'quantized_memory_slots'):
-                pass
-
-            # Convert 1.58-bit quantized layers to int8 storage
-            from ..quantization.quantize_158bit import quantize_weights_158bit
+            # Convert 1.58-bit quantized layers to packed int8 storage
+            from ..quantization.quantize_158bit import quantize_weights_158bit, pack_ternary_weights
             for key in list(state_dict.keys()):
-                if ('episodic_memory' in key or 'scope_detector' in key) and 'weight' in key and '.W_' not in key:
-                    if state_dict[key].dim() >= 2:
+                # Target episodic memory and scope detector layers
+                if ('episodic_memory' in key or 'scope_detector' in key) and 'weight' in key:
+                    # Skip if already quantized
+                    if 'quantized_memory_slots' in key or 'quant_error' in key:
+                        continue
+
+                    if state_dict[key].dim() >= 2:  # Only weight matrices
                         weight = state_dict[key]
                         quantized, scale = quantize_weights_158bit(weight)
-                        state_dict[key] = quantized.to(torch.int8)
-                        state_dict[key.replace('weight', 'weight_scale')] = scale
+
+                        # Pack to 2-bit representation for storage
+                        packed, shape = pack_ternary_weights(quantized)
+
+                        # Store packed weights and metadata
+                        state_dict[key] = packed
+                        state_dict[key + '_scale'] = scale
+                        state_dict[key + '_shape'] = torch.tensor(shape)
+                        state_dict[key + '_is_packed'] = torch.tensor(True)
 
         checkpoint = {
             'model_state_dict': state_dict,
@@ -668,12 +682,20 @@ class MicroVLM_FIBER(nn.Module):
             'quantize_4bit': self.quantize_4bit,
             'quantize_memory_158bit': self.quantize_memory_158bit
         }
-        torch.save(checkpoint, path)
 
-        # Calculate actual file size
-        import os
+        # Save with optimal compression
+        torch.save(checkpoint, path, _use_new_zipfile_serialization=True)
+
+        # Calculate and report actual file size
         file_size_mb = os.path.getsize(path) / (1024 * 1024)
         print(f"Checkpoint saved to {path} ({file_size_mb:.2f} MB)")
+
+        # Report compression stats
+        if self.quantize_4bit:
+            print(f"  - Language model: 4-bit quantized (BitsAndBytes)")
+        if self.quantize_memory_158bit:
+            print(f"  - Episodic memory: 1.58-bit quantized (BitNet)")
+            print(f"  - Memory slots: 4-bit quantized")
 
     def load_checkpoint(self, path: str):
         """Load model checkpoint and handle quantized weights"""
@@ -684,20 +706,39 @@ class MicroVLM_FIBER(nn.Module):
         quantize_memory_158bit = checkpoint.get('quantize_memory_158bit', False)
 
         if quantize_memory_158bit:
-            # Dequantize 1.58-bit weights for inference
-            from ..quantization.quantize_158bit import dequantize_weights_158bit
-            for key in list(state_dict.keys()):
-                if key.endswith('_scale'):
+            # Unpack and dequantize 1.58-bit weights
+            from ..quantization.quantize_158bit import dequantize_weights_158bit, unpack_ternary_weights
+
+            keys_to_process = list(state_dict.keys())
+            keys_to_remove = set()
+
+            for key in keys_to_process:
+                # Skip metadata keys
+                if key.endswith('_scale') or key.endswith('_shape') or key.endswith('_is_packed'):
+                    keys_to_remove.add(key)
                     continue
-                if ('episodic_memory' in key or 'scope_detector' in key) and 'weight' in key:
-                    if state_dict[key].dtype == torch.int8:
-                        scale_key = key.replace('weight', 'weight_scale')
-                        if scale_key in state_dict:
-                            quantized = state_dict[key]
-                            scale = state_dict[scale_key]
-                            dequantized = dequantize_weights_158bit(quantized.float(), scale)
-                            state_dict[key] = dequantized
-                            del state_dict[scale_key]
+
+                # Check if this weight was packed
+                is_packed_key = key + '_is_packed'
+                if is_packed_key in state_dict and state_dict[is_packed_key].item():
+                    # Unpack ternary weights
+                    packed = state_dict[key]
+                    scale = state_dict[key + '_scale']
+                    shape = tuple(state_dict[key + '_shape'].tolist())
+
+                    # Unpack and dequantize
+                    quantized = unpack_ternary_weights(packed, shape)
+                    dequantized = dequantize_weights_158bit(quantized, scale)
+
+                    state_dict[key] = dequantized
+                    keys_to_remove.add(key + '_scale')
+                    keys_to_remove.add(key + '_shape')
+                    keys_to_remove.add(key + '_is_packed')
+
+            # Remove metadata keys
+            for key in keys_to_remove:
+                if key in state_dict:
+                    del state_dict[key]
 
         self.load_state_dict(state_dict, strict=False)
         self.memory_state = checkpoint.get('memory_state', None)

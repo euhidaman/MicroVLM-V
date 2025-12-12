@@ -121,6 +121,11 @@ class Stage1Config:
     freeze_language_model: bool = True  # Freeze Qwen
     freeze_vision_in_fiber: bool = False  # Unfreeze for FIBER fusion
     
+    # Quantization settings (Stage 1 typically doesn't use memory)
+    quantize_language_4bit: bool = False  # Keep FP16 for alignment training
+    quantize_vision_4bit: bool = False
+    quantize_memory_158bit: bool = False  # Memory not used in Stage 1
+
     # Scheduler
     lr_scheduler: str = "cosine"  # cosine, linear, constant
     
@@ -149,6 +154,11 @@ class Stage2Config:
     contrastive_loss_weight: float = 0.1
     alignment_loss_weight: float = 0.1
     
+    # Quantization settings for model compression
+    quantize_language_4bit: bool = True  # 4-bit quantized language model (BitsAndBytes)
+    quantize_vision_4bit: bool = False   # Keep vision encoder in FP16
+    quantize_memory_158bit: bool = True  # 1.58-bit quantization for episodic memory
+
     # Sliding Window Early Stopping
     use_sliding_window_early_stop: bool = True
     sliding_window_size: int = 1000  # Number of steps in window (larger = more stable, ignores short-term noise)
@@ -193,6 +203,11 @@ class Stage3Config:
     freeze_language_model: bool = False
     freeze_adapter: bool = False
     
+    # Quantization settings
+    quantize_language_4bit: bool = True
+    quantize_vision_4bit: bool = False
+    quantize_memory_158bit: bool = True
+
     # LoRA settings (optional)
     use_lora: bool = False
     lora_r: int = 16
