@@ -13,6 +13,12 @@ import math
 EPSILON = 1e-6
 
 
+def _sanitize_tensor(t: torch.Tensor, min_val: float = -1e6, max_val: float = 1e6) -> torch.Tensor:
+    """Clamp tensor to finite range and replace NaN/Inf with safe defaults."""
+    t = torch.clamp(t, min=min_val, max=max_val)
+    return torch.nan_to_num(t, nan=0.0, posinf=max_val, neginf=min_val)
+
+
 class EpisodicMemory(nn.Module):
     """
     Larimar-style episodic memory with Gaussian Process Memory
@@ -192,8 +198,10 @@ class EpisodicMemory(nn.Module):
         Returns:
             w: sampled addressing weights (episode_size, batch_size, memory_size)
         """
-        std = torch.exp(0.5 * w_logvar)
-        
+        w_mean = _sanitize_tensor(w_mean, min_val=-1e3, max_val=1e3)
+        std = torch.exp(0.5 * torch.clamp(w_logvar, min=-10.0, max=10.0))
+        std = _sanitize_tensor(std, min_val=1e-6, max_val=1e3)
+
         # Handle different shapes of w_logvar
         if self._w_logvar_setting == 0:
             # Single scalar - broadcast to w_mean shape
@@ -205,8 +213,8 @@ class EpisodicMemory(nn.Module):
         
         # Reparameterization trick
         w_sample = w_mean + std * torch.randn_like(w_mean)
-        return w_sample
-    
+        return _sanitize_tensor(w_sample, min_val=-1e3, max_val=1e3)
+
     def _get_prior_params(self):
         """Get prior distribution parameters"""
         device = self.memory_mean.device
@@ -252,12 +260,13 @@ class EpisodicMemory(nn.Module):
         
         # Add observation noise
         z_noise = z + torch.randn_like(z) * self.observation_noise_std
-        
+        z_noise = _sanitize_tensor(z_noise, min_val=-1e2, max_val=1e2)
+
         w_mean = torch.bmm(z_noise, M_pseudoinv)  # (batch_size, episode_size, memory_size)
         w_mean = w_mean.transpose(0, 1)  # (episode_size, batch_size, memory_size)
         
-        return w_mean
-    
+        return _sanitize_tensor(w_mean, min_val=-1e3, max_val=1e3)
+
     def _approx_pseudo_inverse(self, A):
         """
         Approximate pseudo-inverse using Ben-Cohen iterative method
@@ -314,13 +323,13 @@ class EpisodicMemory(nn.Module):
         c_z = torch.clamp(c_z, min=-1e3, max=1e3)
         
         # Update mean: M_new = M_old + c_z^T * Delta
-        Delta_clamped = torch.clamp(Delta, min=-1e2, max=1e2)
+        Delta_clamped = _sanitize_tensor(Delta, min_val=-1e2, max_val=1e2)
         posterior_mean = old_mean + torch.bmm(
             c_z.transpose(0, 1).transpose(1, 2), 
             Delta_clamped.transpose(0, 1)
         )
-        posterior_mean = torch.clamp(posterior_mean, min=-1e3, max=1e3)
-        
+        posterior_mean = _sanitize_tensor(posterior_mean, min_val=-1e3, max_val=1e3)
+
         # Update covariance: Cov_new = Cov_old - c_z^T * wU
         posterior_cov = old_cov - torch.bmm(
             c_z.transpose(0, 1).transpose(1, 2),
@@ -329,7 +338,8 @@ class EpisodicMemory(nn.Module):
 
         # Ensure covariance stays symmetric positive-definite
         posterior_cov = 0.5 * (posterior_cov + posterior_cov.transpose(-1, -2))
-        
+        posterior_cov = _sanitize_tensor(posterior_cov, min_val=-1e3, max_val=1e3)
+
         # Clamp covariance diagonal to prevent extreme values
         diag_indices = torch.arange(self.memory_size, device=posterior_cov.device)
         posterior_cov[:, diag_indices, diag_indices] = torch.clamp(
@@ -454,56 +464,33 @@ class EpisodicMemory(nn.Module):
         R = R.to(R_prior.dtype)
         U = U.to(U_prior.dtype)
         
-        p_diag = torch.diagonal(U_prior, dim1=-2, dim2=-1)
-        q_diag = torch.diagonal(U, dim1=-2, dim2=-1)
-
-        # Debug: Check for problematic values before clamping
-        if torch.any(torch.isinf(p_diag)) or torch.any(torch.isinf(q_diag)):
-            print(f"⚠️ Inf detected in covariance diagonals before clamping")
-            print(f"  p_diag range: [{p_diag.min().item()}, {p_diag.max().item()}]")
-            print(f"  q_diag range: [{q_diag.min().item()}, {q_diag.max().item()}]")
-        
-        if torch.any(p_diag < EPSILON) or torch.any(q_diag < EPSILON):
-            print(f"⚠️ Very small diagonal values detected")
-            print(f"  p_diag min: {p_diag.min().item()}")
-            print(f"  q_diag min: {q_diag.min().item()}")
-
-        # Clamp diagonals to avoid division by zero or log of non-positive values
-        p_diag = torch.clamp(p_diag, min=1e-3, max=1e6)
-        q_diag = torch.clamp(q_diag, min=1e-3, max=1e6)
-        ratio = q_diag / p_diag
-        ratio = torch.clamp(ratio, min=EPSILON, max=1e3)
+        p_diag = _sanitize_tensor(torch.diagonal(U_prior, dim1=-2, dim2=-1), min_val=1e-4, max_val=1e4)
+        q_diag = _sanitize_tensor(torch.diagonal(U, dim1=-2, dim2=-1), min_val=1e-4, max_val=1e4)
+        ratio = _sanitize_tensor(q_diag / p_diag, min_val=1e-4, max_val=1e4)
 
         t1 = self.code_size * torch.sum(ratio, dim=-1)
         t1 = torch.clamp(t1, min=-1e6, max=1e6)
         
         # Clamp the squared difference to prevent explosion
-        diff_sq = (R - R_prior) ** 2
-        diff_sq = torch.clamp(diff_sq, max=1e3)
+        diff_sq = _sanitize_tensor((R - R_prior) ** 2, min_val=0.0, max_val=1e3)
         t2 = torch.sum(diff_sq / p_diag.unsqueeze(-1), dim=[-2, -1])
         t2 = torch.clamp(t2, min=-1e6, max=1e6)
         
         t3 = -self.code_size * self.memory_size
         
-        log_term = torch.log(p_diag) - torch.log(q_diag)
-        log_term = torch.clamp(log_term, min=-10.0, max=10.0)
+        log_term = _sanitize_tensor(torch.log(p_diag) - torch.log(q_diag), min_val=-10.0, max_val=10.0)
         t4 = self.code_size * torch.sum(log_term, dim=-1)
         t4 = torch.clamp(t4, min=-1e6, max=1e6)
         
         dkl_M = torch.mean(t1 + t2 + t3 + t4)
         
-        # Debug: Check final value
-        if torch.isinf(dkl_M) or torch.isnan(dkl_M):
-            print(f"⚠️ Invalid KL divergence computed")
-            print(f"  t1: {t1.mean().item()}")
-            print(f"  t2: {t2.mean().item()}")
-            print(f"  t3: {t3}")
-            print(f"  t4: {t4.mean().item()}")
-            print(f"  dkl_M: {dkl_M.item()}")
-        
-        dkl_M = torch.clamp(dkl_M, min=-1e6, max=1e6)
-        return dkl_M
-    
+        # Debug: Check for NaN or Inf
+        if torch.isnan(dkl_M) or torch.isinf(dkl_M):
+            print("⚠️ Invalid KL divergence detected – forcing to zero.")
+            dkl_M = torch.zeros_like(dkl_M)
+
+        return torch.clamp(dkl_M, min=-1e3, max=1e3)
+
     def _compute_addressing_kl(self, w_mean, w_logvar=None):
         """
         Compute KL divergence of addressing weights (Larimar-style).
@@ -542,16 +529,13 @@ class EpisodicMemory(nn.Module):
             else:
                 w_logvar_expanded = w_logvar
         
-        exp_term = torch.exp(w_logvar_expanded)
-        exp_term = torch.clamp(exp_term, max=1e3)
-        
-        # KL divergence: 0.5 * (sigma^2 + mu^2 - 1 - log(sigma^2))
-        dkl = 0.5 * (exp_term + w_mean ** 2 - 1 - w_logvar_expanded)
-        dkl = torch.clamp(dkl, min=0.0, max=1e3)
+        exp_term = _sanitize_tensor(torch.exp(w_logvar_expanded), min_val=1e-6, max_val=1e3)
+        kl_core = _sanitize_tensor(exp_term + w_mean ** 2 - 1 - w_logvar_expanded, min_val=-1e3, max_val=1e3)
+        dkl = 0.5 * kl_core
+        dkl = _sanitize_tensor(dkl, min_val=0.0, max_val=1e3)
         dkl = torch.sum(dkl, dim=-1)
-        dkl = torch.clamp(dkl, min=0.0, max=1e6)
-        return dkl
-    
+        return _sanitize_tensor(dkl, min_val=0.0, max_val=1e4)
+
     def project_to_kv(self, z_retrieved):
         """
         Project retrieved memory to KV space using W_M
