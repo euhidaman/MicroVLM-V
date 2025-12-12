@@ -224,13 +224,21 @@ class MicroVLM_FIBER(nn.Module):
         for module in [self.image_proj_for_alignment, self.text_proj_for_alignment]:
             for m in module.modules():
                 if isinstance(m, nn.Linear):
-                    nn.init.xavier_uniform_(m.weight, gain=0.1)
+                    nn.init.xavier_uniform_(m.weight, gain=0.01)
                     if m.bias is not None:
                         nn.init.zeros_(m.bias)
                 elif isinstance(m, nn.LayerNorm):
                     nn.init.ones_(m.weight)
                     nn.init.zeros_(m.bias)
     
+    def _safe_proj(self, proj_module, x):
+        """Apply projection with sanitization"""
+        x = torch.nan_to_num(x, nan=0.0, posinf=1e2, neginf=-1e2)
+        x = torch.clamp(x, min=-1e2, max=1e2)
+        out = proj_module(x)
+        out = torch.nan_to_num(out, nan=0.0, posinf=1e2, neginf=-1e2)
+        return torch.clamp(out, min=-1e2, max=1e2)
+
     def encode_image(
         self,
         images: torch.Tensor,
@@ -273,7 +281,7 @@ class MicroVLM_FIBER(nn.Module):
             raw_image_features = self.vision_encoder.get_cls_token(images)
         
         # Project to alignment space and normalize for stable similarity metrics
-        image_features = self.image_proj_for_alignment(raw_image_features)
+        image_features = self._safe_proj(self.image_proj_for_alignment, raw_image_features)
         image_features = F.normalize(image_features, p=2, dim=-1, eps=1e-6)
         
         # Project to language space via adapter
@@ -315,7 +323,7 @@ class MicroVLM_FIBER(nn.Module):
             raw_text_features = text_embeddings.mean(dim=1)
         
         # Project to alignment space and normalize to keep cosine similarities bounded
-        text_features = self.text_proj_for_alignment(raw_text_features)
+        text_features = self._safe_proj(self.text_proj_for_alignment, raw_text_features)
         text_features = F.normalize(text_features, p=2, dim=-1, eps=1e-6)
         
         return text_embeddings, text_features

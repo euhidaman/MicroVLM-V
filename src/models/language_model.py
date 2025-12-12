@@ -138,6 +138,11 @@ class Qwen2LanguageModel(nn.Module):
         Returns:
             outputs: CausalLMOutput or tuple
         """
+        # Sanitize inputs_embeds if provided
+        if inputs_embeds is not None:
+            inputs_embeds = torch.nan_to_num(inputs_embeds, nan=0.0, posinf=1e2, neginf=-1e2)
+            inputs_embeds = torch.clamp(inputs_embeds, min=-1e2, max=1e2)
+
         if self.model is not None:
             # Use HuggingFace model
             return self.model(

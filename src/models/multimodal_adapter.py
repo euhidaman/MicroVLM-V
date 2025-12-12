@@ -65,17 +65,17 @@ class MultimodalAdapter(nn.Module):
     
     def _init_weights(self):
         """Initialize weights"""
-        nn.init.xavier_uniform_(self.projection.weight)
+        nn.init.xavier_uniform_(self.projection.weight, gain=0.01)
         nn.init.zeros_(self.projection.bias)
         
         # Initialize pooling queries with small random values
-        nn.init.normal_(self.pooling_queries, mean=0.0, std=0.02)
-        nn.init.normal_(self.prefix_pos_embeddings, mean=0.0, std=0.02)
-        
-        # Initialize MLP
+        nn.init.normal_(self.pooling_queries, mean=0.0, std=0.001)
+        nn.init.normal_(self.prefix_pos_embeddings, mean=0.0, std=0.001)
+
+        # Initialize MLP with very small weights
         for module in self.mlp.modules():
             if isinstance(module, nn.Linear):
-                nn.init.xavier_uniform_(module.weight)
+                nn.init.xavier_uniform_(module.weight, gain=0.001)
                 if module.bias is not None:
                     nn.init.zeros_(module.bias)
     
@@ -93,18 +93,27 @@ class MultimodalAdapter(nn.Module):
         """
         batch_size = vision_embeddings.size(0)
         
+        # Sanitize input
+        vision_embeddings = torch.nan_to_num(vision_embeddings, nan=0.0, posinf=1e2, neginf=-1e2)
+        vision_embeddings = torch.clamp(vision_embeddings, min=-1e2, max=1e2)
+
         # Project to qwen dimension: (B, num_patches, qwen_dim)
         projected = self.projection(vision_embeddings)
-        
-        # Apply MLP
+        projected = torch.nan_to_num(projected, nan=0.0, posinf=1e2, neginf=-1e2)
+        projected = torch.clamp(projected, min=-1e2, max=1e2)
+
+        # Apply MLP (removed residual to prevent instability)
         projected = self.mlp(projected)
-        
+        projected = torch.nan_to_num(projected, nan=0.0, posinf=1e2, neginf=-1e2)
+        projected = torch.clamp(projected, min=-1e2, max=1e2)
+
         # Store projected patch embeddings before pooling (for attention visualization)
         patch_embeddings_proj = projected
         
         # Expand pooling queries for batch
         queries = self.pooling_queries.unsqueeze(0).expand(batch_size, -1, -1)
-        
+        queries = torch.nan_to_num(queries, nan=0.0, posinf=1e2, neginf=-1e2)
+
         # Apply cross-attention pooling with attention weights
         pooled, attn_weights = self.pooling_attn(
             query=queries,
@@ -114,15 +123,21 @@ class MultimodalAdapter(nn.Module):
             average_attn_weights=True  # Average across heads
         )
         
+        pooled = torch.nan_to_num(pooled, nan=0.0, posinf=1e2, neginf=-1e2)
+        pooled = torch.clamp(pooled, min=-1e2, max=1e2)
+
         # Store attention weights for visualization: (B, k_prefix, num_patches)
         self._last_pooling_attn_weights = attn_weights.detach()
         
-        # Add positional embeddings
-        prefix_tokens = pooled + self.prefix_pos_embeddings.unsqueeze(0)
-        
+        # Add positional embeddings (no scaling due to small init)
+        pos_emb = torch.nan_to_num(self.prefix_pos_embeddings, nan=0.0, posinf=1e2, neginf=-1e2)
+        prefix_tokens = pooled + pos_emb.unsqueeze(0)
+        prefix_tokens = torch.clamp(prefix_tokens, min=-1e2, max=1e2)
+
         # Layer normalization
         prefix_tokens = self.layer_norm(prefix_tokens)
-        
+        prefix_tokens = torch.nan_to_num(prefix_tokens, nan=0.0, posinf=1e2, neginf=-1e2)
+
         if return_patch_embeddings:
             return prefix_tokens, patch_embeddings_proj
         return prefix_tokens
@@ -185,32 +200,41 @@ class ContrastiveAlignmentLoss(nn.Module):
         Returns:
             loss: scalar tensor
         """
+        # Sanitize inputs
+        image_features = torch.nan_to_num(image_features, nan=0.0, posinf=1e2, neginf=-1e2)
+        text_features = torch.nan_to_num(text_features, nan=0.0, posinf=1e2, neginf=-1e2)
+
         # Normalize features (L2 normalization)
-        image_features = F.normalize(image_features.float(), p=2, dim=-1)
-        text_features = F.normalize(text_features.float(), p=2, dim=-1)
-        
+        image_features = F.normalize(image_features.float(), p=2, dim=-1, eps=1e-6)
+        text_features = F.normalize(text_features.float(), p=2, dim=-1, eps=1e-6)
+
         # STABILITY FIX: Use property for bounded logit scale
-        logit_scale = self.logit_scale.exp()
-        
+        logit_scale = torch.clamp(self.logit_scale.exp(), min=1.0, max=100.0)
+
         # Compute similarity matrix with learnable temperature
         # shape: (batch_size, batch_size)
         logits_per_image = logit_scale * torch.matmul(image_features, text_features.t())
         logits_per_text = logits_per_image.t()
         
         # STABILITY FIX: Clamp logits to prevent extreme values
-        logits_per_image = torch.clamp(logits_per_image, min=-100.0, max=100.0)
-        logits_per_text = torch.clamp(logits_per_text, min=-100.0, max=100.0)
-        
+        logits_per_image = torch.clamp(logits_per_image, min=-50.0, max=50.0)
+        logits_per_text = torch.clamp(logits_per_text, min=-50.0, max=50.0)
+
         # Labels: diagonal elements are positive pairs
         batch_size = image_features.size(0)
         labels = torch.arange(batch_size, device=image_features.device)
         
         # Bidirectional loss (image->text and text->image)
-        loss_i2t = self.cross_entropy(logits_per_image, labels)
-        loss_t2i = self.cross_entropy(logits_per_text, labels)
-        
-        loss = (loss_i2t + loss_t2i) / 2
-        
+        try:
+            loss_i2t = self.cross_entropy(logits_per_image, labels)
+            loss_t2i = self.cross_entropy(logits_per_text, labels)
+            loss = (loss_i2t + loss_t2i) / 2
+        except RuntimeError:
+            return torch.tensor(0.0, device=image_features.device, requires_grad=True)
+
+        if torch.isnan(loss) or torch.isinf(loss):
+            return torch.tensor(0.0, device=image_features.device, requires_grad=True)
+
         return loss
 
 

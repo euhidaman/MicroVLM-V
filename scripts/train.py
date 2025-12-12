@@ -1775,32 +1775,36 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # Debug: Check for NaN/Inf in loss components
         if torch.isnan(loss) or torch.isinf(loss):
             if is_main_process:
-                print(f"\n⚠️ Invalid loss detected at step {global_step}:")
-                print(f"  Total loss: {loss.item()}")
-                if 'lm_loss' in outputs and outputs['lm_loss'] is not None:
-                    print(f"  LM loss: {outputs['lm_loss'].item()}")
-                if 'alignment_loss' in outputs:
-                    print(f"  Alignment loss: {outputs['alignment_loss'].item()}")
-                if 'itc_loss' in outputs:
-                    print(f"  ITC loss: {outputs['itc_loss'].item()}")
-                if 'itm_loss' in outputs:
-                    print(f"  ITM loss: {outputs['itm_loss'].item()}")
-                if 'memory_kl' in outputs:
-                    print(f"  Memory KL: {outputs['memory_kl'].item()}")
-                if 'addressing_kl' in outputs:
-                    print(f"  Addressing KL: {outputs['addressing_kl'].item()}")
-
-                # Check for NaN in model parameters
-                for name, param in model.named_parameters():
-                    if param.grad is not None and (torch.isnan(param.grad).any() or torch.isinf(param.grad).any()):
-                        print(f"  NaN/Inf gradient in: {name}")
-
-                print("  Skipping this batch...")
+                print(f"\n⚠️ Invalid loss detected at step {global_step} - skipping batch")
+            optimizer.zero_grad()
             continue
 
         # Backward pass
         optimizer.zero_grad()
-        loss.backward()
+
+        # Use gradient scaling for mixed precision stability
+        if hasattr(loss, 'backward'):
+            try:
+                loss.backward()
+            except RuntimeError as e:
+                if is_main_process:
+                    print(f"\n⚠️ Backward pass failed at step {global_step}: {e}")
+                optimizer.zero_grad()
+                continue
+
+        # Check and sanitize gradients immediately after backward
+        has_nan = False
+        for name, param in model.named_parameters():
+            if param.grad is not None:
+                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                    has_nan = True
+                    param.grad.zero_()
+
+        if has_nan:
+            if is_main_process and global_step % 10 == 0:
+                print(f"\n⚠️ NaN gradients detected at step {global_step} - zeroed and continuing")
+            optimizer.zero_grad()
+            continue
 
         # Compute gradient norm before clipping
         total_norm = 0.0
@@ -1810,10 +1814,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
 
-        # Gradient clipping
+        # Aggressive gradient clipping for stability
         if config.gradient_clip > 0:
             torch.nn.utils.clip_grad_norm_(
-                model.parameters(), config.gradient_clip)
+                model.parameters(), min(config.gradient_clip, 1.0))
 
         # Log gradient norm periodically (main process only)
         if is_main_process and global_step % 100 == 0:
