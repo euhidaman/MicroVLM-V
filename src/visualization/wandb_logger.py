@@ -748,14 +748,142 @@ class WandBLogger:
             # Convert to HWC format for WandB
             if image.shape[0] in [1, 3]:  # CHW format
                 image = image.permute(1, 2, 0)
-            
-            # Denormalize if needed (assume ImageNet normalization)
-            image = image.cpu().numpy()
-            if image.max() <= 1.0 and image.min() >= -1.0:
-                # Denormalize ImageNet
-                mean = np.array([0.485, 0.456, 0.406])
-                std = np.array([0.229, 0.224, 0.225])
-                image = image * std + mean
-                image = np.clip(image, 0, 1)
-        
-        self.wandb_run.log({name: wandb.Image(image)}, step=step)
+
+    def log_quantization_metrics(self, model, global_step, config=None):
+        """
+        Log comprehensive quantization metrics for 4-bit and 1.58-bit quantized components.
+        Monitors quantization health during training.
+
+        Args:
+            model: the model (may be wrapped in DDP)
+            global_step: current training step
+            config: training config (optional, for quantization flags)
+        """
+        if not self.enabled:
+            return
+
+        base_model = model.module if hasattr(model, 'module') else model
+        metrics = {}
+
+        # 1.58-bit Memory Quantization Metrics
+        if config and getattr(config, 'quantize_memory_158bit', False):
+            if hasattr(base_model, 'episodic_memory'):
+                try:
+                    from ..quantization.quantized_episodic_memory import get_memory_quantization_stats
+                    quant_stats = get_memory_quantization_stats(base_model.episodic_memory)
+
+                    # Add prefix for organized wandb grouping
+                    for key, value in quant_stats.items():
+                        metrics[f'quantization/memory_158bit/{key}'] = value
+
+                    # Additional runtime metrics
+                    if hasattr(base_model.episodic_memory, 'quantized_memory_slots'):
+                        quant_mem = base_model.episodic_memory.quantized_memory_slots
+
+                        # Quantization value distribution
+                        if hasattr(quant_mem, 'memory_mean_quantized'):
+                            quant_vals = quant_mem.memory_mean_quantized.detach().cpu().numpy().flatten()
+                            unique_vals = np.unique(quant_vals)
+
+                            metrics['quantization/memory_158bit/unique_values'] = len(unique_vals)
+                            metrics['quantization/memory_158bit/mean_value'] = float(np.mean(quant_vals))
+                            metrics['quantization/memory_158bit/std_value'] = float(np.std(quant_vals))
+
+                            # Check if quantization is collapsing (all values same)
+                            if len(unique_vals) <= 2:
+                                metrics['quantization/memory_158bit/collapsed'] = 1.0
+                            else:
+                                metrics['quantization/memory_158bit/collapsed'] = 0.0
+
+                except Exception as e:
+                    warnings.warn(f"Failed to log memory quantization metrics: {e}")
+
+        # 4-bit Language Model Quantization Metrics
+        if config and getattr(config, 'quantize_language_4bit', False):
+            if hasattr(base_model, 'language_model'):
+                try:
+                    # Check for BitsAndBytes 4-bit quantization
+                    lm_model = base_model.language_model
+
+                    # Count quantized parameters
+                    num_4bit_params = 0
+                    num_total_params = 0
+
+                    for name, param in lm_model.named_parameters():
+                        num_total_params += param.numel()
+                        # BitsAndBytes marks quantized params with specific dtype
+                        if hasattr(param, 'quant_state') or 'int4' in str(param.dtype).lower():
+                            num_4bit_params += param.numel()
+
+                    if num_total_params > 0:
+                        metrics['quantization/language_4bit/quantized_params'] = num_4bit_params
+                        metrics['quantization/language_4bit/total_params'] = num_total_params
+                        metrics['quantization/language_4bit/quantized_ratio'] = num_4bit_params / num_total_params
+
+                    # Memory footprint estimation
+                    # 4-bit: 0.5 bytes per param, full precision: 2-4 bytes per param
+                    memory_saved_mb = (num_4bit_params * 1.5) / 1e6  # Saved bytes if using 2-byte fp16
+                    metrics['quantization/language_4bit/memory_saved_mb'] = memory_saved_mb
+
+                except Exception as e:
+                    warnings.warn(f"Failed to log language quantization metrics: {e}")
+
+        # 4-bit Vision Encoder Quantization Metrics (if enabled)
+        if config and getattr(config, 'quantize_vision_4bit', False):
+            if hasattr(base_model, 'vision_encoder'):
+                try:
+                    vision_model = base_model.vision_encoder
+
+                    # Count quantized parameters
+                    num_4bit_params = 0
+                    num_total_params = 0
+
+                    for name, param in vision_model.named_parameters():
+                        num_total_params += param.numel()
+                        if hasattr(param, 'quant_state') or 'int4' in str(param.dtype).lower():
+                            num_4bit_params += param.numel()
+
+                    if num_total_params > 0:
+                        metrics['quantization/vision_4bit/quantized_params'] = num_4bit_params
+                        metrics['quantization/vision_4bit/total_params'] = num_total_params
+                        metrics['quantization/vision_4bit/quantized_ratio'] = num_4bit_params / num_total_params
+
+                    memory_saved_mb = (num_4bit_params * 1.5) / 1e6
+                    metrics['quantization/vision_4bit/memory_saved_mb'] = memory_saved_mb
+
+                except Exception as e:
+                    warnings.warn(f"Failed to log vision quantization metrics: {e}")
+
+        # Overall quantization summary
+        if metrics:
+            total_quantized_params = (
+                metrics.get('quantization/memory_158bit/quantized_params', 0) +
+                metrics.get('quantization/language_4bit/quantized_params', 0) +
+                metrics.get('quantization/vision_4bit/quantized_params', 0)
+            )
+
+            total_params = sum(p.numel() for p in base_model.parameters())
+
+            if total_params > 0:
+                metrics['quantization/overall/quantized_params'] = total_quantized_params
+                metrics['quantization/overall/total_params'] = total_params
+                metrics['quantization/overall/quantized_ratio'] = total_quantized_params / total_params
+
+            # Estimate total model size with quantization
+            estimated_size_mb = 0
+            for name, param in base_model.named_parameters():
+                is_quantized = (
+                    hasattr(param, 'quant_state') or
+                    'int4' in str(param.dtype).lower() or
+                    'quantized' in name.lower()
+                )
+
+                if is_quantized:
+                    estimated_size_mb += param.numel() * 0.5 / 1e6  # 4-bit or 1.58-bit ~0.5 bytes
+                else:
+                    estimated_size_mb += param.numel() * 2 / 1e6  # fp16: 2 bytes
+
+            metrics['quantization/overall/estimated_model_size_mb'] = estimated_size_mb
+
+            # Log all quantization metrics
+            self.wandb_run.log(metrics, step=global_step)

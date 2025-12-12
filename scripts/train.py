@@ -2019,6 +2019,12 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     wandb_logger.log_metrics(
                         grad_flow_metrics, step=global_step)
 
+                # Quantization metrics (every 100 steps for Stage 2 with quantization)
+                if global_step % 100 == 0 and (getattr(config, 'quantize_memory_158bit', False) or
+                                                getattr(config, 'quantize_language_4bit', False) or
+                                                getattr(config, 'quantize_vision_4bit', False)):
+                    wandb_logger.log_quantization_metrics(model, global_step, config)
+
                 # Language model metrics
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
@@ -2033,6 +2039,14 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         'sliding_window/steps_without_improvement': sw_status['steps_without_improvement'],
                         'sliding_window/min_delta_threshold': sw_status['min_delta'],
                     }, step=global_step)
+
+                # Log quantization status flags for easy filtering in wandb
+                quant_flags = {
+                    'config/quantize_memory_158bit': 1.0 if getattr(config, 'quantize_memory_158bit', False) else 0.0,
+                    'config/quantize_language_4bit': 1.0 if getattr(config, 'quantize_language_4bit', False) else 0.0,
+                    'config/quantize_vision_4bit': 1.0 if getattr(config, 'quantize_vision_4bit', False) else 0.0,
+                }
+                wandb_logger.log_metrics(quant_flags, step=global_step)
 
             # Legacy simple logging (fallback)
             elif wandb_run:
@@ -2346,9 +2360,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         w_mean = viz_model.episodic_memory._solve_w_mean(
                             z_for_memory, viz_model.memory_state[0][:batch_size_for_vis])
 
+                        # Pass episodic memory module for quantization-aware logging
                         wandb_logger.log_memory_heatmap(
                             (viz_model.memory_state[0][:batch_size_for_vis],
-                             viz_model.memory_state[1][:batch_size_for_vis]), w_mean, global_step
+                             viz_model.memory_state[1][:batch_size_for_vis]),
+                            w_mean,
+                            global_step,
+                            episodic_memory_module=viz_model.episodic_memory
                         )
 
             model.train()
@@ -2810,15 +2828,17 @@ def main():
 
     # Log quantization statistics if enabled
     if getattr(config, 'quantize_memory_158bit', False) and hasattr(model, 'episodic_memory'):
-        quant_stats = get_memory_quantization_stats(model.episodic_memory)
+        base_model = model.module if hasattr(model, 'module') else model
+        quant_stats = get_memory_quantization_stats(base_model.episodic_memory)
         print("\n=== Memory Quantization Statistics ===")
         for key, value in quant_stats.items():
             print(f"  {key}: {value}")
         print("=" * 40 + "\n")
 
         if wandb_logger:
-            wandb_logger.log_metrics(
-                quant_stats, step=0, prefix="quantization")
+            # Log quantization stats with proper prefix
+            quant_metrics = {f"quantization/memory_{k}": v for k, v in quant_stats.items()}
+            wandb_logger.log_metrics(quant_metrics, step=0)
 
     # Apply freezing strategy from staged config
     apply_freezing_strategy(model, config, args.alignment_mode)
