@@ -3,6 +3,13 @@ Main Training Script for MicroVLM-V
 Supports small-scale testing, full training stages, and FIBER-style training
 """
 
+import os
+import sys
+from pathlib import Path
+
+# Add parent directory to path FIRST (before any src imports)
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 from src.quantization.quantized_episodic_memory import get_memory_quantization_stats
 from src.quantization.quantize_4bit import QuantizationConfig
 from src.visualization.wandb_logger import WandBLogger
@@ -13,8 +20,6 @@ from src.training.carbon_tracker import CarbonComputeTracker, estimate_model_flo
 from src.training.attention_monitor import AttentionQualityMonitor
 from src.data.cc12m_loader import create_dataloaders
 from src.models import create_microvlm, create_microvlm_fiber, MicroVLMFIBER
-import os
-import sys
 import json
 from datetime import datetime
 import math
@@ -25,14 +30,10 @@ from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
 from torch.cuda.amp import autocast, GradScaler
-from pathlib import Path
 import argparse
 from tqdm import tqdm
 import wandb
 from huggingface_hub import HfApi, create_repo, upload_file
-
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 class EarlyStopping:
