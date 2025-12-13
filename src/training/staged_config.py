@@ -245,8 +245,8 @@ class Stage2Config(TrainingConfig):
 
     # Sliding Window Early Stopping (step-based, robust to noisy losses)
     use_sliding_window_early_stop: bool = True
-    sliding_window_size: int = 1000  # 1000 steps per window
-    sliding_window_min_delta: float = 0.05  # Loss must improve by at least 0.05 (handles 1.31-1.67 range)
+    sliding_window_size: int = 500  # 500 steps per window (as specified)
+    sliding_window_min_delta: float = 0.05  # Loss must decrease by at least 0.05 (as specified)
     sliding_window_patience_steps: int = 3000  # Stop after 3000 steps without improvement
     sliding_window_eval_interval: int = 100  # Evaluate every 100 steps
     sliding_window_num_eval_windows: int = 8  # Need 8 flat windows to confirm plateau

@@ -97,50 +97,55 @@ class EarlyStopping:
 
 class SlidingWindowEarlyStopping:
     """
-    Simplified sliding-window based early stopping for training loss plateau detection.
-    Maintains a moving average window and stops when no meaningful improvement occurs.
+    Sliding-window based early stopping for training loss plateau detection.
+    Maintains a sliding window of the last 500 training steps.
+    Stops training if loss does not decrease by at least 0.05 across the window.
 
-    Suitable for noisy loss signals (e.g., losses varying between 1.3-1.7).
+    Robust to noisy loss signals and compatible with quantized training.
     """
 
-    def __init__(self, window_size=1000, min_delta=0.05, patience_steps=3000,
+    def __init__(self, window_size=500, min_delta=0.05, patience_steps=3000,
                  eval_interval=100, num_eval_windows=8, variance_threshold=0.01, verbose=True):
         """
         Args:
-            window_size: Number of steps to consider in moving average window (default: 1000)
-            min_delta: Minimum loss improvement threshold (default: 0.05 for losses in 1.3-1.7 range)
+            window_size: Number of steps to consider in sliding window (default: 500)
+            min_delta: Minimum loss decrease required across window (default: 0.05)
             patience_steps: Number of steps without improvement before stopping (default: 3000)
             eval_interval: How often to evaluate the window (default: 100 steps)
-            num_eval_windows: Kept for backward compatibility (unused in simplified version)
-            variance_threshold: Kept for backward compatibility (unused in simplified version)
+            num_eval_windows: Kept for backward compatibility
+            variance_threshold: Kept for backward compatibility
             verbose: Print status messages
         """
         self.window_size = window_size
         self.min_delta = min_delta
         self.patience_steps = patience_steps
-        self.eval_interval = eval_interval  # Now used for window evaluation frequency
+        self.eval_interval = eval_interval
         self.num_eval_windows = num_eval_windows  # Kept for config compatibility
         self.variance_threshold = variance_threshold  # Kept for config compatibility
         self.verbose = verbose
 
         self.loss_history = []
-        self.best_window_loss = float('inf')
+        self.earliest_window_loss = None  # Loss at beginning of window
         self.steps_without_improvement = 0
         self.total_steps = 0
+        self.best_loss = float('inf')
         self.best_step = 0
-        self.last_eval_step = 0  # Track when we last evaluated the window
+        self.last_eval_step = 0  # Track when we last evaluated
 
     def add_loss(self, loss_value, current_step):
         """
         Add a new loss value and check if training should stop.
-        Evaluates window at regular intervals (eval_interval) to prevent premature counter increments.
+
+        Checks if loss decreased by at least min_delta comparing:
+        - Current loss (most recent value)
+        - Earliest loss in the window (500 steps ago)
 
         Args:
             loss_value: Current training loss
             current_step: Current global step
 
         Returns:
-            bool: True if training should stop (plateau detected)
+            bool: True if training should stop (no improvement across window)
         """
         # Validate loss value
         if loss_value is None or math.isnan(loss_value) or math.isinf(loss_value):
@@ -151,58 +156,62 @@ class SlidingWindowEarlyStopping:
         self.loss_history.append(loss_value)
         self.total_steps = current_step
 
+        # Track overall best loss
+        if loss_value < self.best_loss:
+            self.best_loss = loss_value
+            self.best_step = current_step
+
         # Only start checking after we have enough data for one window
         if len(self.loss_history) < self.window_size:
             return False
 
-        # Only evaluate the window at regular intervals to avoid incrementing counter on every step
+        # Only evaluate at regular intervals
         steps_since_last_eval = current_step - self.last_eval_step
         if steps_since_last_eval < self.eval_interval:
-            # Not time to evaluate yet, just accumulate losses
             return False
 
-        # Time to evaluate the window
+        # Time to evaluate
         self.last_eval_step = current_step
 
-        # Calculate current window average
+        # Get earliest loss in window (500 steps ago) and current loss
         current_window = self.loss_history[-self.window_size:]
-        current_window_loss = sum(current_window) / len(current_window)
-        current_window_variance = sum((x - current_window_loss)**2 for x in current_window) / len(current_window)
+        earliest_loss = current_window[0]  # First element in window
+        current_loss = loss_value  # Most recent loss
 
-        # Check if this is a meaningful improvement
-        improvement = self.best_window_loss - current_window_loss
+        # Calculate window statistics for logging
+        window_mean = sum(current_window) / len(current_window)
+        window_variance = sum((x - window_mean)**2 for x in current_window) / len(current_window)
 
-        if improvement >= self.min_delta:
-            # Meaningful improvement detected - reset counters
-            self.best_window_loss = current_window_loss
+        # Check if loss decreased by at least min_delta across the window
+        loss_decrease = earliest_loss - current_loss
+
+        if loss_decrease >= self.min_delta:
+            # Loss decreased by at least min_delta - reset counter
             self.steps_without_improvement = 0
-            self.best_step = current_step
             if self.verbose:
-                print(f"\n  [SlidingWindow] ✅ Loss improved to {current_window_loss:.4f}")
-                print(f"     Improvement: Δ={improvement:.4f} (threshold: {self.min_delta})")
-                print(f"     Variance: {current_window_variance:.6f}")
-                print(f"     Window: {self.window_size} steps, Eval interval: {self.eval_interval}")
+                print(f"\n  [SlidingWindow] ✅ Loss decreased by {loss_decrease:.4f} across {self.window_size}-step window")
+                print(f"     Earliest: {earliest_loss:.4f} → Current: {current_loss:.4f} (threshold: {self.min_delta})")
+                print(f"     Window mean: {window_mean:.4f}, variance: {window_variance:.6f}")
         else:
-            # No meaningful improvement - increment by eval_interval steps
+            # No sufficient improvement - increment counter
             self.steps_without_improvement += self.eval_interval
 
             if self.verbose:
-                print(f"\n  [SlidingWindow] ⚠️  No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
-                print(f"     Current window loss: {current_window_loss:.4f}")
-                print(f"     Best window loss: {self.best_window_loss:.4f}")
-                print(f"     Improvement: Δ={improvement:.4f} (threshold: {self.min_delta})")
-                print(f"     Progress: {(self.steps_without_improvement / self.patience_steps * 100):.1f}% to stopping")
+                print(f"\n  [SlidingWindow] ⚠️  Loss decrease {loss_decrease:.4f} < threshold {self.min_delta}")
+                print(f"     Earliest: {earliest_loss:.4f} → Current: {current_loss:.4f}")
+                print(f"     Steps without improvement: {self.steps_without_improvement}/{self.patience_steps}")
+                print(f"     Progress to stopping: {(self.steps_without_improvement / self.patience_steps * 100):.1f}%")
 
-        # Stop if patience exceeded
+        # Check if should stop
         should_stop = self.steps_without_improvement >= self.patience_steps
 
         if should_stop:
             if self.verbose:
                 print(f"\n🛑 SLIDING WINDOW EARLY STOPPING TRIGGERED")
-                print(f"   No meaningful improvement (Δ >= {self.min_delta}) for {self.patience_steps} steps")
-                print(f"   Best window loss: {self.best_window_loss:.4f} at step {self.best_step}")
-                print(f"   Current window loss: {current_window_loss:.4f}")
-                print(f"   Loss improvement: {improvement:.4f} (below threshold {self.min_delta})")
+                print(f"   Loss did not decrease by {self.min_delta} for {self.patience_steps} steps")
+                print(f"   Window: {self.window_size} steps, Eval interval: {self.eval_interval}")
+                print(f"   Best loss: {self.best_loss:.4f} at step {self.best_step}")
+                print(f"   Current loss: {current_loss:.4f}")
                 print(f"   Training stopped at step {current_step}\n")
             return True
 
@@ -211,17 +220,24 @@ class SlidingWindowEarlyStopping:
     def get_status(self):
         """Get current status for logging"""
         # Calculate current window statistics if we have enough data
-        current_window_loss = self.best_window_loss
-        current_window_variance = 0.0
+        current_loss = self.loss_history[-1] if self.loss_history else float('inf')
+        earliest_loss = self.loss_history[-self.window_size] if len(self.loss_history) >= self.window_size else float('inf')
+        loss_decrease = earliest_loss - current_loss if len(self.loss_history) >= self.window_size else 0.0
+
+        window_mean = 0.0
+        window_variance = 0.0
         if len(self.loss_history) >= self.window_size:
             current_window = self.loss_history[-self.window_size:]
-            current_window_loss = sum(current_window) / len(current_window)
-            current_window_variance = sum((x - current_window_loss)**2 for x in current_window) / len(current_window)
+            window_mean = sum(current_window) / len(current_window)
+            window_variance = sum((x - window_mean)**2 for x in current_window) / len(current_window)
 
         return {
-            'best_window_loss': self.best_window_loss,
-            'current_window_loss': current_window_loss,
-            'current_window_variance': current_window_variance,
+            'best_loss': self.best_loss,
+            'current_loss': current_loss,
+            'earliest_window_loss': earliest_loss,
+            'loss_decrease': loss_decrease,
+            'window_mean': window_mean,
+            'window_variance': window_variance,
             'steps_without_improvement': self.steps_without_improvement,
             'total_steps': self.total_steps,
             'best_step': self.best_step,
@@ -1314,8 +1330,11 @@ This model was automatically stopped using **Sliding Window Plateau Detection**.
 
 ### Training Metrics at Stop
 
-- **Best Window Loss:** `{early_stop_metrics.get('best_window_loss', 'N/A'):.6f}`
-- **Current Window Loss:** `{early_stop_metrics.get('current_window_loss', 'N/A'):.6f}`
+- **Best Loss:** `{early_stop_metrics.get('best_loss', 'N/A'):.6f}` (at step `{early_stop_metrics.get('best_step', 'N/A')}`)
+- **Current Loss:** `{early_stop_metrics.get('current_loss', 'N/A'):.6f}`
+- **Earliest Window Loss:** `{early_stop_metrics.get('earliest_window_loss', 'N/A'):.6f}`
+- **Loss Decrease in Window:** `{early_stop_metrics.get('loss_decrease', 'N/A'):.6f}`
+- **Required Decrease Threshold:** `{early_stop_metrics.get('min_delta', 'N/A'):.3f}`
 - **Steps Without Improvement:** `{early_stop_metrics.get('steps_without_improvement', 'N/A')}`
 - **Total Training Steps:** `{early_stop_metrics.get('total_steps', 'N/A')}`
 - **Best Step:** `{early_stop_metrics.get('best_step', 'N/A')}`
@@ -2108,9 +2127,12 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 if sliding_window_stopper is not None:
                     sw_status = sliding_window_stopper.get_status()
                     wandb_logger.log_metrics({
-                        'sliding_window/best_window_loss': sw_status['best_window_loss'],
-                        'sliding_window/current_window_loss': sw_status['current_window_loss'],
-                        'sliding_window/current_window_variance': sw_status['current_window_variance'],
+                        'sliding_window/best_loss': sw_status['best_loss'],
+                        'sliding_window/current_loss': sw_status['current_loss'],
+                        'sliding_window/earliest_window_loss': sw_status['earliest_window_loss'],
+                        'sliding_window/loss_decrease': sw_status['loss_decrease'],
+                        'sliding_window/window_mean': sw_status['window_mean'],
+                        'sliding_window/window_variance': sw_status['window_variance'],
                         'sliding_window/steps_without_improvement': sw_status['steps_without_improvement'],
                         'sliding_window/min_delta_threshold': sw_status['min_delta'],
                     }, step=global_step)
@@ -2464,8 +2486,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         wandb_logger.log_metrics({
                             'early_stopping/triggered': 1.0,
                             'early_stopping/stop_step': global_step,
-                            'early_stopping/best_window_loss': stopper_status['best_window_loss'],
-                            'early_stopping/current_window_loss': stopper_status['current_window_loss'],
+                            'early_stopping/best_loss': stopper_status['best_loss'],
+                            'early_stopping/current_loss': stopper_status['current_loss'],
+                            'early_stopping/earliest_window_loss': stopper_status['earliest_window_loss'],
+                            'early_stopping/loss_decrease': stopper_status['loss_decrease'],
                             'early_stopping/steps_without_improvement': stopper_status['steps_without_improvement'],
                             'early_stopping/min_delta': stopper_status['min_delta'],
                         }, step=global_step)
@@ -3270,12 +3294,13 @@ def main():
                     elif stop_reason == 'alignment_negative':
                         print("   Reason: Alignment similarity stayed below threshold")
                     elif stop_reason == 'sliding_window_plateau':
-                        print("   Reason: Sliding window plateau - no meaningful training loss improvement")
+                        print("   Reason: Sliding window plateau - loss did not decrease by threshold")
                         if stopper_status:
-                            print(f"   Best window loss: {stopper_status['best_window_loss']:.4f}")
-                            print(f"   Current window loss: {stopper_status['current_window_loss']:.4f}")
+                            print(f"   Best loss: {stopper_status['best_loss']:.4f} at step {stopper_status['best_step']}")
+                            print(f"   Current loss: {stopper_status['current_loss']:.4f}")
+                            print(f"   Loss decrease in window: {stopper_status['loss_decrease']:.4f}")
+                            print(f"   Required decrease threshold: {stopper_status['min_delta']:.4f}")
                             print(f"   Steps without improvement: {stopper_status['steps_without_improvement']}")
-                            print(f"   Improvement threshold: {stopper_status['min_delta']:.4f}")
                     else:
                         print(f"   Reason: {stop_reason}")
                     print("   Saving final checkpoint before exit...")
