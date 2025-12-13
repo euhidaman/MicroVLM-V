@@ -110,7 +110,7 @@ class SlidingWindowEarlyStopping:
             window_size: Number of steps to consider in moving average window (default: 1000)
             min_delta: Minimum loss improvement threshold (default: 0.05 for losses in 1.3-1.7 range)
             patience_steps: Number of steps without improvement before stopping (default: 3000)
-            eval_interval: Kept for backward compatibility (unused in simplified version)
+            eval_interval: How often to evaluate the window (default: 100 steps)
             num_eval_windows: Kept for backward compatibility (unused in simplified version)
             variance_threshold: Kept for backward compatibility (unused in simplified version)
             verbose: Print status messages
@@ -118,7 +118,7 @@ class SlidingWindowEarlyStopping:
         self.window_size = window_size
         self.min_delta = min_delta
         self.patience_steps = patience_steps
-        self.eval_interval = eval_interval  # Kept for config compatibility
+        self.eval_interval = eval_interval  # Now used for window evaluation frequency
         self.num_eval_windows = num_eval_windows  # Kept for config compatibility
         self.variance_threshold = variance_threshold  # Kept for config compatibility
         self.verbose = verbose
@@ -128,11 +128,12 @@ class SlidingWindowEarlyStopping:
         self.steps_without_improvement = 0
         self.total_steps = 0
         self.best_step = 0
+        self.last_eval_step = 0  # Track when we last evaluated the window
 
     def add_loss(self, loss_value, current_step):
         """
         Add a new loss value and check if training should stop.
-        Simplified logic: tracks moving average and stops when no improvement over patience period.
+        Evaluates window at regular intervals (eval_interval) to prevent premature counter increments.
 
         Args:
             loss_value: Current training loss
@@ -141,12 +142,27 @@ class SlidingWindowEarlyStopping:
         Returns:
             bool: True if training should stop (plateau detected)
         """
+        # Validate loss value
+        if loss_value is None or math.isnan(loss_value) or math.isinf(loss_value):
+            if self.verbose and current_step % 100 == 0:
+                print(f"  [SlidingWindow] WARNING: Invalid loss value {loss_value} at step {current_step}, skipping")
+            return False
+
         self.loss_history.append(loss_value)
         self.total_steps = current_step
 
         # Only start checking after we have enough data for one window
         if len(self.loss_history) < self.window_size:
             return False
+
+        # Only evaluate the window at regular intervals to avoid incrementing counter on every step
+        steps_since_last_eval = current_step - self.last_eval_step
+        if steps_since_last_eval < self.eval_interval:
+            # Not time to evaluate yet, just accumulate losses
+            return False
+
+        # Time to evaluate the window
+        self.last_eval_step = current_step
 
         # Calculate current window average
         current_window = self.loss_history[-self.window_size:]
@@ -161,15 +177,21 @@ class SlidingWindowEarlyStopping:
             self.best_window_loss = current_window_loss
             self.steps_without_improvement = 0
             self.best_step = current_step
-            if self.verbose and current_step % 100 == 0:
-                print(f"  [SlidingWindow] Loss improved to {current_window_loss:.4f} (Δ={improvement:.4f}, var={current_window_variance:.4f})")
+            if self.verbose:
+                print(f"\n  [SlidingWindow] ✅ Loss improved to {current_window_loss:.4f}")
+                print(f"     Improvement: Δ={improvement:.4f} (threshold: {self.min_delta})")
+                print(f"     Variance: {current_window_variance:.6f}")
+                print(f"     Window: {self.window_size} steps, Eval interval: {self.eval_interval}")
         else:
-            # No meaningful improvement
-            self.steps_without_improvement += 1
+            # No meaningful improvement - increment by eval_interval steps
+            self.steps_without_improvement += self.eval_interval
 
-            if self.verbose and current_step % 100 == 0:
-                print(f"  [SlidingWindow] No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
-                print(f"     Current: {current_window_loss:.4f}, Best: {self.best_window_loss:.4f}, Δ={improvement:.4f}")
+            if self.verbose:
+                print(f"\n  [SlidingWindow] ⚠️  No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
+                print(f"     Current window loss: {current_window_loss:.4f}")
+                print(f"     Best window loss: {self.best_window_loss:.4f}")
+                print(f"     Improvement: Δ={improvement:.4f} (threshold: {self.min_delta})")
+                print(f"     Progress: {(self.steps_without_improvement / self.patience_steps * 100):.1f}% to stopping")
 
         # Stop if patience exceeded
         should_stop = self.steps_without_improvement >= self.patience_steps
