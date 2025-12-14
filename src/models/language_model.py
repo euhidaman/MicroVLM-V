@@ -110,6 +110,11 @@ class Qwen2LanguageModel(nn.Module):
         self.norm = self.model.model.norm
         self.lm_head = self.model.lm_head
 
+        # Enable gradient checkpointing to save memory during training
+        if hasattr(self.model, 'gradient_checkpointing_enable'):
+            self.model.gradient_checkpointing_enable()
+            print("✓ Gradient checkpointing enabled for memory efficiency")
+
         print("Qwen2.5-0.5B loaded successfully")
 
     def get_input_embeddings(self):

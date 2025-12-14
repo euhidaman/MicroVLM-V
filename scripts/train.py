@@ -1938,6 +1938,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         if scheduler is not None:
             scheduler.step()
 
+        # Clear CUDA cache periodically to prevent memory fragmentation
+        if global_step % 10 == 0:
+            torch.cuda.empty_cache()
+
         # Accumulate losses
         total_loss += loss.item()
 

@@ -210,8 +210,8 @@ class Stage2Config(TrainingConfig):
     num_epochs: int = 10  # More epochs for memory learning
     learning_rate: float = 1e-4  # Lower LR with memory
     warmup_steps: int = 1000
-    batch_size: int = 128  # Conservative batch size for 4-bit quantized model on A100 80GB
-    gradient_accumulation_steps: int = 2  # Effective batch = 256
+    batch_size: int = 32  # Reduced from 128 to prevent OOM with 2x A100 80GB
+    gradient_accumulation_steps: int = 4  # Effective batch = 128 (32*4)
     num_workers: int = 16  # Balanced for data loading
 
     # Keep vision/language frozen, train adapter + memory
@@ -227,10 +227,10 @@ class Stage2Config(TrainingConfig):
     quantize_vision_4bit: bool = False
     quantize_language_4bit: bool = True  # 4-bit Qwen reduces ~2GB to ~500MB
 
-    # Memory-specific settings (from Larimar)
-    memory_size: int = 512  # Memory slots for episodic storage
+    # Memory-specific settings (from Larimar) - REDUCED FOR MEMORY EFFICIENCY
+    memory_size: int = 64  # Reduced from 512 to 64 slots to save memory
     observation_noise_std: float = 0.000001
-    pseudoinverse_steps: int = 15
+    pseudoinverse_steps: int = 10  # Reduced from 15 to save memory
     memory_kl_weight: float = 0.02
     addressing_kl_weight: float = 0.005
 

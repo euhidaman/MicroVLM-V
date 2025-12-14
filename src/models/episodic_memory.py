@@ -285,13 +285,20 @@ class EpisodicMemory(nn.Module):
         A_pseudoinv = A_init.transpose(1, 2)  # (batch_size, code_size, memory_size)
         
         # Iterative refinement: A_inv = 2*A_inv - A_inv*A*A_inv
+        # Use inplace operations and delete intermediate tensors to save memory
         for _ in range(self.pseudoinverse_steps):
             temp = torch.bmm(A_pseudoinv, A)
             temp = _sanitize_tensor(temp, min_val=-1e2, max_val=1e2)
-            temp = torch.bmm(temp, A_pseudoinv)
-            temp = _sanitize_tensor(temp, min_val=-1e2, max_val=1e2)
-            A_pseudoinv = 2 * A_pseudoinv - temp
+            temp2 = torch.bmm(temp, A_pseudoinv)
+            del temp  # Free memory immediately
+            temp2 = _sanitize_tensor(temp2, min_val=-1e2, max_val=1e2)
+            A_pseudoinv = 2 * A_pseudoinv - temp2
+            del temp2  # Free memory immediately
             A_pseudoinv = _sanitize_tensor(A_pseudoinv, min_val=-1e2, max_val=1e2)
+
+        # Clear CUDA cache to prevent fragmentation
+        if A.is_cuda:
+            torch.cuda.empty_cache()
 
         return A_pseudoinv
     

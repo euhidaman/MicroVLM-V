@@ -22,7 +22,7 @@ class CC12MDataset(Dataset):
     """
     
     def __init__(self, metadata_file, image_dir=None, transform=None, max_samples=None,
-                 tokenizer=None, max_length=77):
+                 tokenizer=None, max_length=64):
         """
         Args:
             metadata_file: path to metadata JSON file (train_metadata.json or val_metadata.json)
@@ -30,7 +30,7 @@ class CC12MDataset(Dataset):
             transform: image transformations
             max_samples: limit number of samples (for testing)
             tokenizer: text tokenizer
-            max_length: maximum text length
+            max_length: maximum text length (reduced to 64 for memory efficiency)
         """
         self.image_dir = Path(image_dir) if image_dir else None
         self.transform = transform
