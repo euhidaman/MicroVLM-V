@@ -586,13 +586,30 @@ class AttentionVisualizer(nn.Module):
             # Fallback if tight_layout fails
             pass
 
-        # Save figure
+        # Save figure with proper error handling and file sync
         os.makedirs(os.path.dirname(save_path), exist_ok=True)
-        plt.savefig(save_path, dpi=150, bbox_inches='tight')
-        plt.close()
 
-        self.visualizations.append(save_path)
-        print(f"Saved side-by-side attention visualization to {save_path}")
+        try:
+            # Save with explicit format and buffer flush
+            plt.savefig(save_path, dpi=150, bbox_inches='tight', format='png')
+            plt.close()
+
+            # Ensure file is completely written to disk
+            import time
+            time.sleep(0.1)  # Small delay to ensure OS completes write
+
+            # Verify the saved file is valid
+            from PIL import Image as PILImage
+            with PILImage.open(save_path) as test_img:
+                test_img.verify()
+
+            self.visualizations.append(save_path)
+            print(f"Saved side-by-side attention visualization to {save_path}")
+        except Exception as e:
+            plt.close()  # Make sure to close figure even on error
+            print(f"⚠️ Failed to save attention visualization: {e}")
+            # Return None to indicate failure
+            return None
 
         return fig
 

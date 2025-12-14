@@ -2795,13 +2795,37 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
                         if wandb_logger and wandb_logger.wandb_run:
                             import wandb
-                            wandb_logger.wandb_run.log({
-                                'enhanced_viz/attention_sidebyside': wandb.Image(str(sbs_path)),
-                                'enhanced_viz/attention_entropy': stats['attention_entropy'],
-                                'enhanced_viz/attention_sparsity': stats['attention_sparsity'],
-                                'enhanced_viz/divergence': stats['divergence_statistic']
-                            }, step=global_step)
-                            
+                            import time
+
+                            # Wait a moment for file to be fully written
+                            time.sleep(0.5)
+
+                            # Verify image file is valid before logging
+                            try:
+                                from PIL import Image
+                                with Image.open(sbs_path) as img:
+                                    img.verify()  # Verify the image is complete
+
+                                # Re-open after verify (verify closes the file)
+                                with Image.open(sbs_path) as img:
+                                    img.load()  # Force load to check for truncation
+
+                                # Log with the correct current step (global_step already incremented)
+                                wandb_logger.wandb_run.log({
+                                    'enhanced_viz/attention_sidebyside': wandb.Image(str(sbs_path)),
+                                    'enhanced_viz/attention_entropy': stats['attention_entropy'],
+                                    'enhanced_viz/attention_sparsity': stats['attention_sparsity'],
+                                }, step=global_step)
+                            except Exception as e:
+                                print(f"⚠️ Failed to log attention visualization to wandb: {e}")
+                                print(f"   Skipping visualization upload for step {global_step}")
+                                # Log metrics without the image
+                                wandb_logger.wandb_run.log({
+                                    'enhanced_viz/attention_entropy': stats['attention_entropy'],
+                                    'enhanced_viz/attention_sparsity': stats['attention_sparsity'],
+                                    'enhanced_viz/divergence': stats['divergence_statistic']
+                                }, step=global_step)
+
                             # Log text-to-patch attention metrics if available
                             if text_to_patch_attn is not None:
                                 wandb_logger.log_text_to_patch_attention_metrics(
