@@ -3050,28 +3050,58 @@ def main():
     start_epoch = 0
     global_step = 0
     if args.resume and os.path.exists(args.resume):
-        print(f"Resuming from checkpoint: {args.resume}")
+        if is_main_process:
+            print(f"Resuming from checkpoint: {args.resume}")
         checkpoint = torch.load(args.resume, map_location=config.device)
 
         # Load model state with flexibility for architecture changes
         model_state = checkpoint.get('model_state_dict', checkpoint)
-        missing, unexpected = model.load_state_dict(model_state, strict=False)
-        if missing:
-            print(f"   ℹ️  Missing keys (new modules): {len(missing)} keys")
-        if unexpected:
-            print(f"   ℹ️  Unexpected keys (removed modules): {len(unexpected)} keys")
+
+        # Get current model state dict for size comparison
+        current_model = model.module if isinstance(model, DDP) else model
+        current_state = current_model.state_dict()
+
+        # Filter out size-mismatched keys
+        filtered_state = {}
+        size_mismatches = []
+        for key, value in model_state.items():
+            if key in current_state:
+                if current_state[key].shape == value.shape:
+                    filtered_state[key] = value
+                else:
+                    size_mismatches.append((key, value.shape, current_state[key].shape))
+            else:
+                # Key not in current model, still try to load (will be in unexpected)
+                filtered_state[key] = value
+
+        # Load filtered state dict
+        missing, unexpected = current_model.load_state_dict(filtered_state, strict=False)
+
+        if is_main_process:
+            if size_mismatches:
+                print(f"   ⚠️  Size mismatches (skipped): {len(size_mismatches)} keys")
+                for key, old_shape, new_shape in size_mismatches[:5]:  # Show first 5
+                    print(f"      {key}: {old_shape} -> {new_shape}")
+                if len(size_mismatches) > 5:
+                    print(f"      ... and {len(size_mismatches) - 5} more")
+            if missing:
+                print(f"   ℹ️  Missing keys (new modules): {len(missing)} keys")
+            if unexpected:
+                print(f"   ℹ️  Unexpected keys (removed modules): {len(unexpected)} keys")
 
         # Try to restore optimizer state
         try:
             if 'optimizer_state_dict' in checkpoint:
                 optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         except Exception as e:
-            print(f"   ⚠️  Could not restore optimizer state (architecture changed): {e}")
-            print(f"   Starting with fresh optimizer state")
+            if is_main_process:
+                print(f"   ⚠️  Could not restore optimizer state (architecture changed): {e}")
+                print(f"   Starting with fresh optimizer state")
 
         start_epoch = checkpoint.get('epoch', 0)
         global_step = checkpoint.get('global_step', 0)
-        print(f"   ✓ Resumed from epoch {start_epoch}, step {global_step}")
+        if is_main_process:
+            print(f"   ✓ Resumed from epoch {start_epoch}, step {global_step}")
 
     # Optional helpers
     visualizer = None
