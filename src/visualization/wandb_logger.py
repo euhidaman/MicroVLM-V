@@ -271,42 +271,48 @@ class WandBLogger:
             total_norm = total_norm ** 0.5
             metrics['gradients/total_norm'] = total_norm
 
-        # Component-wise gradient norms
-        component_grads = {
-            'vision_encoder': [],
-            'multimodal_adapter': [],
-            'language_model': [],
-            'episodic_memory': [],
-            'image_proj_for_alignment': [],
-            'text_proj_for_alignment': []
-        }
-        
-        for name, param in model.named_parameters():
-            if param.grad is not None:
-                grad_norm = param.grad.data.norm(2).item()
-                
-                # Categorize by component
-                if 'vision_encoder' in name:
-                    component_grads['vision_encoder'].append(grad_norm)
-                elif 'multimodal_adapter' in name:
-                    component_grads['multimodal_adapter'].append(grad_norm)
-                elif 'language_model' in name:
-                    component_grads['language_model'].append(grad_norm)
-                elif 'episodic_memory' in name:
-                    component_grads['episodic_memory'].append(grad_norm)
-                elif 'text_proj_for_alignment' in name:
-                    component_grads['text_proj_for_alignment'].append(grad_norm)
-                elif 'image_proj_for_alignment' in name:
-                    component_grads['image_proj_for_alignment'].append(grad_norm)
-        
-        # Log mean gradient norms per component
-        for component, grads in component_grads.items():
-            if grads:
-                metrics[f'gradients/{component}_mean'] = np.mean(grads)
-                metrics[f'gradients/{component}_max'] = np.max(grads)
-        
-        self.wandb_run.log(metrics, step=global_step)
-    
+            # Component-wise gradient norms
+            component_grads = {
+                'vision_encoder': [],
+                'multimodal_adapter': [],
+                'language_model': [],
+                'episodic_memory': [],
+                'image_proj_for_alignment': [],
+                'text_proj_for_alignment': []
+            }
+
+            for name, param in base_model.named_parameters():
+                if param.grad is not None:
+                    grad_norm = param.grad.data.norm(2).item()
+
+                    # Categorize by component
+                    if 'vision_encoder' in name:
+                        component_grads['vision_encoder'].append(grad_norm)
+                    elif 'multimodal_adapter' in name:
+                        component_grads['multimodal_adapter'].append(grad_norm)
+                    elif 'language_model' in name:
+                        component_grads['language_model'].append(grad_norm)
+                    elif 'episodic_memory' in name:
+                        component_grads['episodic_memory'].append(grad_norm)
+                    elif 'text_proj_for_alignment' in name:
+                        component_grads['text_proj_for_alignment'].append(grad_norm)
+                    elif 'image_proj_for_alignment' in name:
+                        component_grads['image_proj_for_alignment'].append(grad_norm)
+
+            # Log mean gradient norms per component
+            for component, grads in component_grads.items():
+                if grads:
+                    metrics[f'gradients/{component}_mean'] = np.mean(grads)
+                    metrics[f'gradients/{component}_max'] = np.max(grads)
+
+            # Log using robust method
+            if metrics:
+                self.log_metrics(metrics, global_step)
+
+        except Exception as e:
+            if global_step % 100 == 0:
+                print(f"[WandBLogger] WARNING: Failed to log gradient metrics: {e}")
+
     def log_vision_encoder_metrics(self, model, images, global_step, num_samples=4):
         """
         Log vision encoder visualizations and metrics
