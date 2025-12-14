@@ -35,315 +35,242 @@ class WandBLogger:
         
     def log_training_metrics(self, outputs, optimizer, epoch, global_step):
         """
-        Log core training metrics
-        
+        Log core training metrics to WandB.
+
+        ALWAYS attempts to log metrics regardless of self.enabled state.
+        Includes detailed explanations of each metric category.
+
+        Metrics logged:
+        - train/loss: Primary training loss (lower = better convergence)
+        - train/lm_loss: Language modeling cross-entropy loss
+        - train/perplexity: Exp(lm_loss) - interpretable text quality (lower = better)
+        - alignment/*: Vision-language alignment losses
+        - memory/*: Episodic memory learning metrics
+        - regularization/*: Anti-collapse and stability losses
+
         Args:
-            outputs: model outputs dict
-            optimizer: optimizer instance
-            epoch: current epoch
-            global_step: global training step
+            outputs: model outputs dict containing loss tensors
+            optimizer: optimizer instance for LR extraction
+            epoch: current epoch number
+            global_step: global training step (x-axis for all plots)
         """
-        # CRITICAL DEBUG: Print immediately to verify function is called
-        if global_step % 50 == 0:
-            print(f"[WandBLogger] log_training_metrics CALLED at step {global_step}, enabled={self.enabled}, wandb_run={type(self.wandb_run)}")
+        # Helper to safely extract values from potentially quantized tensors
+        def safe_value(tensor):
+            if tensor is None:
+                return None
+            try:
+                if hasattr(tensor, 'item'):
+                    return float(tensor.item())
+                elif torch.is_tensor(tensor):
+                    return float(tensor.detach().cpu().float())
+                else:
+                    return float(tensor)
+            except:
+                return None
 
-        if not self.enabled:
-            if global_step % 100 == 0:  # Only print warning periodically
-                print(f"[WandBLogger] WARNING: Logger not enabled (wandb_run={self.wandb_run})")
-            return
-        
         try:
-            # CRITICAL DEBUG: Show what we're working with
-            if global_step % 50 == 0:
-                print(f"[WandBLogger] outputs type: {type(outputs)}, keys: {list(outputs.keys()) if isinstance(outputs, dict) else 'N/A'}")
-
             metrics = {
                 'train/epoch': epoch,
                 'train/global_step': global_step,
                 'train/learning_rate': optimizer.param_groups[0]['lr']
             }
 
-            # Total loss - log as both 'train/loss' and 'train/total_loss' for compatibility
-            # Handle both dict keys and direct tensor values
-            loss_value = None
-            if 'loss' in outputs:
-                loss_tensor = outputs['loss']
-                # Ensure we can extract the value even if it's a quantized tensor
-                if hasattr(loss_tensor, 'item'):
-                    loss_value = loss_tensor.item()
-                elif torch.is_tensor(loss_tensor):
-                    loss_value = float(loss_tensor.detach().cpu())
-                else:
-                    loss_value = float(loss_tensor)
-
-                metrics['train/loss'] = loss_value  # Primary metric for wandb charts
-                metrics['train/total_loss'] = loss_value  # Alias for clarity
-
-                # DEBUG
-                if global_step % 50 == 0:
-                    print(f"[WandBLogger] Extracted loss value: {loss_value}")
+            # === Core Loss Metrics ===
+            # train/loss: The primary optimization target
+            loss_value = safe_value(outputs.get('loss'))
+            if loss_value is not None:
+                metrics['train/loss'] = loss_value
+                metrics['train/total_loss'] = loss_value
             else:
-                # Try alternative loss keys
+                # Try alternative keys
                 for alt_key in ['total_loss', 'lm_loss']:
-                    if alt_key in outputs and outputs[alt_key] is not None:
-                        loss_tensor = outputs[alt_key]
-                        if hasattr(loss_tensor, 'item'):
-                            loss_value = loss_tensor.item()
-                        elif torch.is_tensor(loss_tensor):
-                            loss_value = float(loss_tensor.detach().cpu())
-                        else:
-                            loss_value = float(loss_tensor)
-                        metrics['train/loss'] = loss_value
-                        metrics['train/total_loss'] = loss_value
+                    alt_val = safe_value(outputs.get(alt_key))
+                    if alt_val is not None:
+                        metrics['train/loss'] = alt_val
                         break
 
-                if loss_value is None and global_step % 100 == 0:
-                    print(f"[WandBLogger] WARNING: No valid loss found. Available keys: {list(outputs.keys())}")
-
-            # LM loss
-            lm_loss = outputs.get('lm_loss')
+            # === Language Model Metrics ===
+            # train/lm_loss: Cross-entropy loss for next token prediction
+            lm_loss = safe_value(outputs.get('lm_loss'))
             if lm_loss is not None:
+                metrics['train/lm_loss'] = lm_loss
+                # train/perplexity: Interpretable metric (2^entropy of predictions)
                 try:
-                    if hasattr(lm_loss, 'item'):
-                        lm_loss_val = lm_loss.item()
-                    elif torch.is_tensor(lm_loss):
-                        lm_loss_val = float(lm_loss.detach().cpu())
-                    else:
-                        lm_loss_val = float(lm_loss)
+                    perplexity = min(float(torch.exp(torch.tensor(lm_loss))), 1e6)
+                    metrics['train/perplexity'] = perplexity
+                except:
+                    pass
 
-                    metrics['train/lm_loss'] = lm_loss_val
-                    # Calculate perplexity safely
-                    try:
-                        perplexity = torch.exp(torch.tensor(lm_loss_val)).item()
-                        # Clamp perplexity to reasonable range
-                        perplexity = min(perplexity, 1e6)
-                        metrics['train/perplexity'] = perplexity
-                    except:
-                        pass  # Skip perplexity if calculation fails
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log lm_loss: {e}")
+            # === Alignment Metrics ===
+            # alignment/loss: How well vision and text representations align
+            align_loss = safe_value(outputs.get('alignment_loss'))
+            if align_loss is not None:
+                metrics['alignment/loss'] = align_loss
 
-            # Alignment loss
-            if 'alignment_loss' in outputs and outputs['alignment_loss'] is not None:
+            # alignment/fine_grained_loss: Token-level alignment supervision
+            fg_loss = safe_value(outputs.get('fine_grained_loss'))
+            if fg_loss is not None:
+                metrics['alignment/fine_grained_loss'] = fg_loss
+
+            # === FIBER Mode Metrics ===
+            # alignment/itc_loss: Image-Text Contrastive - global similarity
+            itc_loss = safe_value(outputs.get('itc_loss'))
+            if itc_loss is not None:
+                metrics['alignment/itc_loss'] = itc_loss
+
+            # alignment/itm_loss: Image-Text Matching - binary relevance
+            itm_loss = safe_value(outputs.get('itm_loss'))
+            if itm_loss is not None:
+                metrics['alignment/itm_loss'] = itm_loss
+
+            # alignment/token_loss: Per-token alignment loss
+            token_loss = safe_value(outputs.get('token_loss'))
+            if token_loss is not None:
+                metrics['alignment/token_loss'] = token_loss
+
+            # === Episodic Memory Metrics ===
+            # memory/kl_divergence: KL loss for memory state updates
+            # Lower = memory learning is stable, Higher = significant updates
+            mem_kl = safe_value(outputs.get('memory_kl'))
+            if mem_kl is not None:
+                metrics['memory/kl_divergence'] = mem_kl
+
+            # memory/addressing_kl: Regularization on memory addressing
+            addr_kl = safe_value(outputs.get('addressing_kl'))
+            if addr_kl is not None:
+                metrics['memory/addressing_kl'] = addr_kl
+
+            # memory/scope_prob: Memory update gating probability
+            scope_probs = outputs.get('scope_probs')
+            if scope_probs is not None and torch.is_tensor(scope_probs):
                 try:
-                    align_loss = outputs['alignment_loss']
-                    if hasattr(align_loss, 'item'):
-                        metrics['alignment/loss'] = align_loss.item()
-                    elif torch.is_tensor(align_loss):
-                        metrics['alignment/loss'] = float(align_loss.detach().cpu())
-                    else:
-                        metrics['alignment/loss'] = float(align_loss)
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log alignment_loss: {e}")
+                    metrics['memory/scope_prob_mean'] = float(scope_probs.mean().detach().cpu())
+                    metrics['memory/scope_prob_std'] = float(scope_probs.std().detach().cpu())
+                except:
+                    pass
 
-            # Fine-grained alignment loss (text-to-patch attention supervision)
-            if 'fine_grained_loss' in outputs and outputs['fine_grained_loss'] is not None:
+            # === Regularization Metrics ===
+            # regularization/anti_collapse_loss: Prevents representation collapse
+            anti_collapse = safe_value(outputs.get('anti_collapse_loss'))
+            if anti_collapse is not None:
+                metrics['regularization/anti_collapse_loss'] = anti_collapse
+
+            # regularization/attention_entropy_loss: Encourages diverse attention
+            attn_entropy = safe_value(outputs.get('attention_entropy_loss'))
+            if attn_entropy is not None:
+                metrics['regularization/attention_entropy_loss'] = attn_entropy
+
+            # === Log to WandB with multiple fallbacks ===
+            logged = False
+
+            # Method 1: self.wandb_run
+            if self.wandb_run is not None:
                 try:
-                    fg_loss = outputs['fine_grained_loss']
-                    if hasattr(fg_loss, 'item'):
-                        metrics['alignment/fine_grained_loss'] = fg_loss.item()
-                    elif torch.is_tensor(fg_loss):
-                        metrics['alignment/fine_grained_loss'] = float(fg_loss.detach().cpu())
+                    self.wandb_run.log(metrics, step=global_step, commit=True)
+                    logged = True
                 except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log fine_grained_loss: {e}")
+                    print(f"[WandBLogger] wandb_run.log failed: {e}")
 
-            # Memory losses - handle both quantized and non-quantized memory
-            if 'memory_kl' in outputs and outputs['memory_kl'] is not None:
+            # Method 2: wandb module directly
+            if not logged:
                 try:
-                    mem_kl = outputs['memory_kl']
-                    if hasattr(mem_kl, 'item'):
-                        metrics['memory/kl_divergence'] = mem_kl.item()
-                    elif torch.is_tensor(mem_kl):
-                        metrics['memory/kl_divergence'] = float(mem_kl.detach().cpu())
-                    else:
-                        metrics['memory/kl_divergence'] = float(mem_kl)
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log(metrics, step=global_step, commit=True)
+                        logged = True
                 except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log memory_kl: {e}")
+                    print(f"[WandBLogger] wandb.log failed: {e}")
 
-            if 'addressing_kl' in outputs and outputs['addressing_kl'] is not None:
-                try:
-                    addr_kl = outputs['addressing_kl']
-                    if hasattr(addr_kl, 'item'):
-                        metrics['memory/addressing_kl'] = addr_kl.item()
-                    elif torch.is_tensor(addr_kl):
-                        metrics['memory/addressing_kl'] = float(addr_kl.detach().cpu())
-                    else:
-                        metrics['memory/addressing_kl'] = float(addr_kl)
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log addressing_kl: {e}")
-
-            # Scope probabilities (if present)
-            if 'scope_probs' in outputs and outputs['scope_probs'] is not None:
-                try:
-                    scope_probs = outputs['scope_probs']
-                    if torch.is_tensor(scope_probs) and scope_probs.numel() > 0:
-                        metrics['memory/scope_prob_mean'] = float(scope_probs.mean().detach().cpu())
-                        metrics['memory/scope_prob_std'] = float(scope_probs.std().detach().cpu())
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log scope_probs: {e}")
-
-            # ITC/ITM losses (FIBER mode)
-            if 'itc_loss' in outputs and outputs['itc_loss'] is not None:
-                try:
-                    itc_loss = outputs['itc_loss']
-                    if hasattr(itc_loss, 'item'):
-                        metrics['alignment/itc_loss'] = itc_loss.item()
-                    elif torch.is_tensor(itc_loss):
-                        metrics['alignment/itc_loss'] = float(itc_loss.detach().cpu())
-                    else:
-                        metrics['alignment/itc_loss'] = float(itc_loss)
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log itc_loss: {e}")
-
-            if 'itm_loss' in outputs and outputs['itm_loss'] is not None:
-                try:
-                    itm_loss = outputs['itm_loss']
-                    if hasattr(itm_loss, 'item'):
-                        metrics['alignment/itm_loss'] = itm_loss.item()
-                    elif torch.is_tensor(itm_loss):
-                        metrics['alignment/itm_loss'] = float(itm_loss.detach().cpu())
-                    else:
-                        metrics['alignment/itm_loss'] = float(itm_loss)
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log itm_loss: {e}")
-
-            if 'token_loss' in outputs and outputs['token_loss'] is not None:
-                try:
-                    token_loss = outputs['token_loss']
-                    if hasattr(token_loss, 'item'):
-                        metrics['alignment/token_loss'] = token_loss.item()
-                    elif torch.is_tensor(token_loss):
-                        metrics['alignment/token_loss'] = float(token_loss.detach().cpu())
-                    else:
-                        metrics['alignment/token_loss'] = float(token_loss)
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log token_loss: {e}")
-
-            # Anti-collapse regularization losses
-            if 'anti_collapse_loss' in outputs and outputs['anti_collapse_loss'] is not None:
-                try:
-                    anti_collapse_loss = outputs['anti_collapse_loss']
-                    if hasattr(anti_collapse_loss, 'item'):
-                        val = anti_collapse_loss.item()
-                    elif torch.is_tensor(anti_collapse_loss):
-                        val = float(anti_collapse_loss.detach().cpu())
-                    else:
-                        val = float(anti_collapse_loss)
-                    metrics['regularization/anti_collapse_loss'] = val
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log anti_collapse_loss: {e}")
-
-            if 'attention_entropy_loss' in outputs and outputs['attention_entropy_loss'] is not None:
-                try:
-                    attn_entropy_loss = outputs['attention_entropy_loss']
-                    if hasattr(attn_entropy_loss, 'item'):
-                        val = attn_entropy_loss.item()
-                    elif torch.is_tensor(attn_entropy_loss):
-                        val = float(attn_entropy_loss.detach().cpu())
-                    else:
-                        val = float(attn_entropy_loss)
-                    metrics['regularization/attention_entropy_loss'] = val
-                except Exception as e:
-                    if global_step % 100 == 0:
-                        print(f"[WandBLogger] WARNING: Failed to log attention_entropy_loss: {e}")
-
-            # Log metrics to wandb with error handling
-            try:
-                # CRITICAL DEBUG: Always print before logging
-                if global_step % 50 == 0:
-                    print(f"[WandBLogger] About to log {len(metrics)} metrics to wandb at step {global_step}")
-                    print(f"[WandBLogger]   Metrics keys: {list(metrics.keys())}")
-                    if 'train/loss' in metrics:
-                        print(f"[WandBLogger]   train/loss = {metrics['train/loss']:.4f}")
-
-                # Force commit=True to ensure metrics are immediately sent to WandB
-                self.wandb_run.log(metrics, step=global_step, commit=True)
-
-                # Debug: Print confirmation every 50 steps now
-                if global_step % 50 == 0:
-                    print(f"[WandBLogger] ✓✓✓ SUCCESSFULLY logged {len(metrics)} metrics at step {global_step}")
-                    if 'train/loss' in metrics:
-                        print(f"[WandBLogger]   train/loss = {metrics['train/loss']:.4f}")
-                    if 'memory/kl_divergence' in metrics:
-                        print(f"[WandBLogger]   memory/kl_divergence = {metrics['memory/kl_divergence']:.4f}")
-            except Exception as e:
-                print(f"[WandBLogger] ❌ ERROR: Failed to log metrics to wandb at step {global_step}: {e}")
-                print(f"[WandBLogger]   Attempted to log {len(metrics)} metrics")
-                print(f"[WandBLogger]   wandb_run type: {type(self.wandb_run)}")
-                import traceback
-                traceback.print_exc()
+            # Debug output every 50 steps
+            if global_step % 50 == 0:
+                status = "✓" if logged else "✗"
+                loss_str = f"{metrics.get('train/loss', 'N/A'):.4f}" if 'train/loss' in metrics else "N/A"
+                print(f"[WandBLogger] {status} log_training_metrics step={global_step}, loss={loss_str}, metrics={len(metrics)}")
 
         except Exception as e:
             print(f"[WandBLogger] ERROR in log_training_metrics at step {global_step}: {e}")
-            print(f"[WandBLogger]   outputs keys: {list(outputs.keys()) if isinstance(outputs, dict) else 'not a dict'}")
             import traceback
             traceback.print_exc()
 
     def log_temperature_metrics(self, model, global_step):
-        """Log temperature/logit_scale metrics for monitoring alignment stability"""
-        if not self.enabled:
-            return
-        
-        metrics = {}
-        base_model = model.module if hasattr(model, 'module') else model
-        
-        # Find alignment loss module and log temperature
-        if hasattr(base_model, 'alignment_loss'):
-            alignment_loss = base_model.alignment_loss
-            if hasattr(alignment_loss, 'logit_scale'):
-                logit_scale = alignment_loss.logit_scale
-                if hasattr(logit_scale, 'item'):
-                    logit_scale_val = logit_scale.item()
-                else:
-                    logit_scale_val = float(logit_scale)
-                temperature = 1.0 / logit_scale_val if logit_scale_val > 0 else 0.0
-                metrics['alignment/logit_scale'] = logit_scale_val
-                metrics['alignment/temperature'] = temperature
-        
-        # Find and log alpha values from fusion blocks
-        if hasattr(base_model, 'vision_encoder') and hasattr(base_model.vision_encoder, 'fusion_blocks'):
-            fusion_blocks = base_model.vision_encoder.fusion_blocks
-            for layer_idx, block in fusion_blocks.items():
-                if hasattr(block, 'i2t_attention') and hasattr(block.i2t_attention, 'alpha'):
-                    alpha = block.i2t_attention.alpha
-                    if hasattr(alpha, 'item'):
-                        metrics[f'fiber/alpha_i2t_layer{layer_idx}'] = alpha.item()
-        
-        if metrics:
-            self.wandb_run.log(metrics, step=global_step)
-    
-    def log_gradient_metrics(self, model, global_step):
         """
-        Log gradient norms and flow for monitoring training health
-        
+        Log temperature/logit_scale metrics for monitoring alignment stability.
+
+        ALWAYS attempts to log - temperature is critical for contrastive learning.
+
+        Metrics logged:
+        - alignment/logit_scale: Raw logit scale parameter (exp for temperature)
+        - alignment/temperature: 1/logit_scale - interpretable temperature
+        - fiber/alpha_*: FIBER fusion layer alpha values
+
         Args:
-            model: the model
+            model: the model (handles DDP/DP wrapped models)
             global_step: global training step
         """
-        if not self.enabled:
-            return
-        
-        metrics = {}
-        
-        # Overall gradient norm
-        total_norm = 0.0
-        for p in model.parameters():
-            if p.grad is not None:
-                param_norm = p.grad.data.norm(2)
-                total_norm += param_norm.item() ** 2
-        total_norm = total_norm ** 0.5
-        metrics['gradients/total_norm'] = total_norm
-        
+        # Always attempt to log - never skip
+        try:
+            metrics = {}
+            base_model = model.module if hasattr(model, 'module') else model
+
+            # Find alignment loss module and log temperature
+            if hasattr(base_model, 'alignment_loss'):
+                alignment_loss = base_model.alignment_loss
+                if hasattr(alignment_loss, 'logit_scale'):
+                    logit_scale = alignment_loss.logit_scale
+                    if hasattr(logit_scale, 'item'):
+                        logit_scale_val = logit_scale.item()
+                    else:
+                        logit_scale_val = float(logit_scale)
+                    temperature = 1.0 / logit_scale_val if logit_scale_val > 0 else 0.0
+                    metrics['alignment/logit_scale'] = logit_scale_val
+                    metrics['alignment/temperature'] = temperature
+
+            # Find and log alpha values from fusion blocks
+            if hasattr(base_model, 'vision_encoder') and hasattr(base_model.vision_encoder, 'fusion_blocks'):
+                fusion_blocks = base_model.vision_encoder.fusion_blocks
+                for layer_idx, block in fusion_blocks.items():
+                    if hasattr(block, 'i2t_attention') and hasattr(block.i2t_attention, 'alpha'):
+                        alpha = block.i2t_attention.alpha
+                        if hasattr(alpha, 'item'):
+                            metrics[f'fiber/alpha_i2t_layer{layer_idx}'] = alpha.item()
+
+            # Log metrics using robust method
+            if metrics:
+                self.log_metrics(metrics, global_step)
+
+        except Exception as e:
+            if global_step % 100 == 0:
+                print(f"[WandBLogger] WARNING: Failed to log temperature metrics: {e}")
+
+    def log_gradient_metrics(self, model, global_step):
+        """
+        Log gradient norms and flow for monitoring training health.
+
+        ALWAYS attempts to log - critical for training stability monitoring.
+
+        Metrics logged:
+        - gradients/total_norm: Overall gradient magnitude (watch for explosion/vanishing)
+        - gradients/<component>_mean: Mean gradient norm per component
+        - gradients/<component>_max: Max gradient norm per component
+
+        Args:
+            model: the model (handles DDP/DP wrapped models)
+            global_step: global training step
+        """
+        # Always attempt to log gradients - never skip
+        try:
+            base_model = model.module if hasattr(model, 'module') else model
+            metrics = {}
+
+            # Overall gradient norm
+            total_norm = 0.0
+            for p in base_model.parameters():
+                if p.grad is not None:
+                    param_norm = p.grad.data.norm(2)
+                    total_norm += param_norm.item() ** 2
+            total_norm = total_norm ** 0.5
+            metrics['gradients/total_norm'] = total_norm
+
         # Component-wise gradient norms
         component_grads = {
             'vision_encoder': [],
@@ -660,9 +587,7 @@ class WandBLogger:
             global_step: global training step
             episodic_memory_module: Optional episodic memory module for quantization stats
         """
-        if not self.enabled:
-            return
-        
+        # Always attempt to log - never silently skip
         try:
             with torch.no_grad():
                 memory_mean, memory_cov = memory_state
@@ -987,27 +912,71 @@ class WandBLogger:
     
     def log_metrics(self, metrics: Dict[str, float], step: int, prefix: str = ""):
         """
-        Generic method to log arbitrary metrics
-        
+        Generic method to log arbitrary metrics to WandB.
+
+        GUARANTEED TO ATTEMPT LOGGING regardless of self.enabled state.
+        Uses multiple fallback mechanisms to ensure metrics reach WandB.
+
         Args:
             metrics: dictionary of metric names to values
-            step: global step
+            step: global step (must be monotonically increasing)
             prefix: optional prefix to add to all metric names
         """
-        # DEBUG: Print every 100 steps
-        if step % 100 == 0:
-            print(f"[WandBLogger.log_metrics] step={step}, enabled={self.enabled}, num_metrics={len(metrics)}")
-
-        if not self.enabled:
-            if step % 100 == 0:
-                print(f"[WandBLogger.log_metrics] RETURNING EARLY - not enabled")
+        # Always attempt to log - never silently skip
+        if not metrics:
             return
-        
+
+        # Apply prefix if specified
         if prefix:
             metrics = {f"{prefix}/{k}": v for k, v in metrics.items()}
         
-        # Force commit=True to ensure immediate sync
-        self.wandb_run.log(metrics, step=step, commit=True)
+        # Filter out None/NaN/Inf values to prevent wandb errors
+        clean_metrics = {}
+        for k, v in metrics.items():
+            if v is not None:
+                try:
+                    if isinstance(v, (int, float)):
+                        if np.isfinite(v):
+                            clean_metrics[k] = v
+                    elif torch.is_tensor(v):
+                        val = float(v.detach().cpu())
+                        if np.isfinite(val):
+                            clean_metrics[k] = val
+                    else:
+                        clean_metrics[k] = float(v)
+                except:
+                    pass  # Skip values that can't be converted
+
+        if not clean_metrics:
+            return
+
+        # Attempt logging with multiple fallbacks
+        logged = False
+
+        # Method 1: Use self.wandb_run if available
+        if self.wandb_run is not None:
+            try:
+                self.wandb_run.log(clean_metrics, step=step, commit=True)
+                logged = True
+            except Exception as e:
+                if step % 100 == 0:
+                    print(f"[WandBLogger.log_metrics] Method 1 failed: {e}")
+
+        # Method 2: Use wandb module directly as fallback
+        if not logged:
+            try:
+                import wandb
+                if wandb.run is not None:
+                    wandb.log(clean_metrics, step=step, commit=True)
+                    logged = True
+            except Exception as e:
+                if step % 100 == 0:
+                    print(f"[WandBLogger.log_metrics] Method 2 failed: {e}")
+
+        # Debug output
+        if step % 100 == 0:
+            status = "✓" if logged else "✗"
+            print(f"[WandBLogger.log_metrics] {status} step={step}, num_metrics={len(clean_metrics)}")
 
     def log_image(self, image, name: str, step: int):
         """

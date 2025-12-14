@@ -23,6 +23,7 @@ from src.models import create_microvlm, create_microvlm_fiber, MicroVLMFIBER
 import json
 from datetime import datetime
 import math
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.distributed as dist
@@ -1797,6 +1798,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         pbar = train_loader
 
     for batch_idx, batch in enumerate(pbar):
+        # CRITICAL DEBUG: Print at batch 0, 50, 100 to verify loop is running
+        if batch_idx % 50 == 0:
+            print(f"\n[BATCH LOOP] batch_idx={batch_idx}, current global_step={global_step}")
+
         # Start batch timing for carbon tracker
         if carbon_tracker is not None:
             carbon_tracker.start_batch()
@@ -1921,24 +1926,249 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         global_step += 1
 
-        # Log per-step loss immediately (every step) to ensure it's always visible in wandb
-        if is_main_process and wandb_logger:
-            # DEBUG: Print on first few steps and then every 50 steps
-            if global_step <= 5 or global_step % 50 == 0:
-                print(f"[PER-STEP LOG] step={global_step}, wandb_logger.enabled={wandb_logger.enabled}")
+        # ============================================================================
+        # MANDATORY WANDB LOGGING - NEVER SKIP, ALWAYS LOG
+        # This section guarantees wandb metrics are logged regardless of any condition
+        # ============================================================================
 
-            immediate_loss_metrics = {
-                'train/step_loss': loss.item(),
+        # Extract all loss values safely (handles quantized tensors)
+        def safe_tensor_value(tensor):
+            """Safely extract scalar value from any tensor including quantized ones"""
+            if tensor is None:
+                return None
+            try:
+                if hasattr(tensor, 'item'):
+                    return float(tensor.item())
+                elif torch.is_tensor(tensor):
+                    return float(tensor.detach().cpu().float())
+                else:
+                    return float(tensor)
+            except Exception:
+                return None
+
+        # Core metrics that MUST be logged every step
+        loss_val = safe_tensor_value(loss)
+        lm_loss_val_float = safe_tensor_value(lm_loss_val)
+        alignment_loss_val_float = safe_tensor_value(alignment_loss_val)
+        memory_kl_val_float = safe_tensor_value(memory_kl_val)
+        itc_loss_val_float = safe_tensor_value(itc_loss_val)
+        itm_loss_val_float = safe_tensor_value(itm_loss_val)
+
+        # UNCONDITIONAL LOGGING - Main process logs to WandB EVERY STEP
+        if is_main_process:
+            # Build comprehensive metrics dict
+            step_metrics = {
+                # === Core Training Metrics ===
+                # train/loss: Primary training loss - most important metric for convergence
+                'train/loss': loss_val,
+                # train/step: Current global training step for x-axis synchronization
                 'train/step': global_step,
+                # train/epoch: Current epoch (fractional based on progress)
+                'train/epoch': epoch + (batch_idx / len(train_loader)) if hasattr(train_loader, '__len__') else epoch,
+                # train/learning_rate: Current LR - critical for diagnosing training issues
+                'train/learning_rate': optimizer.param_groups[0]['lr'],
+                # train/gradient_norm: Gradient magnitude - indicates training stability
+                'train/gradient_norm': total_norm if 'total_norm' in dir() else 0.0,
             }
-            if lm_loss_val is not None:
-                immediate_loss_metrics['train/step_lm_loss'] = lm_loss_val.item()
-            if alignment_loss_val is not None:
-                immediate_loss_metrics['train/step_alignment_loss'] = alignment_loss_val.item()
-            if memory_kl_val is not None:
-                immediate_loss_metrics['train/step_memory_kl'] = memory_kl_val.item()
 
-            wandb_logger.log_metrics(immediate_loss_metrics, step=global_step)
+            # === Language Model Metrics ===
+            if lm_loss_val_float is not None:
+                # train/lm_loss: Language modeling loss - measures text generation quality
+                step_metrics['train/lm_loss'] = lm_loss_val_float
+                # train/perplexity: Exponential of LM loss - interpretable text quality metric
+                try:
+                    step_metrics['train/perplexity'] = min(float(torch.exp(torch.tensor(lm_loss_val_float))), 1e6)
+                except:
+                    pass
+
+            # === Alignment Metrics (Vision-Language) ===
+            if alignment_loss_val_float is not None:
+                # alignment/loss: How well vision and text are aligned
+                step_metrics['alignment/loss'] = alignment_loss_val_float
+
+            # === FIBER Mode Metrics ===
+            if itc_loss_val_float is not None:
+                # alignment/itc_loss: Image-Text Contrastive loss - global alignment
+                step_metrics['alignment/itc_loss'] = itc_loss_val_float
+            if itm_loss_val_float is not None:
+                # alignment/itm_loss: Image-Text Matching loss - fine-grained alignment
+                step_metrics['alignment/itm_loss'] = itm_loss_val_float
+
+            # === Episodic Memory Metrics ===
+            if memory_kl_val_float is not None:
+                # memory/kl_divergence: KL divergence for memory updates - measures memory learning
+                step_metrics['memory/kl_divergence'] = memory_kl_val_float
+
+            # Add addressing KL if available
+            addr_kl = outputs.get('addressing_kl')
+            if addr_kl is not None:
+                addr_kl_float = safe_tensor_value(addr_kl)
+                if addr_kl_float is not None:
+                    # memory/addressing_kl: Memory addressing distribution regularization
+                    step_metrics['memory/addressing_kl'] = addr_kl_float
+
+            # === Token Loss (if available) ===
+            token_loss = outputs.get('token_loss')
+            if token_loss is not None:
+                token_loss_float = safe_tensor_value(token_loss)
+                if token_loss_float is not None:
+                    # alignment/token_loss: Per-token alignment loss
+                    step_metrics['alignment/token_loss'] = token_loss_float
+
+            # Remove None values
+            step_metrics = {k: v for k, v in step_metrics.items() if v is not None}
+
+            # LOG DIRECTLY TO WANDB - bypassing any potential logger issues
+            try:
+                if wandb_logger and wandb_logger.wandb_run:
+                    wandb_logger.wandb_run.log(step_metrics, step=global_step, commit=True)
+                elif wandb_run:
+                    wandb_run.log(step_metrics, step=global_step, commit=True)
+                else:
+                    # Last resort - use wandb module directly
+                    import wandb
+                    if wandb.run is not None:
+                        wandb.log(step_metrics, step=global_step, commit=True)
+            except Exception as e:
+                if global_step % 100 == 0:
+                    print(f"[WANDB ERROR] Failed to log step metrics at step {global_step}: {e}")
+
+            # Debug print every 50 steps to confirm logging is happening
+            if global_step % 50 == 0:
+                print(f"\n[WANDB LOGGED] Step {global_step}: loss={loss_val:.4f}, lr={optimizer.param_groups[0]['lr']:.2e}, metrics={len(step_metrics)}")
+
+        # ============================================================================
+        # EXTENDED METRICS LOGGING (at log_interval)
+        # Additional detailed metrics logged less frequently for performance
+        # ============================================================================
+        if is_main_process and global_step % config.log_interval == 0:
+            try:
+                extended_metrics = {}
+                base_model = model.module if hasattr(model, 'module') else model
+
+                # === Quantization Metrics ===
+                # These metrics track the health and behavior of quantized components
+                if getattr(config, 'quantize_memory_158bit', False) or \
+                   getattr(config, 'quantize_language_4bit', False) or \
+                   getattr(config, 'quantize_vision_4bit', False):
+
+                    # quantization/enabled: Flag indicating quantization is active
+                    extended_metrics['quantization/enabled'] = 1.0
+                    extended_metrics['quantization/memory_158bit'] = 1.0 if getattr(config, 'quantize_memory_158bit', False) else 0.0
+                    extended_metrics['quantization/language_4bit'] = 1.0 if getattr(config, 'quantize_language_4bit', False) else 0.0
+                    extended_metrics['quantization/vision_4bit'] = 1.0 if getattr(config, 'quantize_vision_4bit', False) else 0.0
+
+                    # Get quantization-specific metrics from episodic memory
+                    if hasattr(base_model, 'episodic_memory'):
+                        em = base_model.episodic_memory
+
+                        # Memory slot statistics
+                        if hasattr(em, 'memory_mean'):
+                            mem_mean = em.memory_mean
+                            if torch.is_tensor(mem_mean):
+                                # quantization/memory_scale: Scale factor for quantized memory
+                                extended_metrics['quantization/memory_mean_norm'] = float(torch.norm(mem_mean).detach().cpu())
+                                extended_metrics['quantization/memory_mean_std'] = float(mem_mean.std().detach().cpu())
+
+                        # W_M quantization stats if using 1.58-bit
+                        if hasattr(em, 'W_M_quantized') and em.W_M_quantized is not None:
+                            W_M = em.W_M_quantized
+                            # quantization/W_M_sparsity: Fraction of zero weights (target ~0.25 for 1.58-bit)
+                            sparsity = float((W_M == 0).float().mean().detach().cpu())
+                            extended_metrics['quantization/W_M_sparsity'] = sparsity
+
+                # === Episodic Memory Detailed Metrics ===
+                if config.use_memory and hasattr(base_model, 'episodic_memory'):
+                    em = base_model.episodic_memory
+
+                    # Memory state metrics
+                    if hasattr(em, 'memory_mean') and em.memory_mean is not None:
+                        mem_mean = em.memory_mean
+                        num_slots = mem_mean.shape[0] if len(mem_mean.shape) > 0 else 1
+
+                        # memory/num_slots: Number of memory slots
+                        extended_metrics['memory/num_slots'] = num_slots
+
+                        # memory/slot_norms: Per-slot activation magnitudes (average)
+                        slot_norms = torch.norm(mem_mean, dim=-1) if len(mem_mean.shape) > 1 else torch.norm(mem_mean)
+                        extended_metrics['memory/slot_norm_mean'] = float(slot_norms.mean().detach().cpu())
+                        extended_metrics['memory/slot_norm_std'] = float(slot_norms.std().detach().cpu()) if slot_norms.numel() > 1 else 0.0
+                        extended_metrics['memory/slot_norm_max'] = float(slot_norms.max().detach().cpu())
+                        extended_metrics['memory/slot_norm_min'] = float(slot_norms.min().detach().cpu())
+
+                    # Memory covariance if available
+                    if hasattr(em, 'memory_logvar') and em.memory_logvar is not None:
+                        logvar = em.memory_logvar
+                        # memory/logvar_mean: Average log-variance (uncertainty) of memory slots
+                        extended_metrics['memory/logvar_mean'] = float(logvar.mean().detach().cpu())
+                        extended_metrics['memory/logvar_std'] = float(logvar.std().detach().cpu())
+
+                # === Attention Health Metrics ===
+                if 'token_attention' in outputs and outputs['token_attention'] is not None:
+                    try:
+                        token_attn = outputs['token_attention']
+                        if torch.is_tensor(token_attn) and token_attn.numel() > 0:
+                            # attention/entropy: Attention distribution entropy (higher = more uniform)
+                            attn_entropy = -torch.sum(token_attn * torch.log(token_attn + 1e-8), dim=-1)
+                            extended_metrics['attention/entropy_mean'] = float(attn_entropy.mean().detach().cpu())
+                            extended_metrics['attention/entropy_std'] = float(attn_entropy.std().detach().cpu())
+
+                            # attention/max: Maximum attention value (1.0 = collapsed to single token)
+                            extended_metrics['attention/max_mean'] = float(token_attn.max(dim=-1)[0].mean().detach().cpu())
+
+                            # attention/sparsity: Fraction of near-zero attention weights
+                            sparsity = float((token_attn < 0.01).float().mean().detach().cpu())
+                            extended_metrics['attention/sparsity'] = sparsity
+                    except Exception as e:
+                        pass  # Skip attention metrics if extraction fails
+
+                # === Numerical Health Metrics ===
+                # Track NaNs, Infs, and clipping to detect training instability
+                extended_metrics['health/loss_is_finite'] = 1.0 if (loss_val is not None and np.isfinite(loss_val)) else 0.0
+                extended_metrics['health/grad_norm'] = total_norm if 'total_norm' in dir() else 0.0
+
+                # Check for gradient clipping
+                if 'total_norm' in dir() and total_norm > getattr(config, 'max_grad_norm', 1.0):
+                    extended_metrics['health/grad_clipped'] = 1.0
+                else:
+                    extended_metrics['health/grad_clipped'] = 0.0
+
+                # === Log extended metrics ===
+                if extended_metrics:
+                    try:
+                        if wandb_logger and wandb_logger.wandb_run:
+                            wandb_logger.wandb_run.log(extended_metrics, step=global_step, commit=True)
+                        elif wandb_run:
+                            wandb_run.log(extended_metrics, step=global_step, commit=True)
+                        else:
+                            import wandb
+                            if wandb.run is not None:
+                                wandb.log(extended_metrics, step=global_step, commit=True)
+                    except Exception as e:
+                        print(f"[WANDB ERROR] Failed to log extended metrics: {e}")
+
+                # === Call WandB Logger methods for additional metrics ===
+                if wandb_logger:
+                    try:
+                        # Gradient metrics with explanations
+                        wandb_logger.log_gradient_metrics(model, global_step)
+
+                        # Temperature/alpha metrics for alignment stability
+                        wandb_logger.log_temperature_metrics(model, global_step)
+
+                        # Language model specific metrics
+                        wandb_logger.log_language_model_metrics(outputs, input_ids, global_step)
+
+                        # Quantization metrics (every 100 steps)
+                        if global_step % 100 == 0:
+                            wandb_logger.log_quantization_metrics(model, global_step, config)
+                    except Exception as e:
+                        print(f"[WANDB ERROR] Failed in logger methods at step {global_step}: {e}")
+
+            except Exception as e:
+                print(f"[WANDB ERROR] Extended metrics logging failed at step {global_step}: {e}")
+                import traceback
+                traceback.print_exc()
 
         # Check for best Stage 2 model (main process only)
         if best_stage2_tracker is not None and is_main_process:
