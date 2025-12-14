@@ -1926,6 +1926,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         global_step += 1
 
+        # CRITICAL DEBUG: Verify global_step is actually incrementing
+        if batch_idx % 50 == 0 or batch_idx < 3:
+            print(f"[GLOBAL_STEP DEBUG] After increment: batch_idx={batch_idx}, global_step={global_step}")
+
         # ============================================================================
         # MANDATORY WANDB LOGGING - NEVER SKIP, ALWAYS LOG
         # This section guarantees wandb metrics are logged regardless of any condition
