@@ -1792,7 +1792,8 @@ def compute_gradient_flow_metrics(model):
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, wandb_run=None, wandb_logger=None,
                 is_distributed=False, is_main_process=True, carbon_tracker=None,
-                attention_monitor=None, sliding_window_stopper=None, best_stage2_tracker=None):
+                attention_monitor=None, sliding_window_stopper=None, best_stage2_tracker=None,
+                best_model_tracker=None):
     """Train for one epoch
     
     Args:
@@ -3315,7 +3316,8 @@ def main():
                 carbon_tracker=carbon_tracker,
                 attention_monitor=attention_monitor,
                 sliding_window_stopper=sliding_window_stopper,
-                best_stage2_tracker=best_stage2_tracker
+                best_stage2_tracker=best_stage2_tracker,
+                best_model_tracker=best_model_tracker
             )
 
             # Unpack results (handle both old and new formats)
