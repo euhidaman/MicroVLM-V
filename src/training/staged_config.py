@@ -36,6 +36,7 @@ class TrainingConfig:
     # Training
     num_epochs: int = 5
     learning_rate: float = 1e-4
+    min_learning_rate: float = 1e-6  # Minimum LR for cosine decay (never goes below this)
     warmup_steps: int = 1000
     weight_decay: float = 0.01
     gradient_clip: float = 0.5
@@ -208,8 +209,9 @@ class Stage2Config(TrainingConfig):
     use_memory: bool = True  # Enable memory in Stage 2
     episode_size: int = 4  # Longer episodes for memory learning
     num_epochs: int = 10  # More epochs for memory learning
-    learning_rate: float = 1e-4  # Lower LR with memory
-    warmup_steps: int = 1000
+    learning_rate: float = 5e-5  # Reasonable LR for Stage 2 fine-tuning (was 1e-4, too high)
+    min_learning_rate: float = 1e-6  # Minimum LR for cosine decay
+    warmup_steps: int = 500  # Reduced warmup for faster training start
     batch_size: int = 32  # Reduced from 128 to prevent OOM with 2x A100 80GB
     gradient_accumulation_steps: int = 4  # Effective batch = 128 (32*4)
     num_workers: int = 16  # Balanced for data loading

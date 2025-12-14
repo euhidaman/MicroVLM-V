@@ -1591,30 +1591,40 @@ def create_scheduler(optimizer, config, total_steps):
     """Create learning rate scheduler with warmup for stable contrastive learning"""
     from torch.optim.lr_scheduler import LambdaLR
     
-    warmup_steps = getattr(config, 'warmup_steps', 1000)
+    warmup_steps = getattr(config, 'warmup_steps', 500)
+    min_lr_ratio = getattr(config, 'min_learning_rate', 1e-6) / config.learning_rate  # Min LR as ratio
     scheduler_name = getattr(config, 'scheduler', getattr(
         config, 'lr_scheduler', 'cosine'))
     
+    print(f"[Scheduler] Creating {scheduler_name} scheduler:")
+    print(f"   Peak LR: {config.learning_rate:.2e}")
+    print(f"   Min LR: {getattr(config, 'min_learning_rate', 1e-6):.2e}")
+    print(f"   Warmup steps: {warmup_steps}")
+    print(f"   Total steps: {total_steps}")
+
     if scheduler_name == "cosine":
         # Cosine annealing with linear warmup (CLIP-style)
         def lr_lambda(current_step):
             if current_step < warmup_steps:
-                # Linear warmup
-                return float(current_step) / float(max(1, warmup_steps))
-            # Cosine decay after warmup
+                # Linear warmup from min_lr to peak_lr
+                warmup_progress = float(current_step) / float(max(1, warmup_steps))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * warmup_progress
+            # Cosine decay after warmup (never goes below min_lr_ratio)
             import math
             progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            return max(0.0, 0.5 * (1.0 + math.cos(math.pi * progress)))
-        
+            cosine_decay = 0.5 * (1.0 + math.cos(math.pi * progress))
+            return min_lr_ratio + (1.0 - min_lr_ratio) * cosine_decay
+
         scheduler = LambdaLR(optimizer, lr_lambda)
     elif scheduler_name == "linear":
         # Linear decay with warmup
         def lr_lambda(current_step):
             if current_step < warmup_steps:
-                return float(current_step) / float(max(1, warmup_steps))
+                warmup_progress = float(current_step) / float(max(1, warmup_steps))
+                return min_lr_ratio + (1.0 - min_lr_ratio) * warmup_progress
             progress = float(current_step - warmup_steps) / float(max(1, total_steps - warmup_steps))
-            return max(0.0, 1.0 - progress)
-        
+            return max(min_lr_ratio, 1.0 - progress * (1.0 - min_lr_ratio))
+
         scheduler = LambdaLR(optimizer, lr_lambda)
     else:
         scheduler = None
@@ -3033,9 +3043,17 @@ def main():
 
     # Wrap model with DistributedDataParallel if using multiple GPUs
     if is_distributed:
-        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        # Use find_unused_parameters=False since we have frozen layers that don't participate in backward
+        # This is more efficient and avoids DDP gradient synchronization issues
+        model = DDP(
+            model,
+            device_ids=[local_rank],
+            output_device=local_rank,
+            find_unused_parameters=False,  # Changed from True - we know which params are frozen
+            broadcast_buffers=False  # Don't sync buffers for quantized models
+        )
         if is_main_process:
-            print(f"✓ Model wrapped with DDP on {world_size} GPUs")
+            print(f"✓ Model wrapped with DDP on {world_size} GPUs (find_unused_parameters=False)")
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
@@ -3100,6 +3118,15 @@ def main():
 
         start_epoch = checkpoint.get('epoch', 0)
         global_step = checkpoint.get('global_step', 0)
+
+        # Advance scheduler to the correct step after resume
+        if scheduler is not None and global_step > 0:
+            for _ in range(global_step):
+                scheduler.step()
+            if is_main_process:
+                current_lr = optimizer.param_groups[0]['lr']
+                print(f"   ✓ Scheduler advanced to step {global_step}, current LR: {current_lr:.2e}")
+
         if is_main_process:
             print(f"   ✓ Resumed from epoch {start_epoch}, step {global_step}")
 
