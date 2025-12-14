@@ -18,9 +18,9 @@ class Qwen2LanguageModel(nn.Module):
     def __init__(self, config, pretrained_path=None, quantize_4bit=False):
         super().__init__()
 
-        self.hidden_size = config.get('qwen_hidden_dim', 896)
-        self.num_layers = config.get('num_layers', 24)
-        self.vocab_size = config.get('vocab_size', 151936)
+        self.hidden_size = getattr(config, 'qwen_hidden_dim', 896)
+        self.num_layers = getattr(config, 'num_layers', 24)
+        self.vocab_size = getattr(config, 'vocab_size', 151936)
 
         self.quantize_4bit = quantize_4bit
 
@@ -47,8 +47,8 @@ class Qwen2LanguageModel(nn.Module):
         # Simplified transformer layers
         decoder_layer = nn.TransformerDecoderLayer(
             d_model=self.hidden_size,
-            nhead=config.get('num_heads', 14),
-            dim_feedforward=config.get('intermediate_size', 4864),
+            nhead=getattr(config, 'num_heads', 14),
+            dim_feedforward=getattr(config, 'intermediate_size', 4864),
             dropout=0.0,
             activation='gelu',
             batch_first=True
