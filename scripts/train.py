@@ -3,6 +3,16 @@ Main Training Script for MicroVLM-V
 Supports small-scale testing, full training stages, and FIBER-style training
 """
 
+import os
+import sys
+from pathlib import Path
+
+# Add project root to Python path
+script_dir = Path(__file__).resolve().parent
+project_root = script_dir.parent
+if str(project_root) not in sys.path:
+    sys.path.insert(0, str(project_root))
+
 from src.quantization.quantized_episodic_memory import get_memory_quantization_stats
 from src.quantization.quantize_4bit import QuantizationConfig
 from src.visualization.wandb_logger import WandBLogger
@@ -13,8 +23,6 @@ from src.training.carbon_tracker import CarbonComputeTracker, estimate_model_flo
 from src.training.attention_monitor import AttentionQualityMonitor
 from src.data.cc12m_loader import create_dataloaders
 from src.models import create_microvlm, create_microvlm_fiber, MicroVLMFIBER
-import os
-import sys
 import json
 from datetime import datetime
 import math
@@ -24,14 +32,10 @@ import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 from torch.utils.data import DataLoader
 from torch.utils.data.distributed import DistributedSampler
-from pathlib import Path
 import argparse
 from tqdm import tqdm
 import wandb
 from huggingface_hub import HfApi, create_repo, upload_file
-
-# Add parent directory to path
-sys.path.insert(0, str(Path(__file__).parent.parent))
 
 
 class EarlyStopping:
@@ -440,7 +444,7 @@ def get_model_statistics(model, config):
     """Get comprehensive model statistics"""
     # Unwrap DDP model if necessary
     base_model = model.module if hasattr(model, 'module') else model
-    
+
     stats = {}
 
     # Overall parameters (use base_model for accurate counting)
@@ -727,10 +731,10 @@ def save_best_alignment_checkpoint(model, optimizer, global_step, config, stage_
     }, checkpoint_path)
 
     print(f"✅ Saved best-alignment checkpoint ({correct_sim:.4f}) -> {checkpoint_path}")
-    
+
     # Push to HuggingFace as best checkpoint
     push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type="best", correct_sim=correct_sim)
-    
+
     return checkpoint_path
 
 
@@ -795,7 +799,7 @@ def handle_alignment_tracking(config, model, optimizer, global_step, alignment_s
     else:
         config._alignment_negative_steps = 0
 
-    # Early stop logic: 
+    # Early stop logic:
     # - Never stop before effective_min_stop (e.g., 1500)
     # - After min_stop: stop only if best was found, else keep training
     can_stop = global_step >= effective_min_stop and config._best_alignment_found
