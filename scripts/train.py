@@ -1994,13 +1994,17 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             )
 
         # ===== Regular Checkpoint Saving (Every 500 Steps) =====
+        # Saves as "checkpoint-latest.pt" which OVERWRITES the previous one
+        # This prevents accumulation of checkpoints while keeping iterative commits
         checkpoint_interval = getattr(config, 'checkpoint_interval_steps', 500)
         push_checkpoints_to_hf = getattr(config, 'push_checkpoints_to_hf', True)
 
         if global_step % checkpoint_interval == 0 and is_main_process:
             checkpoint_dir = Path(config.output_dir) / "checkpoints"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
-            checkpoint_path = checkpoint_dir / f"checkpoint-{global_step}.pt"
+
+            # Use fixed filename that overwrites (not accumulating)
+            checkpoint_path = checkpoint_dir / "checkpoint-latest.pt"
 
             # Get model state dict (unwrap DDP if needed)
             model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
@@ -2014,9 +2018,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 'loss': loss.item(),
             }, checkpoint_path)
 
-            print(f"\n💾 Checkpoint saved at step {global_step}: {checkpoint_path}")
+            print(f"\n💾 Checkpoint saved at step {global_step}: {checkpoint_path} (overwrites previous)")
 
-            # Push to HuggingFace if enabled
+            # Push to HuggingFace if enabled (as new commit, same filename)
             if push_checkpoints_to_hf:
                 try:
                     hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
@@ -2030,15 +2034,15 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         except:
                             pass
 
-                        # Upload checkpoint
+                        # Upload checkpoint (overwrites previous checkpoint-latest.pt on HF)
                         api.upload_file(
                             path_or_fileobj=str(checkpoint_path),
-                            path_in_repo=f"checkpoints/checkpoint-{global_step}.pt",
+                            path_in_repo="checkpoint-latest.pt",
                             repo_id=repo_name,
                             token=hf_token,
-                            commit_message=f"Add checkpoint at step {global_step} (loss={loss.item():.4f})"
+                            commit_message=f"Update checkpoint at step {global_step} (loss={loss.item():.4f})"
                         )
-                        print(f"   ✅ Pushed to HuggingFace: {repo_name}/checkpoints/checkpoint-{global_step}.pt")
+                        print(f"   ✅ Pushed to HuggingFace: {repo_name}/checkpoint-latest.pt (overwrites previous)")
                     else:
                         print(f"   ⚠️  HF_TOKEN not found, skipping HuggingFace push")
                 except Exception as e:
