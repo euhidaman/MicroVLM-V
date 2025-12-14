@@ -39,77 +39,95 @@ class WandBLogger:
             global_step: global training step
         """
         if not self.enabled:
+            print(f"[WandBLogger] WARNING: Logger not enabled (wandb_run={self.wandb_run})")
             return
         
-        metrics = {
-            'train/epoch': epoch,
-            'train/global_step': global_step,
-            'train/learning_rate': optimizer.param_groups[0]['lr']
-        }
-        
-        # Total loss
-        if 'loss' in outputs:
-            metrics['train/total_loss'] = outputs['loss'].item()
-        
-        # LM loss
-        lm_loss = outputs.get('lm_loss')
-        if lm_loss is not None:
-            metrics['train/lm_loss'] = lm_loss.item()
-            # Calculate perplexity
-            metrics['train/perplexity'] = torch.exp(lm_loss).item()
-        
-        # Alignment loss
-        if 'alignment_loss' in outputs:
-            metrics['alignment/loss'] = outputs['alignment_loss'].item()
-        
-        # Fine-grained alignment loss (text-to-patch attention supervision)
-        if 'fine_grained_loss' in outputs:
-            metrics['alignment/fine_grained_loss'] = outputs['fine_grained_loss'].item()
-        
-        # Memory losses
-        if 'memory_kl' in outputs:
-            metrics['memory/kl_divergence'] = outputs['memory_kl'].item()
-        
-        if 'addressing_kl' in outputs:
-            metrics['memory/addressing_kl'] = outputs['addressing_kl'].item()
-        
-        # Scope probabilities (if present)
-        if 'scope_probs' in outputs:
-            scope_probs = outputs['scope_probs']
-            metrics['memory/scope_prob_mean'] = scope_probs.mean().item()
-            metrics['memory/scope_prob_std'] = scope_probs.std().item()
-        
-        # ITC/ITM losses (FIBER mode)
-        if 'itc_loss' in outputs:
-            itc_loss = outputs['itc_loss']
-            if itc_loss is not None:
-                metrics['alignment/itc_loss'] = itc_loss.item() if hasattr(itc_loss, 'item') else itc_loss
-        
-        if 'itm_loss' in outputs:
-            itm_loss = outputs['itm_loss']
-            if itm_loss is not None:
-                metrics['alignment/itm_loss'] = itm_loss.item() if hasattr(itm_loss, 'item') else itm_loss
-        
-        if 'token_loss' in outputs:
-            token_loss = outputs['token_loss']
-            if token_loss is not None:
-                metrics['alignment/token_loss'] = token_loss.item() if hasattr(token_loss, 'item') else token_loss
-        
-        # Anti-collapse regularization losses
-        if 'anti_collapse_loss' in outputs:
-            anti_collapse_loss = outputs['anti_collapse_loss']
-            if anti_collapse_loss is not None:
-                val = anti_collapse_loss.item() if hasattr(anti_collapse_loss, 'item') else anti_collapse_loss
-                metrics['regularization/anti_collapse_loss'] = val
-        
-        if 'attention_entropy_loss' in outputs:
-            attn_entropy_loss = outputs['attention_entropy_loss']
-            if attn_entropy_loss is not None:
-                val = attn_entropy_loss.item() if hasattr(attn_entropy_loss, 'item') else attn_entropy_loss
-                metrics['regularization/attention_entropy_loss'] = val
-        
-        self.wandb_run.log(metrics, step=global_step)
-    
+        try:
+            metrics = {
+                'train/epoch': epoch,
+                'train/global_step': global_step,
+                'train/learning_rate': optimizer.param_groups[0]['lr']
+            }
+
+            # Total loss - log as both 'train/loss' and 'train/total_loss' for compatibility
+            if 'loss' in outputs:
+                loss_value = outputs['loss'].item() if torch.is_tensor(outputs['loss']) else outputs['loss']
+                metrics['train/loss'] = loss_value  # Primary metric for wandb charts
+                metrics['train/total_loss'] = loss_value  # Alias for clarity
+            else:
+                print(f"[WandBLogger] WARNING: 'loss' not found in outputs. Available keys: {list(outputs.keys())}")
+
+            # LM loss
+            lm_loss = outputs.get('lm_loss')
+            if lm_loss is not None:
+                metrics['train/lm_loss'] = lm_loss.item()
+                # Calculate perplexity
+                metrics['train/perplexity'] = torch.exp(lm_loss).item()
+
+            # Alignment loss
+            if 'alignment_loss' in outputs:
+                metrics['alignment/loss'] = outputs['alignment_loss'].item()
+
+            # Fine-grained alignment loss (text-to-patch attention supervision)
+            if 'fine_grained_loss' in outputs:
+                metrics['alignment/fine_grained_loss'] = outputs['fine_grained_loss'].item()
+
+            # Memory losses
+            if 'memory_kl' in outputs:
+                metrics['memory/kl_divergence'] = outputs['memory_kl'].item()
+
+            if 'addressing_kl' in outputs:
+                metrics['memory/addressing_kl'] = outputs['addressing_kl'].item()
+
+            # Scope probabilities (if present)
+            if 'scope_probs' in outputs:
+                scope_probs = outputs['scope_probs']
+                metrics['memory/scope_prob_mean'] = scope_probs.mean().item()
+                metrics['memory/scope_prob_std'] = scope_probs.std().item()
+
+            # ITC/ITM losses (FIBER mode)
+            if 'itc_loss' in outputs:
+                itc_loss = outputs['itc_loss']
+                if itc_loss is not None:
+                    metrics['alignment/itc_loss'] = itc_loss.item() if hasattr(itc_loss, 'item') else itc_loss
+
+            if 'itm_loss' in outputs:
+                itm_loss = outputs['itm_loss']
+                if itm_loss is not None:
+                    metrics['alignment/itm_loss'] = itm_loss.item() if hasattr(itm_loss, 'item') else itm_loss
+
+            if 'token_loss' in outputs:
+                token_loss = outputs['token_loss']
+                if token_loss is not None:
+                    metrics['alignment/token_loss'] = token_loss.item() if hasattr(token_loss, 'item') else token_loss
+
+            # Anti-collapse regularization losses
+            if 'anti_collapse_loss' in outputs:
+                anti_collapse_loss = outputs['anti_collapse_loss']
+                if anti_collapse_loss is not None:
+                    val = anti_collapse_loss.item() if hasattr(anti_collapse_loss, 'item') else anti_collapse_loss
+                    metrics['regularization/anti_collapse_loss'] = val
+
+            if 'attention_entropy_loss' in outputs:
+                attn_entropy_loss = outputs['attention_entropy_loss']
+                if attn_entropy_loss is not None:
+                    val = attn_entropy_loss.item() if hasattr(attn_entropy_loss, 'item') else attn_entropy_loss
+                    metrics['regularization/attention_entropy_loss'] = val
+
+            # Log metrics to wandb with error handling
+            self.wandb_run.log(metrics, step=global_step)
+
+            # Debug: Print confirmation every 100 steps
+            if global_step % 100 == 0:
+                print(f"[WandBLogger] Successfully logged {len(metrics)} metrics at step {global_step}")
+                if 'train/loss' in metrics:
+                    print(f"[WandBLogger] train/loss = {metrics['train/loss']:.4f}")
+
+        except Exception as e:
+            print(f"[WandBLogger] ERROR in log_training_metrics: {e}")
+            import traceback
+            traceback.print_exc()
+
     def log_temperature_metrics(self, model, global_step):
         """Log temperature/logit_scale metrics for monitoring alignment stability"""
         if not self.enabled:

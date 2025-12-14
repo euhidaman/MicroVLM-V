@@ -1496,15 +1496,16 @@ def setup_wandb(config, run_name):
     if config.use_wandb:
         try:
             # Initialize with project (will auto-create if doesn't exist)
-            wandb.init(
+            run = wandb.init(
                 project=config.wandb_project,
                 name=run_name,
                 config=vars(config),
                 resume='allow'  # Allow resuming runs
             )
-            print(f"WandB initialized: {run_name}")
-            print(f"WandB project: {config.wandb_project}")
-            return wandb
+            print(f"✓ WandB initialized: {run_name}")
+            print(f"✓ WandB project: {config.wandb_project}")
+            print(f"✓ WandB run URL: {run.url if run else 'N/A'}")
+            return run
         except Exception as e:
             print(f"WARNING: WandB initialization failed: {e}")
             print("Continuing without WandB logging...")
