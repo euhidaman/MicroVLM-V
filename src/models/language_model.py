@@ -211,10 +211,8 @@ class Qwen2LanguageModel(nn.Module):
                 return CausalLMOutput(
                     loss=loss,
                     logits=logits,
-                    past_key_values=None,
-                    hidden_states=all_hidden_states,
-                    attentions=tuple(
-                        all_attentions) if output_attentions else None
+                    hidden_states=all_hidden_states if output_hidden_states else None,
+                    attentions=tuple(all_attentions) if output_attentions else None
                 )
             else:
                 outputs = (loss, logits, None, all_hidden_states)
