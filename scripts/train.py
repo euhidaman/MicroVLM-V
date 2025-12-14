@@ -1763,6 +1763,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         sliding_window_stopper: SlidingWindowEarlyStopping object for plateau detection
         best_stage2_tracker: BestStage2ModelTracker for tracking optimal Stage 2 model
     """
+    # ============================================================================
+    # CONSTANTS FOR LOGGING INTERVALS
+    # ============================================================================
+    COMPREHENSIVE_LOG_INTERVAL = 200  # Log detailed metrics every 200 steps
+
     # CRITICAL DEBUG: Verify wandb_logger is passed to train_epoch
     print(f"\n{'='*60}")
     print(f"[train_epoch] STARTING epoch={epoch}, global_step={global_step}")
@@ -2057,7 +2062,6 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # COMPREHENSIVE METRICS LOGGING (every 200 steps)
         # All detailed metrics including quantization, memory slots, attention, etc.
         # ============================================================================
-        COMPREHENSIVE_LOG_INTERVAL = 200  # Log everything every 200 steps
         if is_main_process and global_step % COMPREHENSIVE_LOG_INTERVAL == 0:
             print(f"\n{'='*70}")
             print(f"[COMPREHENSIVE LOGGING] Step {global_step}")
@@ -2300,7 +2304,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         if alignment_stop_code != 0:
             stop_label = 'alignment_plateau' if alignment_stop_code == 1 else 'alignment_negative'
             avg_loss = total_loss / max(batch_idx + 1, 1)
-            return avg_loss, global_step, stop_label
+            return avg_loss, global_step, stop_label, None
 
         # ===== Attention Quality Monitoring =====
         # Update attention monitor with token attention if available
@@ -2337,7 +2341,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
                         # Return with early stop flag
                         avg_loss = total_loss / max(batch_idx + 1, 1)
-                        return avg_loss, global_step, 'attention'
+                        return avg_loss, global_step, 'attention', None
 
                     # Log attention quality metrics every 200 steps
                     if is_main_process and global_step % COMPREHENSIVE_LOG_INTERVAL == 0 and wandb_logger:
