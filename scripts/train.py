@@ -1762,6 +1762,18 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         sliding_window_stopper: SlidingWindowEarlyStopping object for plateau detection
         best_stage2_tracker: BestStage2ModelTracker for tracking optimal Stage 2 model
     """
+    # CRITICAL DEBUG: Verify wandb_logger is passed to train_epoch
+    print(f"\n{'='*60}")
+    print(f"[train_epoch] STARTING epoch={epoch}, global_step={global_step}")
+    print(f"[train_epoch] wandb_logger type: {type(wandb_logger)}")
+    print(f"[train_epoch] wandb_logger is None: {wandb_logger is None}")
+    if wandb_logger is not None:
+        print(f"[train_epoch] wandb_logger.enabled: {wandb_logger.enabled}")
+        print(f"[train_epoch] wandb_logger.wandb_run: {type(wandb_logger.wandb_run)}")
+    print(f"[train_epoch] is_main_process: {is_main_process}")
+    print(f"[train_epoch] config.log_interval: {config.log_interval}")
+    print(f"{'='*60}\n")
+
     model.train()
 
     total_loss = 0
@@ -1911,6 +1923,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         # Log per-step loss immediately (every step) to ensure it's always visible in wandb
         if is_main_process and wandb_logger:
+            # DEBUG: Print on first few steps and then every 50 steps
+            if global_step <= 5 or global_step % 50 == 0:
+                print(f"[PER-STEP LOG] step={global_step}, wandb_logger.enabled={wandb_logger.enabled}")
+
             immediate_loss_metrics = {
                 'train/step_loss': loss.item(),
                 'train/step': global_step,
@@ -2094,11 +2110,18 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         # Logging (main process only)
         if is_main_process and global_step % config.log_interval == 0:
+            # CRITICAL DEBUG - Print to verify this block is entered
+            print(f"\n[WANDB DEBUG] Entering logging block at step {global_step}")
+            print(f"[WANDB DEBUG] is_main_process={is_main_process}, log_interval={config.log_interval}")
+            print(f"[WANDB DEBUG] wandb_logger={wandb_logger is not None}, wandb_run={wandb_run is not None}")
+
             # Use comprehensive WandB logger
             if wandb_logger:
+                print(f"[WANDB DEBUG] Calling log_training_metrics...")
                 # Core training metrics
                 wandb_logger.log_training_metrics(
                     outputs, optimizer, epoch, global_step)
+                print(f"[WANDB DEBUG] log_training_metrics completed")
 
                 # Gradient metrics
                 wandb_logger.log_gradient_metrics(model, global_step)
