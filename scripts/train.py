@@ -1798,9 +1798,19 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         pbar = train_loader
 
     for batch_idx, batch in enumerate(pbar):
+        # ============================================================================
+        # INCREMENT GLOBAL STEP FIRST - BEFORE ANY EARLY EXITS
+        # This ensures the step counter always advances, even if batch fails
+        # ============================================================================
+        global_step += 1
+
         # CRITICAL DEBUG: Print at batch 0, 50, 100 to verify loop is running
         if batch_idx % 50 == 0:
-            print(f"\n[BATCH LOOP] batch_idx={batch_idx}, current global_step={global_step}")
+            print(f"\n[BATCH LOOP] batch_idx={batch_idx}, global_step AFTER INCREMENT={global_step}")
+
+        # Debug print for first few batches
+        if batch_idx <= 10:
+            print(f"[LOOP START] batch={batch_idx}, global_step={global_step}")
 
         # Start batch timing for carbon tracker
         if carbon_tracker is not None:
@@ -1924,15 +1934,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         itm_loss_val = outputs.get('itm_loss')
         itm_loss_total += itm_loss_val.item() if itm_loss_val is not None else 0
 
-        global_step += 1
-
-        # IMMEDIATE DEBUG: Print EVERY time to verify increment is happening
-        if batch_idx <= 10 or batch_idx % 50 == 0:
-            print(f"[INCREMENT] batch_idx={batch_idx}, global_step AFTER +=1: {global_step}")
-
-        # CRITICAL DEBUG: Verify global_step is actually incrementing
-        if batch_idx % 50 == 0 or batch_idx < 3:
-            print(f"[GLOBAL_STEP DEBUG] After increment: batch_idx={batch_idx}, global_step={global_step}")
+        # NOTE: global_step increment moved to START of loop (line ~1802)
+        # This ensures it always increments even if batch fails partway through
 
         # ============================================================================
         # MANDATORY WANDB LOGGING - NEVER SKIP, ALWAYS LOG
