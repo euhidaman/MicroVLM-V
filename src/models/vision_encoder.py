@@ -18,11 +18,11 @@ class DeiTVisionEncoder(nn.Module):
     def __init__(self, config, pretrained_path=None):
         super().__init__()
         
-        self.image_size = config.get('image_size', 224)
-        self.patch_size = config.get('patch_size', 16)
-        self.hidden_size = config.get('deit_embed_dim', 192)
-        self.num_patches = config.get('num_patches', 196)
-        
+        self.image_size = getattr(config, 'image_size', 224)
+        self.patch_size = getattr(config, 'patch_size', 16)
+        self.hidden_size = getattr(config, 'deit_embed_dim', 192)
+        self.num_patches = getattr(config, 'num_patches', 196)
+
         # Image preprocessing
         self.preprocess = transforms.Compose([
             transforms.Resize((self.image_size, self.image_size)),

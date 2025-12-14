@@ -40,21 +40,21 @@ class EpisodicMemory(nn.Module):
         super().__init__()
         
         # Reduced memory dimensions for compact model
-        self.memory_size = config.get('memory_size', 64)  # K_mem (reduced from 512)
-        self.code_size = config.get('memory_dim', 896)  # C_mem (matches Qwen hidden)
-        self.qwen_hidden_dim = config.get('qwen_hidden_dim', 896)
-        
+        self.memory_size = getattr(config, 'memory_size', 64)  # K_mem (reduced from 512)
+        self.code_size = getattr(config, 'memory_dim', 896)  # C_mem (matches Qwen hidden)
+        self.qwen_hidden_dim = getattr(config, 'qwen_hidden_dim', 896)
+
         # Validate dimension match - code_size must match language hidden for fused embeddings
-        lang_hidden = config.get('language_hidden_size', 896)
+        lang_hidden = getattr(config, 'language_hidden_size', 896)
         if self.code_size != lang_hidden:
             print(f"⚠️ EpisodicMemory: code_size ({self.code_size}) != language_hidden ({lang_hidden})")
             print(f"   Forcing code_size = {lang_hidden} to avoid dimension mismatch")
             self.code_size = lang_hidden
         
         # W_M projection targets fewer layers/heads for size reduction
-        self.num_layers = config.get('memory_num_layers', 6)  # Reduced from 24
-        self.num_heads = config.get('memory_num_heads', 4)    # Reduced from 14
-        self.head_dim = config.get('head_dim', 64)
+        self.num_layers = getattr(config, 'memory_num_layers', 6)  # Reduced from 24
+        self.num_heads = getattr(config, 'memory_num_heads', 4)    # Reduced from 14
+        self.head_dim = getattr(config, 'head_dim', 64)
         self.compute_dtype = torch.float32
         
         # Memory parameters: M of shape (K_mem, C_mem)
@@ -63,9 +63,9 @@ class EpisodicMemory(nn.Module):
         
         # ===== Larimar-style w_logvar_setting configuration =====
         # Controls how addressing weight variance is computed
-        self._w_logvar_setting = config.get('w_logvar_setting', 1)  # Default: setting 1 (per-dim)
-        self.deterministic = config.get('deterministic_memory', False)
-        
+        self._w_logvar_setting = getattr(config, 'w_logvar_setting', 1)  # Default: setting 1 (per-dim)
+        self.deterministic = getattr(config, 'deterministic_memory', False)
+
         if self._w_logvar_setting == 0:
             # Setting 0: Single scalar variance (most lightweight)
             self.w_logvar = nn.Parameter(torch.zeros(1))
@@ -620,9 +620,9 @@ class ScopeDetector(nn.Module):
     def __init__(self, config):
         super().__init__()
         
-        self.input_dim = config.get('qwen_hidden_dim', 896)
-        self.hidden_dim = config.get('scope_hidden_dim', 64)  # Reduced from 256
-        
+        self.input_dim = getattr(config, 'qwen_hidden_dim', 896)
+        self.hidden_dim = getattr(config, 'scope_hidden_dim', 64)  # Reduced from 256
+
         # Simplified 2-layer MLP (reduced from 3 layers)
         self.mlp = nn.Sequential(
             nn.Linear(self.input_dim, self.hidden_dim),

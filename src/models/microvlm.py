@@ -73,23 +73,25 @@ class MicroVLM(nn.Module):
             print("Scope detector quantization applied!")
 
         # Alignment embedding dimension (shared projection space)
-        self.alignment_dim = config.get('alignment_dim', 256)
-        
+        self.alignment_dim = getattr(config, 'alignment_dim', 256)
+
         # Image feature projection for alignment (DeiT 192-dim -> alignment_dim)
         # Uses MLP for better representation
+        vision_hidden = getattr(config, 'vision_hidden_size', 192)
         self.image_proj_for_alignment = nn.Sequential(
-            nn.Linear(config.get('vision_hidden_size', 192), config.get('vision_hidden_size', 192) * 2),
+            nn.Linear(vision_hidden, vision_hidden * 2),
             nn.GELU(),
-            nn.Linear(config.get('vision_hidden_size', 192) * 2, self.alignment_dim),
+            nn.Linear(vision_hidden * 2, self.alignment_dim),
             nn.LayerNorm(self.alignment_dim)
         )
         
         # Text feature projection for alignment (Qwen 896-dim -> alignment_dim)
         # Crucial: both modalities must project to the same space!
+        lang_hidden = getattr(config, 'language_hidden_size', 896)
         self.text_proj_for_alignment = nn.Sequential(
-            nn.Linear(config.get('language_hidden_size', 896), config.get('language_hidden_size', 896)),
+            nn.Linear(lang_hidden, lang_hidden),
             nn.GELU(),
-            nn.Linear(config.get('language_hidden_size', 896), self.alignment_dim),
+            nn.Linear(lang_hidden, self.alignment_dim),
             nn.LayerNorm(self.alignment_dim)
         )
         
@@ -98,7 +100,7 @@ class MicroVLM(nn.Module):
 
         # Alignment loss
         self.alignment_loss = ContrastiveAlignmentLoss(
-            temperature=config.get('alignment_temperature', 0.07)
+            temperature=getattr(config, 'alignment_temperature', 0.07)
         )
         
         # Fine-grained text-to-patch alignment loss
