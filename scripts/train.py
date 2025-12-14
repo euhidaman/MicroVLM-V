@@ -1809,13 +1809,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # ============================================================================
         global_step += 1
 
-        # CRITICAL DEBUG: Print at batch 0, 50, 100 to verify loop is running
-        if batch_idx % 50 == 0:
-            print(f"\n[BATCH LOOP] batch_idx={batch_idx}, global_step AFTER INCREMENT={global_step}")
-
-        # Debug print for first few batches
-        if batch_idx <= 10:
-            print(f"[LOOP START] batch={batch_idx}, global_step={global_step}")
+        # Print progress every 200 steps to verify training is advancing
+        if global_step % 200 == 0:
+            print(f"\n[Training Progress] Step {global_step}, Batch {batch_idx} of epoch {epoch}")
 
         # Start batch timing for carbon tracker
         if carbon_tracker is not None:
@@ -1889,8 +1885,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     param.grad.zero_()
 
         if has_nan:
-            if is_main_process and global_step % 10 == 0:
-                print(f"\n⚠️ NaN gradients detected at step {global_step} - zeroed and continuing")
+            if is_main_process and global_step % 50 == 0:
+                print(f"\n⚠️  NaN gradients detected at step {global_step} - zeroed and continuing")
             optimizer.zero_grad()
             scaler.update()
             continue
