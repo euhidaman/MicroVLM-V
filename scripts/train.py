@@ -2043,15 +2043,6 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 except Exception as e:
                     print(f"   ⚠️  Failed to push to HuggingFace: {e}")
 
-        # Logging section continues below
-        if False:  # Placeholder for removed code
-            pass
-                        model=model,
-                        optimizer=optimizer,
-                        global_step=global_step,
-                        config=config,
-                        stage_name=stage_name
-                    )
 
         # Alignment-specific tracking (Stage 1)
         alignment_stop_code = 0
