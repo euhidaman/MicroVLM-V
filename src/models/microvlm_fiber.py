@@ -102,7 +102,7 @@ class MicroVLM_FIBER(nn.Module):
                 config=config,
                 pretrained_path=vision_checkpoint,
                 fusion_layers=self.fiber_config.fusion_layers,
-                text_dim=config.get('language_hidden_size', 896),
+                text_dim=getattr(config, 'language_hidden_size', 896),
                 num_fusion_heads=self.fiber_config.num_fusion_heads,
                 fusion_dim=self.fiber_config.fusion_dim
             )
@@ -127,12 +127,15 @@ class MicroVLM_FIBER(nn.Module):
         
         # Episodic memory
         # Debug: print memory config to diagnose dimension mismatch
-        mem_dim = config.get('memory_dim', 896)
-        lang_hidden = config.get('language_hidden_size', 896)
+        mem_dim = getattr(config, 'memory_dim', 896)
+        lang_hidden = getattr(config, 'language_hidden_size', 896)
         print(f"🔍 EpisodicMemory config: memory_dim={mem_dim}, language_hidden_size={lang_hidden}")
         if mem_dim != lang_hidden:
             print(f"   ⚠️ MISMATCH! Forcing memory_dim to {lang_hidden}")
-            config['memory_dim'] = lang_hidden
+            if hasattr(config, '__setattr__'):
+                config.memory_dim = lang_hidden
+            elif isinstance(config, dict):
+                config['memory_dim'] = lang_hidden
         self.episodic_memory = EpisodicMemory(config)
         
         if quantize_memory_158bit:
@@ -146,17 +149,17 @@ class MicroVLM_FIBER(nn.Module):
             apply_158bit_quantization_to_memory(self.scope_detector)
         
         # Alignment dimension (reduced for compact model)
-        self.alignment_dim = config.get('alignment_dim', 128)  # Reduced from 256
-        
+        self.alignment_dim = getattr(config, 'alignment_dim', 128)  # Reduced from 256
+
         # Image feature projection for alignment (simplified)
         self.image_proj_for_alignment = nn.Sequential(
-            nn.Linear(config.get('vision_hidden_size', 192), self.alignment_dim),
+            nn.Linear(getattr(config, 'vision_hidden_size', 192), self.alignment_dim),
             nn.LayerNorm(self.alignment_dim)
         )
         
         # Text feature projection for alignment (simplified)
         self.text_proj_for_alignment = nn.Sequential(
-            nn.Linear(config.get('language_hidden_size', 896), self.alignment_dim),
+            nn.Linear(getattr(config, 'language_hidden_size', 896), self.alignment_dim),
             nn.LayerNorm(self.alignment_dim)
         )
         
@@ -186,8 +189,8 @@ class MicroVLM_FIBER(nn.Module):
             )
             # Initialize ITM head
             self.alignment_loss.set_itm_head(
-                vision_dim=config.get('vision_hidden_size', 192),
-                text_dim=config.get('language_hidden_size', 896)
+                vision_dim=getattr(config, 'vision_hidden_size', 192),
+                text_dim=getattr(config, 'language_hidden_size', 896)
             )
             # Initialize ITC projection heads (FIBER-style)
             self.alignment_loss.set_itc_heads(
@@ -197,7 +200,7 @@ class MicroVLM_FIBER(nn.Module):
         else:
             print("🔗 Using baseline Contrastive Alignment Loss")
             self.alignment_loss = ContrastiveAlignmentLoss(
-                temperature=config.get('alignment_temperature', 0.07)
+                temperature=getattr(config, 'alignment_temperature', 0.07)
             )
         
         # Fine-grained alignment (kept for compatibility)
