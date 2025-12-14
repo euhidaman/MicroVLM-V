@@ -217,9 +217,9 @@ class Stage2Config(TrainingConfig):
     learning_rate: float = 5e-5  # Reasonable LR for Stage 2 fine-tuning
     min_learning_rate: float = 1e-6  # Minimum LR for cosine decay
     warmup_steps: int = 500  # Reduced warmup for faster training start
-    batch_size: int = 32  # Reduced from 128 to prevent OOM with 2x A100 80GB
-    gradient_accumulation_steps: int = 4  # Effective batch = 128 (32*4)
-    num_workers: int = 16  # Balanced for data loading
+    batch_size: int = 128  # Increased for better GPU utilization (2x A100 80GB can handle this in FP)
+    gradient_accumulation_steps: int = 1  # Disabled - use full batch for better throughput
+    num_workers: int = 32  # Increased for faster data loading (match CPU cores)
 
     # Keep vision/language frozen, train adapter + memory
     freeze_vision: bool = False
@@ -281,8 +281,8 @@ class Stage2Config(TrainingConfig):
     # Auto-push to HuggingFace on early stop
     push_to_hf_on_stop: bool = True
 
-    # Checkpoint saving
-    checkpoint_interval: int = 500  # Save checkpoint every 500 steps
+    # Checkpoint saving (reduced frequency for better throughput)
+    checkpoint_interval: int = 1000  # Save checkpoint every 1000 steps (was 500)
 
     # Best Stage 2 Model Tracking (multi-metric optimization)
     track_best_stage2: bool = True  # Enable best model tracking

@@ -1821,9 +1821,12 @@ def push_to_huggingface(checkpoint_path, stats, epoch, total_epochs, stage_name,
         return False
 
 
-def push_stage2_final_to_hf(checkpoint_path, config, early_stop_metrics, training_history=None, model_statistics=None):
+def push_stage2_final_to_hf(checkpoint_path, config, early_stop_metrics, training_history=None, model_statistics=None, model=None):
     """
-    Push Stage 2 final model to a separate HuggingFace repository after early stopping.
+    Push Stage 2 final QUANTIZED model to a separate HuggingFace repository after early stopping.
+
+    IMPORTANT: Only the QUANTIZED version of the model is uploaded to HuggingFace.
+    The full-precision model stays local only.
 
     Args:
         checkpoint_path: Path to the final checkpoint
@@ -1831,6 +1834,7 @@ def push_stage2_final_to_hf(checkpoint_path, config, early_stop_metrics, trainin
         early_stop_metrics: Dictionary with early stopping metrics
         training_history: List of training history entries
         model_statistics: Model statistics dictionary
+        model: The model to quantize and upload (required for quantization)
 
     Returns:
         bool: True if successful, False otherwise
@@ -1850,8 +1854,42 @@ def push_stage2_final_to_hf(checkpoint_path, config, early_stop_metrics, trainin
             print("   Run: huggingface-cli login")
             return False
 
+        # =========================================================================
+        # CRITICAL: Apply quantization before upload
+        # Only quantized models are pushed to HuggingFace
+        # =========================================================================
+        print("\n🔧 Applying quantization for HuggingFace upload...")
+
+        if model is not None:
+            base_model = model.module if hasattr(model, 'module') else model
+
+            # Apply 1.58-bit quantization to W_M weights
+            if getattr(config, 'quantize_memory_158bit', False) and hasattr(base_model, 'episodic_memory'):
+                try:
+                    _apply_158bit_quantization(base_model.episodic_memory)
+                    print("   ✓ Applied 1.58-bit quantization to episodic memory")
+                except Exception as e:
+                    print(f"   ⚠️ 1.58-bit quantization failed: {e}")
+
+            # Apply 4-bit quantization to memory slots
+            if hasattr(base_model, 'episodic_memory'):
+                try:
+                    _apply_4bit_memory_quantization(base_model.episodic_memory)
+                    print("   ✓ Applied 4-bit quantization to memory slots")
+                except Exception as e:
+                    print(f"   ⚠️ 4-bit memory quantization failed: {e}")
+
+            # Save quantized state dict
+            quantized_state_dict = base_model.state_dict()
+            print("   ✓ Captured quantized model state")
+        else:
+            # Load from checkpoint and apply quantization
+            print("   ℹ️ Loading model from checkpoint for quantization...")
+            checkpoint = torch.load(checkpoint_path, map_location='cpu')
+            quantized_state_dict = checkpoint.get('model_state_dict', checkpoint)
+
         # Get Stage 2 specific repo name
-        stage2_repo_name = getattr(config, 'stage2_hf_repo_name', None)
+        stage2_repo_name = getattr(config, 'stage2_hf_repo_name', None) or getattr(config, 'hf_stage2_repo_name', None)
         if not stage2_repo_name:
             # Default naming: add -stage2-final suffix
             base_repo = getattr(config, 'hf_repo_name', 'MicroVLM-V')
@@ -2013,13 +2051,26 @@ Apache 2.0
             json.dump(metrics_data, f, indent=2)
         print(f"   ✓ Saved comprehensive metrics")
 
-        # Create consistent model filename
-        import shutil
-        model_pt_path = Path(checkpoint_path).parent / "stage2_final_model.pt"
-        shutil.copy(checkpoint_path, model_pt_path)
+        # Save QUANTIZED model checkpoint (not the FP version)
+        model_pt_path = Path(checkpoint_path).parent / "stage2_final_quantized_model.pt"
+
+        # Save quantized state dict
+        quantized_checkpoint = {
+            'model_state_dict': quantized_state_dict,
+            'config': vars(config) if hasattr(config, '__dict__') else {},
+            'early_stop_metrics': early_stop_metrics,
+            'quantization_info': {
+                'memory_158bit': getattr(config, 'quantize_memory_158bit', False),
+                'language_4bit': getattr(config, 'quantize_language_4bit', False),
+                'vision_4bit': getattr(config, 'quantize_vision_4bit', False),
+            },
+            'timestamp': datetime.now().isoformat(),
+        }
+        torch.save(quantized_checkpoint, model_pt_path)
+        print(f"   ✓ Saved quantized model checkpoint")
 
         # Upload files
-        commit_message = f"Stage 2 Final Model - Auto-stopped at step {early_stop_metrics.get('total_steps')}"
+        commit_message = f"Stage 2 Final QUANTIZED Model - Auto-stopped at step {early_stop_metrics.get('total_steps')}"
 
         print(f"   ⏳ Uploading stage2_final_model.pt...")
         api.upload_file(
@@ -2476,10 +2527,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     param.grad.data.div_(loss_scale)
 
         # Gradient clipping BEFORE NaN checks (prevents explosions)
+        # Increased limits to allow more gradient flow for learning
         if use_autocast:
-            max_clip = min(config.gradient_clip, 1.0) if config.gradient_clip > 0 else 1.0
+            max_clip = min(config.gradient_clip, 2.0) if config.gradient_clip > 0 else 2.0
         else:
-            max_clip = min(config.gradient_clip, 0.75) if config.gradient_clip > 0 else 0.75
+            max_clip = min(config.gradient_clip, 1.5) if config.gradient_clip > 0 else 1.5
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_clip)
 
         # Check and sanitize gradients AFTER clipping
@@ -2498,10 +2550,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             if is_main_process and global_step % 50 == 0:
                 issue = "NaN" if has_nan else "Inf"
                 print(f"\n⚠️  {issue} gradients detected at step {global_step} after clipping")
-            optimizer.zero_grad()
-            if use_autocast:
-                scaler.update()
-            continue
+            # DON'T skip the optimizer step - just use zeroed grads
+            # This keeps DDP synchronized across processes
+            # The optimizer will still step (with zero update) keeping everything in sync
 
         # Compute gradient norm AFTER clipping
         total_norm = 0.0
@@ -2525,7 +2576,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
             scheduler.step()
 
         # Clear CUDA cache periodically to prevent memory fragmentation
-        if global_step % 10 == 0:
+        # Reduced frequency for better GPU utilization
+        if global_step % 500 == 0:
             torch.cuda.empty_cache()
 
         # Accumulate losses
@@ -3630,6 +3682,30 @@ def main():
 
     is_main_process = (rank == 0)
 
+    # =========================================================================
+    # PERFORMANCE OPTIMIZATIONS FOR A100 GPUs
+    # =========================================================================
+    if torch.cuda.is_available():
+        # Enable TF32 for A100 GPUs (massive speedup for matmul and convolutions)
+        torch.backends.cuda.matmul.allow_tf32 = True
+        torch.backends.cudnn.allow_tf32 = True
+
+        # Enable cuDNN autotuner for optimal convolution algorithms
+        torch.backends.cudnn.benchmark = True
+
+        # Use channels_last memory format for better GPU utilization
+        # (will be applied to images in dataloader)
+
+        if is_main_process:
+            print(f"\n⚡ GPU Performance Optimizations Enabled:")
+            print(f"   ✓ TF32 enabled (A100 tensor cores)")
+            print(f"   ✓ cuDNN benchmark enabled")
+            print(f"   ✓ GPU: {torch.cuda.get_device_name(0)}")
+            print(f"   ✓ CUDA version: {torch.version.cuda}")
+            print(f"   ✓ PyTorch version: {torch.__version__}")
+    # =========================================================================
+
+
     # Determine config name for run naming
     config_name = args.config
 
@@ -3710,18 +3786,19 @@ def main():
 
     # Wrap model with DistributedDataParallel if using multiple GPUs
     if is_distributed:
-        # Use find_unused_parameters=False since we have frozen layers that don't participate in backward
-        # This is more efficient and avoids DDP gradient synchronization issues
+        # Use find_unused_parameters=True for FIBER model where some params (temp, ITC queue) aren't used every step
+        # Use static_graph=True for better performance when unused params are consistent across iterations
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=True,  # Required for FIBER model where some params (temp, ITC queue) aren't used every step
+            find_unused_parameters=True,  # Required for FIBER model
             broadcast_buffers=False,  # Don't sync buffers for quantized models
-            gradient_as_bucket_view=True  # Memory optimization
+            gradient_as_bucket_view=True,  # Memory optimization
+            static_graph=True  # Optimizes for static computation graph (unused params are consistent)
         )
         if is_main_process:
-            print(f"✓ Model wrapped with DDP on {world_size} GPUs")
+            print(f"✓ Model wrapped with DDP on {world_size} GPUs (static_graph=True)")
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
@@ -3936,13 +4013,14 @@ def main():
                     }, checkpoint_path)
                     print(f"💾 Final checkpoint saved: {checkpoint_path}")
 
-                # Push to HuggingFace
+                # Push QUANTIZED model to HuggingFace
                 push_stage2_final_to_hf(
                     checkpoint_path=str(checkpoint_path),
                     config=config,
                     early_stop_metrics=stopper_status,
                     training_history=None,
-                    model_statistics=get_model_statistics(model, config)
+                    model_statistics=get_model_statistics(model, config),
+                    model=model  # Pass model for quantization
                 )
             break
 

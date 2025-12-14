@@ -336,13 +336,15 @@ def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer,
             shuffle=False
         )
     
-    # Create loaders
+    # Create loaders with performance optimizations
     train_loader = DataLoader(
         train_dataset,
         batch_size=batch_size,
         shuffle=(train_sampler is None),  # Only shuffle if not using sampler
         num_workers=num_workers,
-        pin_memory=True,
+        pin_memory=True,  # Faster GPU transfer
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive between epochs
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches per worker
         sampler=train_sampler
     )
     
@@ -352,6 +354,8 @@ def create_dataloaders(train_metadata_file, val_metadata_file, tokenizer,
         shuffle=False,
         num_workers=num_workers,
         pin_memory=True,
+        persistent_workers=True if num_workers > 0 else False,  # Keep workers alive
+        prefetch_factor=2 if num_workers > 0 else None,  # Prefetch 2 batches per worker
         sampler=val_sampler
     )
     
