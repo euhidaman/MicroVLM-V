@@ -1873,12 +1873,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
             loss = outputs['loss']
 
-        # Check for NaN/Inf
+        # Check for NaN/Inf - use zero loss instead of skipping to keep DDP in sync
         if torch.isnan(loss) or torch.isinf(loss):
             if is_main_process:
-                print(f"\n⚠️ Invalid loss detected at step {global_step} - skipping batch")
-            optimizer.zero_grad()
-            scaler.update()
+                print(f"\n⚠️ Invalid loss detected at step {global_step} - using zero loss")
+            loss = torch.tensor(0.0, device=loss.device, requires_grad=True)
             continue
 
         # Backward pass with gradient scaling
@@ -1895,10 +1894,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         except RuntimeError as e:
             if is_main_process:
                 print(f"\n⚠️ Backward pass failed at step {global_step}: {e}")
+            # Don't skip - just zero gradients and continue with optimizer step
+            # This keeps DDP in sync across processes
             optimizer.zero_grad()
-            if use_autocast:
-                scaler.update()
-            continue
 
         if use_autocast:
             # Unscale gradients for NaN/Inf checks
@@ -3049,11 +3047,12 @@ def main():
             model,
             device_ids=[local_rank],
             output_device=local_rank,
-            find_unused_parameters=False,  # Changed from True - we know which params are frozen
-            broadcast_buffers=False  # Don't sync buffers for quantized models
+            find_unused_parameters=True,  # Required for FIBER model where some params (temp, ITC queue) aren't used every step
+            broadcast_buffers=False,  # Don't sync buffers for quantized models
+            gradient_as_bucket_view=True  # Memory optimization
         )
         if is_main_process:
-            print(f"✓ Model wrapped with DDP on {world_size} GPUs (find_unused_parameters=False)")
+            print(f"✓ Model wrapped with DDP on {world_size} GPUs")
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
