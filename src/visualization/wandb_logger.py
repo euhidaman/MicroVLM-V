@@ -38,12 +38,20 @@ class WandBLogger:
             epoch: current epoch
             global_step: global training step
         """
+        # CRITICAL DEBUG: Print immediately to verify function is called
+        if global_step % 50 == 0:
+            print(f"[WandBLogger] log_training_metrics CALLED at step {global_step}, enabled={self.enabled}, wandb_run={type(self.wandb_run)}")
+
         if not self.enabled:
             if global_step % 100 == 0:  # Only print warning periodically
                 print(f"[WandBLogger] WARNING: Logger not enabled (wandb_run={self.wandb_run})")
             return
         
         try:
+            # CRITICAL DEBUG: Show what we're working with
+            if global_step % 50 == 0:
+                print(f"[WandBLogger] outputs type: {type(outputs)}, keys: {list(outputs.keys()) if isinstance(outputs, dict) else 'N/A'}")
+
             metrics = {
                 'train/epoch': epoch,
                 'train/global_step': global_step,
@@ -65,6 +73,10 @@ class WandBLogger:
 
                 metrics['train/loss'] = loss_value  # Primary metric for wandb charts
                 metrics['train/total_loss'] = loss_value  # Alias for clarity
+
+                # DEBUG
+                if global_step % 50 == 0:
+                    print(f"[WandBLogger] Extracted loss value: {loss_value}")
             else:
                 # Try alternative loss keys
                 for alt_key in ['total_loss', 'lm_loss']:
@@ -242,17 +254,24 @@ class WandBLogger:
 
             # Log metrics to wandb with error handling
             try:
+                # CRITICAL DEBUG: Always print before logging
+                if global_step % 50 == 0:
+                    print(f"[WandBLogger] About to log {len(metrics)} metrics to wandb at step {global_step}")
+                    print(f"[WandBLogger]   Metrics keys: {list(metrics.keys())}")
+                    if 'train/loss' in metrics:
+                        print(f"[WandBLogger]   train/loss = {metrics['train/loss']:.4f}")
+
                 self.wandb_run.log(metrics, step=global_step)
 
-                # Debug: Print confirmation every 100 steps
-                if global_step % 100 == 0:
-                    print(f"[WandBLogger] ✓ Logged {len(metrics)} metrics at step {global_step}")
+                # Debug: Print confirmation every 50 steps now
+                if global_step % 50 == 0:
+                    print(f"[WandBLogger] ✓✓✓ SUCCESSFULLY logged {len(metrics)} metrics at step {global_step}")
                     if 'train/loss' in metrics:
                         print(f"[WandBLogger]   train/loss = {metrics['train/loss']:.4f}")
                     if 'memory/kl_divergence' in metrics:
                         print(f"[WandBLogger]   memory/kl_divergence = {metrics['memory/kl_divergence']:.4f}")
             except Exception as e:
-                print(f"[WandBLogger] ERROR: Failed to log metrics to wandb at step {global_step}: {e}")
+                print(f"[WandBLogger] ❌ ERROR: Failed to log metrics to wandb at step {global_step}: {e}")
                 print(f"[WandBLogger]   Attempted to log {len(metrics)} metrics")
                 print(f"[WandBLogger]   wandb_run type: {type(self.wandb_run)}")
                 import traceback
