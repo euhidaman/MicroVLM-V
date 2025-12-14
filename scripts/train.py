@@ -1495,16 +1495,25 @@ def setup_wandb(config, run_name):
     """Initialize WandB logging"""
     if config.use_wandb:
         try:
+            # Check if wandb is already initialized in this process
+            if wandb.run is not None:
+                print(f"⚠️  WandB already initialized in this process (run: {wandb.run.name})")
+                print(f"   Returning existing run instead of creating new one")
+                return wandb.run
+
             # Initialize with project (will auto-create if doesn't exist)
+            # Use resume='never' to prevent accidental merging of separate training runs
             run = wandb.init(
                 project=config.wandb_project,
                 name=run_name,
                 config=vars(config),
-                resume='allow'  # Allow resuming runs
+                resume='never',  # Changed from 'allow' to prevent run conflicts
+                reinit=False     # Prevent multiple inits in same process
             )
             print(f"✓ WandB initialized: {run_name}")
             print(f"✓ WandB project: {config.wandb_project}")
             print(f"✓ WandB run URL: {run.url if run else 'N/A'}")
+            print(f"✓ WandB process: PID={os.getpid()}, Device={torch.cuda.current_device() if torch.cuda.is_available() else 'CPU'}")
             return run
         except Exception as e:
             print(f"WARNING: WandB initialization failed: {e}")
@@ -2781,7 +2790,28 @@ def main():
         print(f"{'='*60}\n")
     
     # Helper to check if current process is main
-    is_main_process = (not is_distributed) or (dist.get_rank() == 0)
+    # In distributed mode: only rank 0
+    # In DataParallel mode: prevent duplicate WandB runs by checking if we're the first process
+    if is_distributed:
+        is_main_process = (dist.get_rank() == 0)
+    else:
+        # For non-distributed or DataParallel: use environment variable or assume main
+        # This prevents multiple WandB runs when using DataParallel
+        is_main_process = (local_rank == 0)
+
+        # Additional safeguard: if CUDA_VISIBLE_DEVICES is set and we're not on device 0, not main
+        if 'CUDA_VISIBLE_DEVICES' in os.environ:
+            visible_devices = os.environ['CUDA_VISIBLE_DEVICES'].split(',')
+            if len(visible_devices) > 1 and torch.cuda.current_device() != 0:
+                is_main_process = False
+                print(f"[GPU {torch.cuda.current_device()}] Not main process, disabling WandB logging")
+
+    # CRITICAL: Force disable WandB on non-main processes via environment variable
+    # This is the nuclear option to prevent duplicate runs
+    if not is_main_process:
+        os.environ['WANDB_MODE'] = 'disabled'
+        os.environ['WANDB_SILENT'] = 'true'
+        print(f"[Process {os.getpid()}] WANDB_MODE=disabled set for non-main process")
 
     # Load configuration - prioritize staged config if requested
     if args.use_staged_config or args.config in ['stage1', 'stage2', 'stage3', 'full_quantized']:
@@ -2839,8 +2869,22 @@ def main():
     wandb_run = None
     wandb_logger = None
     if is_main_process:
+        print(f"\n{'='*60}")
+        print(f"  WANDB INITIALIZATION (Main Process Only)")
+        print(f"  Process ID: {os.getpid()}")
+        print(f"  CUDA Device: {torch.cuda.current_device() if torch.cuda.is_available() else 'N/A'}")
+        print(f"  Distributed: {is_distributed}, Rank: {dist.get_rank() if is_distributed else 'N/A'}")
+        print(f"{'='*60}")
+
         wandb_run = setup_wandb(config, run_name)
         wandb_logger = WandBLogger(config, wandb_run) if wandb_run else None
+
+        if wandb_logger:
+            print(f"✓ WandBLogger created successfully")
+        else:
+            print(f"⚠️  WandBLogger is None (WandB disabled or initialization failed)")
+    else:
+        print(f"\n[Process {os.getpid()}, Device {torch.cuda.current_device()}] Not main process - WandB disabled for this process")
 
     # Initialize Carbon/Compute Tracker (main process only)
     carbon_tracker = None
