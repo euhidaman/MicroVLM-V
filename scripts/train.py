@@ -2037,15 +2037,25 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 if global_step % 100 == 0:
                     print(f"[WANDB ERROR] Failed to log step metrics at step {global_step}: {e}")
 
-            # Debug print every 50 steps to confirm logging is happening
+            # Debug print every 50 steps to confirm basic logging is happening
             if global_step % 50 == 0:
-                print(f"\n[WANDB LOGGED] Step {global_step}: loss={loss_val:.4f}, lr={optimizer.param_groups[0]['lr']:.2e}, metrics={len(step_metrics)}")
+                print(f"\n[WANDB] Step {global_step}: BASIC metrics logged ({len(step_metrics)} metrics)")
+                print(f"  ├─ loss={loss_val:.4f}, lr={optimizer.param_groups[0]['lr']:.2e}")
+                if lm_loss_val_float:
+                    print(f"  ├─ lm_loss={lm_loss_val_float:.4f}")
+                if memory_kl_val_float:
+                    print(f"  └─ memory_kl={memory_kl_val_float:.4f}")
 
         # ============================================================================
-        # EXTENDED METRICS LOGGING (at log_interval)
-        # Additional detailed metrics logged less frequently for performance
+        # COMPREHENSIVE METRICS LOGGING (every 200 steps)
+        # All detailed metrics including quantization, memory slots, attention, etc.
         # ============================================================================
-        if is_main_process and global_step % config.log_interval == 0:
+        COMPREHENSIVE_LOG_INTERVAL = 200  # Log everything every 200 steps
+        if is_main_process and global_step % COMPREHENSIVE_LOG_INTERVAL == 0:
+            print(f"\n{'='*70}")
+            print(f"[COMPREHENSIVE LOGGING] Step {global_step}")
+            print(f"{'='*70}")
+
             try:
                 extended_metrics = {}
                 base_model = model.module if hasattr(model, 'module') else model
@@ -2139,6 +2149,34 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
                 # === Log extended metrics ===
                 if extended_metrics:
+                    print(f"\n📊 Extended Metrics ({len(extended_metrics)} total):")
+
+                    # Categorize and print metrics by type
+                    quant_metrics = {k: v for k, v in extended_metrics.items() if 'quantization' in k}
+                    memory_metrics = {k: v for k, v in extended_metrics.items() if 'memory' in k}
+                    attention_metrics = {k: v for k, v in extended_metrics.items() if 'attention' in k}
+                    health_metrics = {k: v for k, v in extended_metrics.items() if 'health' in k}
+
+                    if quant_metrics:
+                        print(f"  🔢 Quantization: {len(quant_metrics)} metrics")
+                        for k, v in list(quant_metrics.items())[:3]:
+                            print(f"     ├─ {k}: {v}")
+
+                    if memory_metrics:
+                        print(f"  🧠 Memory: {len(memory_metrics)} metrics")
+                        for k, v in list(memory_metrics.items())[:3]:
+                            print(f"     ├─ {k}: {v}")
+
+                    if attention_metrics:
+                        print(f"  👁️  Attention: {len(attention_metrics)} metrics")
+                        for k, v in list(attention_metrics.items())[:3]:
+                            print(f"     ├─ {k}: {v}")
+
+                    if health_metrics:
+                        print(f"  ❤️  Health: {len(health_metrics)} metrics")
+                        for k, v in health_metrics.items():
+                            print(f"     ├─ {k}: {v}")
+
                     try:
                         if wandb_logger and wandb_logger.wandb_run:
                             wandb_logger.wandb_run.log(extended_metrics, step=global_step, commit=True)
@@ -2148,27 +2186,35 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                             import wandb
                             if wandb.run is not None:
                                 wandb.log(extended_metrics, step=global_step, commit=True)
+                        print(f"  ✅ Successfully logged {len(extended_metrics)} extended metrics to WandB")
                     except Exception as e:
-                        print(f"[WANDB ERROR] Failed to log extended metrics: {e}")
+                        print(f"  ❌ Failed to log extended metrics: {e}")
 
                 # === Call WandB Logger methods for additional metrics ===
+                print(f"\n📈 Additional Logger Methods:")
                 if wandb_logger:
                     try:
                         # Gradient metrics with explanations
+                        print(f"  ├─ Logging gradient metrics...")
                         wandb_logger.log_gradient_metrics(model, global_step)
 
                         # Temperature/alpha metrics for alignment stability
+                        print(f"  ├─ Logging temperature/alpha metrics...")
                         wandb_logger.log_temperature_metrics(model, global_step)
 
                         # Language model specific metrics
+                        print(f"  ├─ Logging language model metrics...")
                         wandb_logger.log_language_model_metrics(outputs, input_ids, global_step)
 
-                        # Quantization metrics (every 100 steps)
-                        if global_step % 100 == 0:
-                            wandb_logger.log_quantization_metrics(model, global_step, config)
-                    except Exception as e:
-                        print(f"[WANDB ERROR] Failed in logger methods at step {global_step}: {e}")
+                        # Quantization metrics
+                        print(f"  └─ Logging quantization metrics...")
+                        wandb_logger.log_quantization_metrics(model, global_step, config)
 
+                        print(f"  ✅ All logger methods completed successfully")
+                    except Exception as e:
+                        print(f"  ❌ Failed in logger methods: {e}")
+
+                print(f"{'='*70}\n")
             except Exception as e:
                 print(f"[WANDB ERROR] Extended metrics logging failed at step {global_step}: {e}")
                 import traceback
@@ -2203,8 +2249,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 stage_name=stage_name
             )
 
-            # Log best stage 2 tracking metrics to wandb
-            if wandb_logger and global_step % config.log_interval == 0:
+            # Log best stage 2 tracking metrics to wandb (every 200 steps)
+            if wandb_logger and global_step % COMPREHENSIVE_LOG_INTERVAL == 0:
                 best_tracker_metrics = {
                     'best_stage2/composite_score': best_stage2_tracker.best_composite_score,
                     'best_stage2/best_step': best_stage2_tracker.best_step,
@@ -2217,6 +2263,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     best_tracker_metrics[f'best_stage2/best_{metric_name}'] = metric_value
 
                 wandb_logger.log_metrics(best_tracker_metrics, step=global_step)
+
+                if is_new_best:
+                    print(f"🌟 NEW BEST MODEL at step {global_step}! Composite score: {best_stage2_tracker.best_composite_score:.4f}")
 
         # Step-based checkpointing disabled - only epoch checkpoints used
         # This ensures consistent checkpoint behavior across all stages
@@ -2283,14 +2332,15 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         avg_loss = total_loss / max(batch_idx + 1, 1)
                         return avg_loss, global_step, 'attention'
 
-                    # Log attention quality metrics periodically
-                    if is_main_process and global_step % config.log_interval == 0 and wandb_logger:
+                    # Log attention quality metrics every 200 steps
+                    if is_main_process and global_step % COMPREHENSIVE_LOG_INTERVAL == 0 and wandb_logger:
                         try:
                             wandb_metrics = attention_monitor.get_wandb_metrics(metrics)
                             wandb_logger.log_metrics(wandb_metrics, step=global_step)
+                            print(f"  ✅ Attention quality metrics logged")
                         except Exception as e:
                             if global_step % 100 == 0:
-                                print(f"WARNING: Failed to log attention quality metrics: {e}")
+                                print(f"  ⚠️  Failed to log attention quality metrics: {e}")
             except Exception as e:
                 if global_step % 500 == 0:
                     print(f"WARNING: Error in attention monitor at step {global_step}: {e}")
