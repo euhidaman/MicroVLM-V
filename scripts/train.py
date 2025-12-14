@@ -2922,7 +2922,7 @@ def main():
 
     # Init wandb if requested
     wandb_run = setup_wandb(config, run_name_str)
-    wandb_logger = WandBLogger(wandb_run, enabled=config.use_wandb) if wandb_run else None
+    wandb_logger = WandBLogger(config, wandb_run=wandb_run) if wandb_run else None
 
     # Build tokenizer
     tokenizer_name = getattr(config, 'text_model', None) or getattr(config, 'qwen_model', 'Qwen/Qwen2.5-0.5B')
