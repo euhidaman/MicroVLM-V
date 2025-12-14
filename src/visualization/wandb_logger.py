@@ -20,10 +20,15 @@ class WandBLogger:
     """
     
     def __init__(self, config, wandb_run=None):
+        # ALWAYS PRINT - to verify this file version is loaded
+        print(f"[WandBLogger.__init__] INITIALIZING - wandb_run={wandb_run is not None}, type={type(wandb_run)}")
+
         self.config = config
         self.wandb_run = wandb_run
         self.enabled = wandb_run is not None
         
+        print(f"[WandBLogger.__init__] enabled={self.enabled}")
+
         # Tracking for memory heatmap
         self.memory_states = []
         self.memory_addressing_history = []
@@ -261,7 +266,8 @@ class WandBLogger:
                     if 'train/loss' in metrics:
                         print(f"[WandBLogger]   train/loss = {metrics['train/loss']:.4f}")
 
-                self.wandb_run.log(metrics, step=global_step)
+                # Force commit=True to ensure metrics are immediately sent to WandB
+                self.wandb_run.log(metrics, step=global_step, commit=True)
 
                 # Debug: Print confirmation every 50 steps now
                 if global_step % 50 == 0:
@@ -988,14 +994,21 @@ class WandBLogger:
             step: global step
             prefix: optional prefix to add to all metric names
         """
+        # DEBUG: Print every 100 steps
+        if step % 100 == 0:
+            print(f"[WandBLogger.log_metrics] step={step}, enabled={self.enabled}, num_metrics={len(metrics)}")
+
         if not self.enabled:
+            if step % 100 == 0:
+                print(f"[WandBLogger.log_metrics] RETURNING EARLY - not enabled")
             return
         
         if prefix:
             metrics = {f"{prefix}/{k}": v for k, v in metrics.items()}
         
-        self.wandb_run.log(metrics, step=step)
-    
+        # Force commit=True to ensure immediate sync
+        self.wandb_run.log(metrics, step=step, commit=True)
+
     def log_image(self, image, name: str, step: int):
         """
         Log a single image to WandB
