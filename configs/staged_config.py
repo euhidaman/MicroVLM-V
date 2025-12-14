@@ -152,11 +152,20 @@ class Stage2Config:
     # Sliding Window Early Stopping
     use_sliding_window_early_stop: bool = True
     sliding_window_size: int = 1000  # Number of steps in window (larger = more stable, ignores short-term noise)
-    sliding_window_min_delta: float = 0.01  # Minimum improvement threshold (0.01 = requires real progress beyond noise)
-    sliding_window_patience_steps: int = 2000  # Steps without improvement before stopping (reduced for faster stopping)
+    sliding_window_min_delta: float = 0.05  # Minimum improvement threshold (0.05 = requires significant progress)
+    sliding_window_patience_steps: int = 1000  # Steps without improvement before stopping (aggressive early stop)
+
+    # Best Model Tracking
+    track_best_model: bool = True  # Track and save best model (lowest loss)
+    best_model_metric: str = "loss"  # Metric to track for best model
+
+    # Regular Checkpoint Saving (every 500 steps)
+    checkpoint_interval_steps: int = 500  # Save checkpoint every N steps
+    push_checkpoints_to_hf: bool = True  # Push each checkpoint to HuggingFace
 
     # HuggingFace Auto-Push on Early Stop
     push_to_hf_on_stop: bool = True
+    push_best_model_on_stop: bool = True  # Push best model as final commit
     hf_stage2_repo_name: str = "MicroVLM-V-stage2-final"
 
     # Frozen components

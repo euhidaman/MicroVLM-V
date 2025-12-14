@@ -212,6 +212,84 @@ class SlidingWindowEarlyStopping:
         }
 
 
+class SimpleBestModelTracker:
+    """
+    Tracks the absolute best model based on a single metric (default: loss).
+    Saves the checkpoint whenever a new best is found.
+    """
+
+    def __init__(self, metric_name="loss", save_dir="checkpoints", verbose=True):
+        """
+        Args:
+            metric_name: Name of metric to track (default: 'loss')
+            save_dir: Directory to save best model checkpoint
+            verbose: Print status messages
+        """
+        self.metric_name = metric_name
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        self.verbose = verbose
+
+        self.best_metric_value = float('inf')  # Lower is better
+        self.best_step = 0
+        self.best_epoch = 0
+        self.best_checkpoint_path = None
+        self.updates_count = 0
+
+    def update(self, metric_value, step, epoch, model, optimizer, config):
+        """
+        Update best model if metric improved.
+
+        Args:
+            metric_value: Current metric value (e.g., loss)
+            step: Current global step
+            epoch: Current epoch
+            model: Model to save
+            optimizer: Optimizer to save
+            config: Training config
+
+        Returns:
+            bool: True if new best was saved
+        """
+        if metric_value < self.best_metric_value:
+            self.best_metric_value = metric_value
+            self.best_step = step
+            self.best_epoch = epoch
+            self.updates_count += 1
+
+            # Save best model checkpoint
+            self.best_checkpoint_path = self.save_dir / f"best-model-{self.metric_name}-{metric_value:.4f}-step-{step}.pt"
+
+            torch.save({
+                'epoch': epoch,
+                'global_step': step,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': vars(config) if hasattr(config, '__dict__') else config,
+                'best_metric': self.metric_name,
+                'best_metric_value': metric_value,
+                'updates_count': self.updates_count
+            }, self.best_checkpoint_path)
+
+            if self.verbose:
+                print(f"\n🏆 NEW BEST MODEL! {self.metric_name}={metric_value:.4f} at step {step}")
+                print(f"   Saved to: {self.best_checkpoint_path}")
+                print(f"   Improvement: {self.best_metric_value:.4f} → {metric_value:.4f}\n")
+
+            return True
+        return False
+
+    def get_best_info(self):
+        """Get information about best model"""
+        return {
+            'best_metric_value': self.best_metric_value,
+            'best_step': self.best_step,
+            'best_epoch': self.best_epoch,
+            'best_checkpoint_path': str(self.best_checkpoint_path) if self.best_checkpoint_path else None,
+            'updates_count': self.updates_count
+        }
+
+
 class BestStage2ModelTracker:
     """
     Tracks the best Stage 2 model based on multiple metrics (not just loss).
@@ -1872,6 +1950,19 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         global_step += 1
 
+        # ===== Best Model Tracking =====
+        # Update best model tracker with current loss (main process only)
+        if best_model_tracker is not None and is_main_process:
+            current_loss = loss.item()
+            best_model_tracker.update(
+                metric_value=current_loss,
+                step=global_step,
+                epoch=epoch,
+                model=model.module if hasattr(model, 'module') else model,
+                optimizer=optimizer,
+                config=config
+            )
+
         # Check for best Stage 2 model (main process only)
         if best_stage2_tracker is not None and is_main_process:
             # Prepare metrics dictionary for evaluation
@@ -1901,26 +1992,60 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 stage_name=stage_name
             )
 
-        # Step-based checkpointing (every 500 steps) on main process only
-        # Save checkpoints throughout training for Stage 2
-        checkpoint_interval = getattr(config, 'checkpoint_interval', 500)
-        stage_name = getattr(config, 'stage_name', 'default')
+        # ===== Regular Checkpoint Saving (Every 500 Steps) =====
+        checkpoint_interval = getattr(config, 'checkpoint_interval_steps', 500)
+        push_checkpoints_to_hf = getattr(config, 'push_checkpoints_to_hf', True)
 
-        # For Stage 2, always save checkpoints every 500 steps
-        if is_main_process and global_step % checkpoint_interval == 0:
-            if 'stage2' in stage_name.lower():
-                save_step_checkpoint(
-                    model=model,
-                    optimizer=optimizer,
-                    global_step=global_step,
-                    config=config,
-                    stage_name=stage_name
-                )
-            else:
-                # For other stages, only save before force_continue threshold
-                force_continue_steps = getattr(config, 'force_continue_steps', 1500)
-                if global_step <= force_continue_steps:
-                    save_step_checkpoint(
+        if global_step % checkpoint_interval == 0 and is_main_process:
+            checkpoint_dir = Path(config.output_dir) / "checkpoints"
+            checkpoint_dir.mkdir(parents=True, exist_ok=True)
+            checkpoint_path = checkpoint_dir / f"checkpoint-{global_step}.pt"
+
+            # Get model state dict (unwrap DDP if needed)
+            model_state = model.module.state_dict() if hasattr(model, 'module') else model.state_dict()
+
+            torch.save({
+                'epoch': epoch,
+                'global_step': global_step,
+                'model_state_dict': model_state,
+                'optimizer_state_dict': optimizer.state_dict(),
+                'config': vars(config) if hasattr(config, '__dict__') else config,
+                'loss': loss.item(),
+            }, checkpoint_path)
+
+            print(f"\n💾 Checkpoint saved at step {global_step}: {checkpoint_path}")
+
+            # Push to HuggingFace if enabled
+            if push_checkpoints_to_hf:
+                try:
+                    hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+                    if hf_token:
+                        repo_name = getattr(config, 'hf_stage2_repo_name', 'MicroVLM-V-stage2-final')
+                        api = HfApi()
+
+                        # Create repo if it doesn't exist
+                        try:
+                            api.create_repo(repo_id=repo_name, exist_ok=True, token=hf_token, private=False)
+                        except:
+                            pass
+
+                        # Upload checkpoint
+                        api.upload_file(
+                            path_or_fileobj=str(checkpoint_path),
+                            path_in_repo=f"checkpoints/checkpoint-{global_step}.pt",
+                            repo_id=repo_name,
+                            token=hf_token,
+                            commit_message=f"Add checkpoint at step {global_step} (loss={loss.item():.4f})"
+                        )
+                        print(f"   ✅ Pushed to HuggingFace: {repo_name}/checkpoints/checkpoint-{global_step}.pt")
+                    else:
+                        print(f"   ⚠️  HF_TOKEN not found, skipping HuggingFace push")
+                except Exception as e:
+                    print(f"   ⚠️  Failed to push to HuggingFace: {e}")
+
+        # Logging section continues below
+        if False:  # Placeholder for removed code
+            pass
                         model=model,
                         optimizer=optimizer,
                         global_step=global_step,
@@ -3123,6 +3248,23 @@ def main():
             print(f"   Patience: {sliding_window_stopper.patience_steps} steps")
             print(f"   Auto-push to HF: {getattr(config, 'push_to_hf_on_stop', True)}")
 
+    # Initialize Simple Best Model Tracker (tracks absolute best loss)
+    best_model_tracker = None
+    track_best_model = getattr(config, 'track_best_model', False)
+
+    if track_best_model:
+        checkpoint_dir = Path(config.output_dir) / "checkpoints"
+        best_model_tracker = SimpleBestModelTracker(
+            metric_name=getattr(config, 'best_model_metric', 'loss'),
+            save_dir=checkpoint_dir,
+            verbose=is_main_process
+        )
+        if is_main_process:
+            print(f"\n🏆 Best Model Tracking:")
+            print(f"   Metric: {best_model_tracker.metric_name}")
+            print(f"   Save dir: {checkpoint_dir}")
+            print(f"   Tracking absolute best model throughout training")
+
     # Initialize Best Stage 2 Model Tracker (for optimal model selection)
     best_stage2_tracker = None
     track_best_stage2 = getattr(config, 'track_best_stage2', False)
@@ -3218,6 +3360,84 @@ def main():
                         f"{args.config}_early_stop"
                     )
                     print(f"   Emergency checkpoint saved: {checkpoint_path}")
+
+                    # Push best model to HuggingFace if tracking is enabled
+                    push_best_model_on_stop = getattr(config, 'push_best_model_on_stop', True)
+                    if best_model_tracker is not None and push_best_model_on_stop:
+                        best_info = best_model_tracker.get_best_info()
+                        if best_info['best_checkpoint_path']:
+                            print(f"\n🏆 Pushing BEST MODEL to HuggingFace:")
+                            print(f"   Best {best_model_tracker.metric_name}: {best_info['best_metric_value']:.4f}")
+                            print(f"   Best step: {best_info['best_step']}")
+                            print(f"   Checkpoint: {best_info['best_checkpoint_path']}")
+
+                            try:
+                                hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+                                if hf_token:
+                                    repo_name = getattr(config, 'hf_stage2_repo_name', 'MicroVLM-V-stage2-final')
+                                    api = HfApi()
+
+                                    # Create repo if needed
+                                    try:
+                                        api.create_repo(repo_id=repo_name, exist_ok=True, token=hf_token, private=False)
+                                    except:
+                                        pass
+
+                                    # Upload best model as final commit
+                                    best_checkpoint_path = Path(best_info['best_checkpoint_path'])
+                                    api.upload_file(
+                                        path_or_fileobj=str(best_checkpoint_path),
+                                        path_in_repo=f"best-model-final.pt",
+                                        repo_id=repo_name,
+                                        token=hf_token,
+                                        commit_message=f"🏆 Best model: {best_model_tracker.metric_name}={best_info['best_metric_value']:.4f} at step {best_info['best_step']}"
+                                    )
+                                    print(f"   ✅ Best model pushed to HuggingFace: {repo_name}/best-model-final.pt")
+
+                                    # Create and upload model card
+                                    model_card = f"""# MicroVLM-V Stage 2 - Best Model
+
+## Best Model Information
+- **Metric**: {best_model_tracker.metric_name}
+- **Best Value**: {best_info['best_metric_value']:.4f}
+- **Step**: {best_info['best_step']}
+- **Epoch**: {best_info['best_epoch']}
+- **Total Updates**: {best_info['updates_count']}
+
+## Early Stopping Information
+- **Stop Reason**: {stop_reason}
+- **Final Step**: {global_step}
+- **Final Epoch**: {epoch}
+"""
+                                    if stopper_status:
+                                        model_card += f"""
+## Sliding Window Statistics
+- **Best Window Loss**: {stopper_status['best_window_loss']:.4f}
+- **Current Window Loss**: {stopper_status['current_window_loss']:.4f}
+- **Steps Without Improvement**: {stopper_status['steps_without_improvement']}
+- **Min Delta Threshold**: {stopper_status['min_delta']:.4f}
+- **Window Size**: {stopper_status['window_size']} steps
+- **Patience**: {stopper_status['patience_steps']} steps
+"""
+
+                                    model_card_path = best_checkpoint_path.parent / "MODEL_CARD.md"
+                                    with open(model_card_path, 'w') as f:
+                                        f.write(model_card)
+
+                                    api.upload_file(
+                                        path_or_fileobj=str(model_card_path),
+                                        path_in_repo="README.md",
+                                        repo_id=repo_name,
+                                        token=hf_token,
+                                        commit_message="Add model card for best model"
+                                    )
+                                    print(f"   ✅ Model card uploaded")
+                                else:
+                                    print(f"   ⚠️  HF_TOKEN not found, skipping HuggingFace push")
+                            except Exception as e:
+                                print(f"   ⚠️  Failed to push best model to HuggingFace: {e}")
+                        else:
+                            print(f"   ⚠️  No best model checkpoint found to push")
 
                     # Show best Stage 2 model info if available
                     if best_stage2_tracker is not None and best_stage2_tracker.best_checkpoint_path:
@@ -3373,6 +3593,74 @@ def main():
         base_model = model.module if hasattr(model, 'module') else model
         base_model.save_checkpoint(str(final_path))
         print(f"Training complete! Final model saved to {final_path}")
+
+        # Push best model to HuggingFace at end of training
+        push_best_model_on_stop = getattr(config, 'push_best_model_on_stop', True)
+        if best_model_tracker is not None and push_best_model_on_stop:
+            best_info = best_model_tracker.get_best_info()
+            if best_info['best_checkpoint_path']:
+                print(f"\n🏆 Pushing BEST MODEL to HuggingFace (Training Complete):")
+                print(f"   Best {best_model_tracker.metric_name}: {best_info['best_metric_value']:.4f}")
+                print(f"   Best step: {best_info['best_step']}")
+                print(f"   Checkpoint: {best_info['best_checkpoint_path']}")
+
+                try:
+                    hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+                    if hf_token:
+                        repo_name = getattr(config, 'hf_stage2_repo_name', 'MicroVLM-V-stage2-final')
+                        api = HfApi()
+
+                        # Create repo if needed
+                        try:
+                            api.create_repo(repo_id=repo_name, exist_ok=True, token=hf_token, private=False)
+                        except:
+                            pass
+
+                        # Upload best model as final commit
+                        best_checkpoint_path = Path(best_info['best_checkpoint_path'])
+                        api.upload_file(
+                            path_or_fileobj=str(best_checkpoint_path),
+                            path_in_repo=f"best-model-final.pt",
+                            repo_id=repo_name,
+                            token=hf_token,
+                            commit_message=f"🏆 Best model: {best_model_tracker.metric_name}={best_info['best_metric_value']:.4f} at step {best_info['best_step']} (Training Complete)"
+                        )
+                        print(f"   ✅ Best model pushed to HuggingFace: {repo_name}/best-model-final.pt")
+
+                        # Create and upload model card
+                        model_card = f"""# MicroVLM-V Stage 2 - Best Model (Training Complete)
+
+## Best Model Information
+- **Metric**: {best_model_tracker.metric_name}
+- **Best Value**: {best_info['best_metric_value']:.4f}
+- **Step**: {best_info['best_step']}
+- **Epoch**: {best_info['best_epoch']}
+- **Total Updates**: {best_info['updates_count']}
+
+## Training Summary
+- **Total Steps**: {global_step}
+- **Total Epochs**: {actual_epochs}
+- **Training Status**: Completed Successfully
+"""
+
+                        model_card_path = best_checkpoint_path.parent / "MODEL_CARD_COMPLETE.md"
+                        with open(model_card_path, 'w') as f:
+                            f.write(model_card)
+
+                        api.upload_file(
+                            path_or_fileobj=str(model_card_path),
+                            path_in_repo="README.md",
+                            repo_id=repo_name,
+                            token=hf_token,
+                            commit_message="Add model card for best model (training complete)"
+                        )
+                        print(f"   ✅ Model card uploaded")
+                    else:
+                        print(f"   ⚠️  HF_TOKEN not found, skipping HuggingFace push")
+                except Exception as e:
+                    print(f"   ⚠️  Failed to push best model to HuggingFace: {e}")
+            else:
+                print(f"   ⚠️  No best model checkpoint found to push")
 
         if wandb_run:
             wandb_run.summary["actual_epochs"] = actual_epochs
