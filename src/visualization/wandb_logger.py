@@ -39,7 +39,8 @@ class WandBLogger:
             global_step: global training step
         """
         if not self.enabled:
-            print(f"[WandBLogger] WARNING: Logger not enabled (wandb_run={self.wandb_run})")
+            if global_step % 100 == 0:  # Only print warning periodically
+                print(f"[WandBLogger] WARNING: Logger not enabled (wandb_run={self.wandb_run})")
             return
         
         try:
@@ -50,81 +51,216 @@ class WandBLogger:
             }
 
             # Total loss - log as both 'train/loss' and 'train/total_loss' for compatibility
+            # Handle both dict keys and direct tensor values
+            loss_value = None
             if 'loss' in outputs:
-                loss_value = outputs['loss'].item() if torch.is_tensor(outputs['loss']) else outputs['loss']
+                loss_tensor = outputs['loss']
+                # Ensure we can extract the value even if it's a quantized tensor
+                if hasattr(loss_tensor, 'item'):
+                    loss_value = loss_tensor.item()
+                elif torch.is_tensor(loss_tensor):
+                    loss_value = float(loss_tensor.detach().cpu())
+                else:
+                    loss_value = float(loss_tensor)
+
                 metrics['train/loss'] = loss_value  # Primary metric for wandb charts
                 metrics['train/total_loss'] = loss_value  # Alias for clarity
             else:
-                print(f"[WandBLogger] WARNING: 'loss' not found in outputs. Available keys: {list(outputs.keys())}")
+                # Try alternative loss keys
+                for alt_key in ['total_loss', 'lm_loss']:
+                    if alt_key in outputs and outputs[alt_key] is not None:
+                        loss_tensor = outputs[alt_key]
+                        if hasattr(loss_tensor, 'item'):
+                            loss_value = loss_tensor.item()
+                        elif torch.is_tensor(loss_tensor):
+                            loss_value = float(loss_tensor.detach().cpu())
+                        else:
+                            loss_value = float(loss_tensor)
+                        metrics['train/loss'] = loss_value
+                        metrics['train/total_loss'] = loss_value
+                        break
+
+                if loss_value is None and global_step % 100 == 0:
+                    print(f"[WandBLogger] WARNING: No valid loss found. Available keys: {list(outputs.keys())}")
 
             # LM loss
             lm_loss = outputs.get('lm_loss')
             if lm_loss is not None:
-                metrics['train/lm_loss'] = lm_loss.item()
-                # Calculate perplexity
-                metrics['train/perplexity'] = torch.exp(lm_loss).item()
+                try:
+                    if hasattr(lm_loss, 'item'):
+                        lm_loss_val = lm_loss.item()
+                    elif torch.is_tensor(lm_loss):
+                        lm_loss_val = float(lm_loss.detach().cpu())
+                    else:
+                        lm_loss_val = float(lm_loss)
+
+                    metrics['train/lm_loss'] = lm_loss_val
+                    # Calculate perplexity safely
+                    try:
+                        perplexity = torch.exp(torch.tensor(lm_loss_val)).item()
+                        # Clamp perplexity to reasonable range
+                        perplexity = min(perplexity, 1e6)
+                        metrics['train/perplexity'] = perplexity
+                    except:
+                        pass  # Skip perplexity if calculation fails
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log lm_loss: {e}")
 
             # Alignment loss
-            if 'alignment_loss' in outputs:
-                metrics['alignment/loss'] = outputs['alignment_loss'].item()
+            if 'alignment_loss' in outputs and outputs['alignment_loss'] is not None:
+                try:
+                    align_loss = outputs['alignment_loss']
+                    if hasattr(align_loss, 'item'):
+                        metrics['alignment/loss'] = align_loss.item()
+                    elif torch.is_tensor(align_loss):
+                        metrics['alignment/loss'] = float(align_loss.detach().cpu())
+                    else:
+                        metrics['alignment/loss'] = float(align_loss)
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log alignment_loss: {e}")
 
             # Fine-grained alignment loss (text-to-patch attention supervision)
-            if 'fine_grained_loss' in outputs:
-                metrics['alignment/fine_grained_loss'] = outputs['fine_grained_loss'].item()
+            if 'fine_grained_loss' in outputs and outputs['fine_grained_loss'] is not None:
+                try:
+                    fg_loss = outputs['fine_grained_loss']
+                    if hasattr(fg_loss, 'item'):
+                        metrics['alignment/fine_grained_loss'] = fg_loss.item()
+                    elif torch.is_tensor(fg_loss):
+                        metrics['alignment/fine_grained_loss'] = float(fg_loss.detach().cpu())
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log fine_grained_loss: {e}")
 
-            # Memory losses
-            if 'memory_kl' in outputs:
-                metrics['memory/kl_divergence'] = outputs['memory_kl'].item()
+            # Memory losses - handle both quantized and non-quantized memory
+            if 'memory_kl' in outputs and outputs['memory_kl'] is not None:
+                try:
+                    mem_kl = outputs['memory_kl']
+                    if hasattr(mem_kl, 'item'):
+                        metrics['memory/kl_divergence'] = mem_kl.item()
+                    elif torch.is_tensor(mem_kl):
+                        metrics['memory/kl_divergence'] = float(mem_kl.detach().cpu())
+                    else:
+                        metrics['memory/kl_divergence'] = float(mem_kl)
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log memory_kl: {e}")
 
-            if 'addressing_kl' in outputs:
-                metrics['memory/addressing_kl'] = outputs['addressing_kl'].item()
+            if 'addressing_kl' in outputs and outputs['addressing_kl'] is not None:
+                try:
+                    addr_kl = outputs['addressing_kl']
+                    if hasattr(addr_kl, 'item'):
+                        metrics['memory/addressing_kl'] = addr_kl.item()
+                    elif torch.is_tensor(addr_kl):
+                        metrics['memory/addressing_kl'] = float(addr_kl.detach().cpu())
+                    else:
+                        metrics['memory/addressing_kl'] = float(addr_kl)
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log addressing_kl: {e}")
 
             # Scope probabilities (if present)
-            if 'scope_probs' in outputs:
-                scope_probs = outputs['scope_probs']
-                metrics['memory/scope_prob_mean'] = scope_probs.mean().item()
-                metrics['memory/scope_prob_std'] = scope_probs.std().item()
+            if 'scope_probs' in outputs and outputs['scope_probs'] is not None:
+                try:
+                    scope_probs = outputs['scope_probs']
+                    if torch.is_tensor(scope_probs) and scope_probs.numel() > 0:
+                        metrics['memory/scope_prob_mean'] = float(scope_probs.mean().detach().cpu())
+                        metrics['memory/scope_prob_std'] = float(scope_probs.std().detach().cpu())
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log scope_probs: {e}")
 
             # ITC/ITM losses (FIBER mode)
-            if 'itc_loss' in outputs:
-                itc_loss = outputs['itc_loss']
-                if itc_loss is not None:
-                    metrics['alignment/itc_loss'] = itc_loss.item() if hasattr(itc_loss, 'item') else itc_loss
+            if 'itc_loss' in outputs and outputs['itc_loss'] is not None:
+                try:
+                    itc_loss = outputs['itc_loss']
+                    if hasattr(itc_loss, 'item'):
+                        metrics['alignment/itc_loss'] = itc_loss.item()
+                    elif torch.is_tensor(itc_loss):
+                        metrics['alignment/itc_loss'] = float(itc_loss.detach().cpu())
+                    else:
+                        metrics['alignment/itc_loss'] = float(itc_loss)
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log itc_loss: {e}")
 
-            if 'itm_loss' in outputs:
-                itm_loss = outputs['itm_loss']
-                if itm_loss is not None:
-                    metrics['alignment/itm_loss'] = itm_loss.item() if hasattr(itm_loss, 'item') else itm_loss
+            if 'itm_loss' in outputs and outputs['itm_loss'] is not None:
+                try:
+                    itm_loss = outputs['itm_loss']
+                    if hasattr(itm_loss, 'item'):
+                        metrics['alignment/itm_loss'] = itm_loss.item()
+                    elif torch.is_tensor(itm_loss):
+                        metrics['alignment/itm_loss'] = float(itm_loss.detach().cpu())
+                    else:
+                        metrics['alignment/itm_loss'] = float(itm_loss)
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log itm_loss: {e}")
 
-            if 'token_loss' in outputs:
-                token_loss = outputs['token_loss']
-                if token_loss is not None:
-                    metrics['alignment/token_loss'] = token_loss.item() if hasattr(token_loss, 'item') else token_loss
+            if 'token_loss' in outputs and outputs['token_loss'] is not None:
+                try:
+                    token_loss = outputs['token_loss']
+                    if hasattr(token_loss, 'item'):
+                        metrics['alignment/token_loss'] = token_loss.item()
+                    elif torch.is_tensor(token_loss):
+                        metrics['alignment/token_loss'] = float(token_loss.detach().cpu())
+                    else:
+                        metrics['alignment/token_loss'] = float(token_loss)
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log token_loss: {e}")
 
             # Anti-collapse regularization losses
-            if 'anti_collapse_loss' in outputs:
-                anti_collapse_loss = outputs['anti_collapse_loss']
-                if anti_collapse_loss is not None:
-                    val = anti_collapse_loss.item() if hasattr(anti_collapse_loss, 'item') else anti_collapse_loss
+            if 'anti_collapse_loss' in outputs and outputs['anti_collapse_loss'] is not None:
+                try:
+                    anti_collapse_loss = outputs['anti_collapse_loss']
+                    if hasattr(anti_collapse_loss, 'item'):
+                        val = anti_collapse_loss.item()
+                    elif torch.is_tensor(anti_collapse_loss):
+                        val = float(anti_collapse_loss.detach().cpu())
+                    else:
+                        val = float(anti_collapse_loss)
                     metrics['regularization/anti_collapse_loss'] = val
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log anti_collapse_loss: {e}")
 
-            if 'attention_entropy_loss' in outputs:
-                attn_entropy_loss = outputs['attention_entropy_loss']
-                if attn_entropy_loss is not None:
-                    val = attn_entropy_loss.item() if hasattr(attn_entropy_loss, 'item') else attn_entropy_loss
+            if 'attention_entropy_loss' in outputs and outputs['attention_entropy_loss'] is not None:
+                try:
+                    attn_entropy_loss = outputs['attention_entropy_loss']
+                    if hasattr(attn_entropy_loss, 'item'):
+                        val = attn_entropy_loss.item()
+                    elif torch.is_tensor(attn_entropy_loss):
+                        val = float(attn_entropy_loss.detach().cpu())
+                    else:
+                        val = float(attn_entropy_loss)
                     metrics['regularization/attention_entropy_loss'] = val
+                except Exception as e:
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] WARNING: Failed to log attention_entropy_loss: {e}")
 
             # Log metrics to wandb with error handling
-            self.wandb_run.log(metrics, step=global_step)
+            try:
+                self.wandb_run.log(metrics, step=global_step)
 
-            # Debug: Print confirmation every 100 steps
-            if global_step % 100 == 0:
-                print(f"[WandBLogger] Successfully logged {len(metrics)} metrics at step {global_step}")
-                if 'train/loss' in metrics:
-                    print(f"[WandBLogger] train/loss = {metrics['train/loss']:.4f}")
+                # Debug: Print confirmation every 100 steps
+                if global_step % 100 == 0:
+                    print(f"[WandBLogger] ✓ Logged {len(metrics)} metrics at step {global_step}")
+                    if 'train/loss' in metrics:
+                        print(f"[WandBLogger]   train/loss = {metrics['train/loss']:.4f}")
+                    if 'memory/kl_divergence' in metrics:
+                        print(f"[WandBLogger]   memory/kl_divergence = {metrics['memory/kl_divergence']:.4f}")
+            except Exception as e:
+                print(f"[WandBLogger] ERROR: Failed to log metrics to wandb at step {global_step}: {e}")
+                print(f"[WandBLogger]   Attempted to log {len(metrics)} metrics")
+                print(f"[WandBLogger]   wandb_run type: {type(self.wandb_run)}")
+                import traceback
+                traceback.print_exc()
 
         except Exception as e:
-            print(f"[WandBLogger] ERROR in log_training_metrics: {e}")
+            print(f"[WandBLogger] ERROR in log_training_metrics at step {global_step}: {e}")
+            print(f"[WandBLogger]   outputs keys: {list(outputs.keys()) if isinstance(outputs, dict) else 'not a dict'}")
             import traceback
             traceback.print_exc()
 
@@ -502,70 +638,125 @@ class WandBLogger:
         if not self.enabled:
             return
         
-        with torch.no_grad():
-            memory_mean, memory_cov = memory_state
-            
-            # Check if memory is quantized and use quantized values for visualization
-            use_quantized = False
-            if episodic_memory_module is not None and hasattr(episodic_memory_module, 'quantized_memory_slots'):
-                use_quantized = True
-                quant_memory = episodic_memory_module.quantized_memory_slots
-                # Use QUANTIZED values (4-bit INT8) for visualization
-                memory_mean_quantized = quant_memory.memory_mean_quantized.cpu().numpy()
-                # Compute norms from quantized values (preserves quantization visibility)
-                memory_norms = np.linalg.norm(memory_mean_quantized, axis=1).astype(np.float32)
-            else:
-                # Fallback to dequantized/full-precision values
-                memory_mean_np = memory_mean[0].cpu().numpy()  # Take first batch
-                memory_norms = np.linalg.norm(memory_mean_np, axis=1)
+        try:
+            with torch.no_grad():
+                memory_mean, memory_cov = memory_state
 
-            # Average addressing weights over batch and episode
-            addr_weights_np = addressing_weights.mean(dim=1).cpu().numpy()
-            avg_addressing = addr_weights_np.mean(axis=0)
+                # Check if memory is quantized and use quantized values for visualization
+                use_quantized = False
+                memory_norms = None
 
-            # Store snapshot for temporal evolution (log every step for step-wise visibility)
-            # Only store every N steps to avoid memory explosion but ensure visibility
-            should_store = (global_step % 100 == 0) or len(self.memory_states) == 0
-            if should_store:
-                self.memory_states.append((global_step, memory_norms.copy()))
-                self.memory_addressing_history.append((global_step, avg_addressing.copy()))
+                if episodic_memory_module is not None and hasattr(episodic_memory_module, 'quantized_memory_slots'):
+                    try:
+                        use_quantized = True
+                        quant_memory = episodic_memory_module.quantized_memory_slots
 
-                # Limit history size to prevent memory issues (keep last 500 snapshots)
-                if len(self.memory_states) > 500:
-                    self.memory_states = self.memory_states[-500:]
-                    self.memory_addressing_history = self.memory_addressing_history[-500:]
+                        # Try to dequantize for proper visualization
+                        try:
+                            dequant_mean, _ = quant_memory.dequantize_memory()
+                            memory_norms = torch.norm(dequant_mean, dim=-1).detach().cpu().numpy().astype(np.float32)
+                        except Exception as e:
+                            # Fallback: Use packed quantized values directly
+                            if hasattr(quant_memory, 'memory_mean_quantized'):
+                                memory_mean_quantized = quant_memory.memory_mean_quantized.detach().cpu().numpy()
+                                # Compute norms from packed values
+                                memory_norms = np.linalg.norm(memory_mean_quantized, axis=1).astype(np.float32)
+                            else:
+                                raise e
 
-            # Log numerical metrics at every interval
-            avg_addressing_nonzero = avg_addressing[avg_addressing > 1e-10]
-            if len(avg_addressing_nonzero) > 0:
-                avg_addressing_prob = avg_addressing_nonzero / np.sum(avg_addressing_nonzero)
-                addressing_entropy = -np.sum(avg_addressing_prob * np.log(avg_addressing_prob))
-            else:
-                addressing_entropy = 0.0
-            
-            metrics = {
-                'memory/mean_activation': np.mean(memory_norms),
-                'memory/max_activation': np.max(memory_norms),
-                'memory/min_activation': np.min(memory_norms),
-                'memory/active_slots': np.sum(memory_norms > 0.1),
-                'memory/addressing_entropy': addressing_entropy,
-                'memory/addressing_sparsity': np.sum(avg_addressing < 0.01) / len(avg_addressing),
-                'memory/is_quantized': 1.0 if use_quantized else 0.0,
-                'memory/num_snapshots': len(self.memory_states),  # Track snapshot count
-            }
+                        if global_step % 100 == 0:
+                            print(f"[WandBLogger] Using quantized memory for heatmap (use_quantized={use_quantized})")
 
-            # Add quantization-specific metrics if available
-            if use_quantized and episodic_memory_module is not None:
-                from ..quantization.quantized_episodic_memory import get_memory_quantization_stats
-                quant_stats = get_memory_quantization_stats(episodic_memory_module)
-                metrics.update(quant_stats)
+                    except Exception as e:
+                        if global_step % 100 == 0:
+                            print(f"[WandBLogger] WARNING: Failed to extract quantized memory, using fallback: {e}")
+                        use_quantized = False
 
-            self.wandb_run.log(metrics, step=global_step)
-            
-            # Generate temporal evolution heatmaps when we have multiple snapshots
-            # Update visualization every 500 steps for step-wise visibility
-            if len(self.memory_states) >= 2 and (global_step % 500 == 0 or global_step % 100 == 0):
-                self._visualize_memory_temporal_evolution(global_step)
+                # Fallback to non-quantized memory
+                if memory_norms is None:
+                    if memory_mean.dim() == 3:
+                        memory_mean_np = memory_mean[0].detach().cpu().numpy()  # Take first batch
+                    else:
+                        memory_mean_np = memory_mean.detach().cpu().numpy()
+                    memory_norms = np.linalg.norm(memory_mean_np, axis=1).astype(np.float32)
+
+                # Average addressing weights over batch and episode
+                addr_weights_np = addressing_weights.mean(dim=1).detach().cpu().numpy()
+                avg_addressing = addr_weights_np.mean(axis=0)
+
+                # Store snapshot for temporal evolution (log every step for step-wise visibility)
+                # Only store every N steps to avoid memory explosion but ensure visibility
+                should_store = (global_step % 100 == 0) or len(self.memory_states) == 0
+                if should_store:
+                    self.memory_states.append((global_step, memory_norms.copy()))
+                    self.memory_addressing_history.append((global_step, avg_addressing.copy()))
+
+                    # Limit history size to prevent memory issues (keep last 500 snapshots)
+                    if len(self.memory_states) > 500:
+                        self.memory_states = self.memory_states[-500:]
+                        self.memory_addressing_history = self.memory_addressing_history[-500:]
+
+                # Log numerical metrics at every interval
+                avg_addressing_nonzero = avg_addressing[avg_addressing > 1e-10]
+                if len(avg_addressing_nonzero) > 0:
+                    avg_addressing_prob = avg_addressing_nonzero / np.sum(avg_addressing_nonzero)
+                    addressing_entropy = -np.sum(avg_addressing_prob * np.log(avg_addressing_prob + 1e-10))
+                else:
+                    addressing_entropy = 0.0
+
+                metrics = {
+                    'memory/mean_activation': float(np.mean(memory_norms)),
+                    'memory/max_activation': float(np.max(memory_norms)),
+                    'memory/min_activation': float(np.min(memory_norms)),
+                    'memory/active_slots': int(np.sum(memory_norms > 0.1)),
+                    'memory/addressing_entropy': float(addressing_entropy),
+                    'memory/addressing_sparsity': float(np.sum(avg_addressing < 0.01) / len(avg_addressing)),
+                    'memory/is_quantized': 1.0 if use_quantized else 0.0,
+                    'memory/num_snapshots': len(self.memory_states),  # Track snapshot count
+                }
+
+                # Add quantization-specific metrics if available
+                if use_quantized and episodic_memory_module is not None:
+                    try:
+                        from ..quantization.quantized_episodic_memory import get_memory_quantization_stats
+                        quant_stats = get_memory_quantization_stats(episodic_memory_module)
+                        # Ensure all values are serializable
+                        for key, value in quant_stats.items():
+                            if value is not None:
+                                try:
+                                    if hasattr(value, 'item'):
+                                        metrics[key] = value.item()
+                                    elif torch.is_tensor(value):
+                                        metrics[key] = float(value.detach().cpu())
+                                    else:
+                                        metrics[key] = float(value)
+                                except:
+                                    pass  # Skip non-serializable metrics
+                    except Exception as e:
+                        if global_step % 100 == 0:
+                            print(f"[WandBLogger] WARNING: Failed to get quantization stats: {e}")
+
+                # Log metrics with error handling
+                try:
+                    self.wandb_run.log(metrics, step=global_step)
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] ✓ Logged {len(metrics)} memory metrics at step {global_step}")
+                except Exception as e:
+                    print(f"[WandBLogger] ERROR: Failed to log memory metrics at step {global_step}: {e}")
+
+                # Generate temporal evolution heatmaps when we have multiple snapshots
+                # Update visualization every 500 steps for step-wise visibility
+                if len(self.memory_states) >= 2 and (global_step % 500 == 0 or global_step % 100 == 0):
+                    try:
+                        self._visualize_memory_temporal_evolution(global_step)
+                    except Exception as e:
+                        if global_step % 100 == 0:
+                            print(f"[WandBLogger] WARNING: Failed to create memory heatmap visualization: {e}")
+
+        except Exception as e:
+            print(f"[WandBLogger] ERROR in log_memory_heatmap at step {global_step}: {e}")
+            import traceback
+            traceback.print_exc()
 
     def _visualize_memory_temporal_evolution(self, global_step):
         """
@@ -832,129 +1023,173 @@ class WandBLogger:
         if not self.enabled:
             return
 
-        base_model = model.module if hasattr(model, 'module') else model
-        metrics = {}
+        try:
+            base_model = model.module if hasattr(model, 'module') else model
+            metrics = {}
 
-        # 1.58-bit Memory Quantization Metrics
-        if config and getattr(config, 'quantize_memory_158bit', False):
-            if hasattr(base_model, 'episodic_memory'):
-                try:
-                    from ..quantization.quantized_episodic_memory import get_memory_quantization_stats
-                    quant_stats = get_memory_quantization_stats(base_model.episodic_memory)
+            # Debug print for first call
+            if global_step <= 100:
+                print(f"[WandBLogger] log_quantization_metrics called at step {global_step}")
+                if config:
+                    print(f"[WandBLogger]   quantize_memory_158bit: {getattr(config, 'quantize_memory_158bit', False)}")
+                    print(f"[WandBLogger]   quantize_language_4bit: {getattr(config, 'quantize_language_4bit', False)}")
+                    print(f"[WandBLogger]   quantize_vision_4bit: {getattr(config, 'quantize_vision_4bit', False)}")
 
-                    # Add prefix for organized wandb grouping
-                    for key, value in quant_stats.items():
-                        metrics[f'quantization/memory_158bit/{key}'] = value
+            # 1.58-bit Memory Quantization Metrics
+            if config and getattr(config, 'quantize_memory_158bit', False):
+                if hasattr(base_model, 'episodic_memory'):
+                    try:
+                        from ..quantization.quantized_episodic_memory import get_memory_quantization_stats
+                        quant_stats = get_memory_quantization_stats(base_model.episodic_memory)
 
-                    # Additional runtime metrics
-                    if hasattr(base_model.episodic_memory, 'quantized_memory_slots'):
-                        quant_mem = base_model.episodic_memory.quantized_memory_slots
+                        # Add prefix for organized wandb grouping
+                        for key, value in quant_stats.items():
+                            if value is not None:
+                                try:
+                                    # Ensure value is a scalar
+                                    if hasattr(value, 'item'):
+                                        metrics[f'quantization/memory_158bit/{key}'] = value.item()
+                                    elif torch.is_tensor(value):
+                                        metrics[f'quantization/memory_158bit/{key}'] = float(value.detach().cpu())
+                                    else:
+                                        metrics[f'quantization/memory_158bit/{key}'] = float(value)
+                                except Exception as e:
+                                    if global_step % 100 == 0:
+                                        print(f"[WandBLogger] WARNING: Failed to log quantization metric {key}: {e}")
 
-                        # Quantization value distribution
-                        if hasattr(quant_mem, 'memory_mean_quantized'):
-                            quant_vals = quant_mem.memory_mean_quantized.detach().cpu().numpy().flatten()
-                            unique_vals = np.unique(quant_vals)
+                        # Additional runtime metrics
+                        if hasattr(base_model.episodic_memory, 'quantized_memory_slots'):
+                            quant_mem = base_model.episodic_memory.quantized_memory_slots
 
-                            metrics['quantization/memory_158bit/unique_values'] = len(unique_vals)
-                            metrics['quantization/memory_158bit/mean_value'] = float(np.mean(quant_vals))
-                            metrics['quantization/memory_158bit/std_value'] = float(np.std(quant_vals))
+                            # Quantization value distribution
+                            if hasattr(quant_mem, 'memory_mean_quantized'):
+                                try:
+                                    quant_vals = quant_mem.memory_mean_quantized.detach().cpu().numpy().flatten()
+                                    unique_vals = np.unique(quant_vals)
 
-                            # Check if quantization is collapsing (all values same)
-                            if len(unique_vals) <= 2:
-                                metrics['quantization/memory_158bit/collapsed'] = 1.0
-                            else:
-                                metrics['quantization/memory_158bit/collapsed'] = 0.0
+                                    metrics['quantization/memory_158bit/unique_values'] = len(unique_vals)
+                                    metrics['quantization/memory_158bit/mean_value'] = float(np.mean(quant_vals))
+                                    metrics['quantization/memory_158bit/std_value'] = float(np.std(quant_vals))
 
-                except Exception as e:
-                    warnings.warn(f"Failed to log memory quantization metrics: {e}")
+                                    # Check if quantization is collapsing (all values same)
+                                    if len(unique_vals) <= 2:
+                                        metrics['quantization/memory_158bit/collapsed'] = 1.0
+                                        if global_step % 100 == 0:
+                                            print(f"[WandBLogger] WARNING: Memory quantization may be collapsing (only {len(unique_vals)} unique values)")
+                                    else:
+                                        metrics['quantization/memory_158bit/collapsed'] = 0.0
+                                except Exception as e:
+                                    if global_step % 100 == 0:
+                                        print(f"[WandBLogger] WARNING: Failed to compute memory quantization distribution: {e}")
 
-        # 4-bit Language Model Quantization Metrics
-        if config and getattr(config, 'quantize_language_4bit', False):
-            if hasattr(base_model, 'language_model'):
-                try:
-                    # Check for BitsAndBytes 4-bit quantization
-                    lm_model = base_model.language_model
+                    except Exception as e:
+                        if global_step % 100 == 0:
+                            print(f"[WandBLogger] WARNING: Failed to log memory quantization metrics: {e}")
+                            import traceback
+                            traceback.print_exc()
+                else:
+                    if global_step % 500 == 0:
+                        print(f"[WandBLogger] WARNING: quantize_memory_158bit=True but episodic_memory not found in model")
 
-                    # Count quantized parameters
-                    num_4bit_params = 0
-                    num_total_params = 0
+            # 4-bit Language Model Quantization Metrics
+            if config and getattr(config, 'quantize_language_4bit', False):
+                if hasattr(base_model, 'language_model'):
+                    try:
+                        # Check for BitsAndBytes 4-bit quantization
+                        lm_model = base_model.language_model
 
-                    for name, param in lm_model.named_parameters():
-                        num_total_params += param.numel()
-                        # BitsAndBytes marks quantized params with specific dtype
-                        if hasattr(param, 'quant_state') or 'int4' in str(param.dtype).lower():
-                            num_4bit_params += param.numel()
+                        # Count quantized parameters
+                        num_4bit_params = 0
+                        num_total_params = 0
 
-                    if num_total_params > 0:
-                        metrics['quantization/language_4bit/quantized_params'] = num_4bit_params
-                        metrics['quantization/language_4bit/total_params'] = num_total_params
-                        metrics['quantization/language_4bit/quantized_ratio'] = num_4bit_params / num_total_params
+                        for name, param in lm_model.named_parameters():
+                            num_total_params += param.numel()
+                            # BitsAndBytes marks quantized params with specific dtype
+                            if hasattr(param, 'quant_state') or 'int4' in str(param.dtype).lower():
+                                num_4bit_params += param.numel()
 
-                    # Memory footprint estimation
-                    # 4-bit: 0.5 bytes per param, full precision: 2-4 bytes per param
-                    memory_saved_mb = (num_4bit_params * 1.5) / 1e6  # Saved bytes if using 2-byte fp16
-                    metrics['quantization/language_4bit/memory_saved_mb'] = memory_saved_mb
+                        if num_total_params > 0:
+                            metrics['quantization/language_4bit/quantized_params'] = num_4bit_params
+                            metrics['quantization/language_4bit/total_params'] = num_total_params
+                            metrics['quantization/language_4bit/quantized_ratio'] = num_4bit_params / num_total_params
 
-                except Exception as e:
-                    warnings.warn(f"Failed to log language quantization metrics: {e}")
+                        # Memory footprint estimation
+                        # 4-bit: 0.5 bytes per param, full precision: 2-4 bytes per param
+                        memory_saved_mb = (num_4bit_params * 1.5) / 1e6  # Saved bytes if using 2-byte fp16
+                        metrics['quantization/language_4bit/memory_saved_mb'] = memory_saved_mb
 
-        # 4-bit Vision Encoder Quantization Metrics (if enabled)
-        if config and getattr(config, 'quantize_vision_4bit', False):
-            if hasattr(base_model, 'vision_encoder'):
-                try:
-                    vision_model = base_model.vision_encoder
+                    except Exception as e:
+                        warnings.warn(f"Failed to log language quantization metrics: {e}")
 
-                    # Count quantized parameters
-                    num_4bit_params = 0
-                    num_total_params = 0
+            # 4-bit Vision Encoder Quantization Metrics (if enabled)
+            if config and getattr(config, 'quantize_vision_4bit', False):
+                if hasattr(base_model, 'vision_encoder'):
+                    try:
+                        vision_model = base_model.vision_encoder
 
-                    for name, param in vision_model.named_parameters():
-                        num_total_params += param.numel()
-                        if hasattr(param, 'quant_state') or 'int4' in str(param.dtype).lower():
-                            num_4bit_params += param.numel()
+                        # Count quantized parameters
+                        num_4bit_params = 0
+                        num_total_params = 0
 
-                    if num_total_params > 0:
-                        metrics['quantization/vision_4bit/quantized_params'] = num_4bit_params
-                        metrics['quantization/vision_4bit/total_params'] = num_total_params
-                        metrics['quantization/vision_4bit/quantized_ratio'] = num_4bit_params / num_total_params
+                        for name, param in vision_model.named_parameters():
+                            num_total_params += param.numel()
+                            if hasattr(param, 'quant_state') or 'int4' in str(param.dtype).lower():
+                                num_4bit_params += param.numel()
 
-                    memory_saved_mb = (num_4bit_params * 1.5) / 1e6
-                    metrics['quantization/vision_4bit/memory_saved_mb'] = memory_saved_mb
+                        if num_total_params > 0:
+                            metrics['quantization/vision_4bit/quantized_params'] = num_4bit_params
+                            metrics['quantization/vision_4bit/total_params'] = num_total_params
+                            metrics['quantization/vision_4bit/quantized_ratio'] = num_4bit_params / num_total_params
 
-                except Exception as e:
-                    warnings.warn(f"Failed to log vision quantization metrics: {e}")
+                        memory_saved_mb = (num_4bit_params * 1.5) / 1e6
+                        metrics['quantization/vision_4bit/memory_saved_mb'] = memory_saved_mb
 
-        # Overall quantization summary
-        if metrics:
-            total_quantized_params = (
-                metrics.get('quantization/memory_158bit/quantized_params', 0) +
-                metrics.get('quantization/language_4bit/quantized_params', 0) +
-                metrics.get('quantization/vision_4bit/quantized_params', 0)
-            )
+                    except Exception as e:
+                        warnings.warn(f"Failed to log vision quantization metrics: {e}")
 
-            total_params = sum(p.numel() for p in base_model.parameters())
-
-            if total_params > 0:
-                metrics['quantization/overall/quantized_params'] = total_quantized_params
-                metrics['quantization/overall/total_params'] = total_params
-                metrics['quantization/overall/quantized_ratio'] = total_quantized_params / total_params
-
-            # Estimate total model size with quantization
-            estimated_size_mb = 0
-            for name, param in base_model.named_parameters():
-                is_quantized = (
-                    hasattr(param, 'quant_state') or
-                    'int4' in str(param.dtype).lower() or
-                    'quantized' in name.lower()
+            # Overall quantization summary
+            if metrics:
+                total_quantized_params = (
+                    metrics.get('quantization/memory_158bit/quantized_params', 0) +
+                    metrics.get('quantization/language_4bit/quantized_params', 0) +
+                    metrics.get('quantization/vision_4bit/quantized_params', 0)
                 )
 
-                if is_quantized:
-                    estimated_size_mb += param.numel() * 0.5 / 1e6  # 4-bit or 1.58-bit ~0.5 bytes
-                else:
-                    estimated_size_mb += param.numel() * 2 / 1e6  # fp16: 2 bytes
+                total_params = sum(p.numel() for p in base_model.parameters())
 
-            metrics['quantization/overall/estimated_model_size_mb'] = estimated_size_mb
+                if total_params > 0:
+                    metrics['quantization/overall/quantized_params'] = total_quantized_params
+                    metrics['quantization/overall/total_params'] = total_params
+                    metrics['quantization/overall/quantized_ratio'] = total_quantized_params / total_params
 
-            # Log all quantization metrics
-            self.wandb_run.log(metrics, step=global_step)
+                # Estimate total model size with quantization
+                estimated_size_mb = 0
+                for name, param in base_model.named_parameters():
+                    is_quantized = (
+                        hasattr(param, 'quant_state') or
+                        'int4' in str(param.dtype).lower() or
+                        'quantized' in name.lower()
+                    )
+
+                    if is_quantized:
+                        estimated_size_mb += param.numel() * 0.5 / 1e6  # 4-bit or 1.58-bit ~0.5 bytes
+                    else:
+                        estimated_size_mb += param.numel() * 2 / 1e6  # fp16: 2 bytes
+
+                metrics['quantization/overall/estimated_model_size_mb'] = estimated_size_mb
+
+                # Log all quantization metrics with error handling
+                try:
+                    self.wandb_run.log(metrics, step=global_step)
+                    if global_step % 100 == 0:
+                        print(f"[WandBLogger] ✓ Logged {len(metrics)} quantization metrics at step {global_step}")
+                except Exception as e:
+                    print(f"[WandBLogger] ERROR: Failed to log quantization metrics at step {global_step}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+        except Exception as e:
+            print(f"[WandBLogger] ERROR in log_quantization_metrics at step {global_step}: {e}")
+            import traceback
+            traceback.print_exc()
 

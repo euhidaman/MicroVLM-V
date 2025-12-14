@@ -1990,40 +1990,51 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         # ===== Attention Quality Monitoring =====
         # Update attention monitor with token attention if available
         if attention_monitor is not None and 'token_attention' in outputs:
-            token_attn = outputs['token_attention']
-            if token_attn is not None:
-                # Check attention quality
-                metrics = attention_monitor.check_attention(token_attn.detach(), global_step)
-                
-                # Check for early stopping (main process only)
-                if is_main_process and attention_monitor.should_stop():
-                    print(f"\n{'='*60}")
-                    print("⚠️  ATTENTION QUALITY ALERT - EARLY STOPPING TRIGGERED")
-                    print(f"{'='*60}")
-                    print(f"Step: {global_step}")
-                    print(f"Health Score: {metrics.health_score:.4f}")
-                    print(f"Edge Ratio: {metrics.edge_ratio:.4f}")
-                    print(f"Entropy Ratio: {metrics.mean_entropy_ratio:.4f}")
-                    print(f"\nAttention has degraded to edge-detection mode.")
-                    print(f"Training will stop to prevent further degradation.")
-                    print(f"{'='*60}\n")
-                    
-                    # Log alert to WandB
-                    if wandb_logger:
-                        wandb_logger.log_metrics({
-                            'attention_quality/early_stop_triggered': 1.0,
-                            'attention_quality/stop_step': global_step,
-                            'attention_quality/final_health': metrics.health_score,
-                        }, step=global_step)
-                    
-                    # Return with early stop flag
-                    avg_loss = total_loss / max(batch_idx + 1, 1)
-                    return avg_loss, global_step, 'attention'
-                
-                # Log attention quality metrics periodically
-                if is_main_process and global_step % config.log_interval == 0 and wandb_logger:
-                    wandb_metrics = attention_monitor.get_wandb_metrics(metrics)
-                    wandb_logger.log_metrics(wandb_metrics, step=global_step)
+            try:
+                token_attn = outputs['token_attention']
+                if token_attn is not None:
+                    # Check attention quality
+                    metrics = attention_monitor.check_attention(token_attn.detach(), global_step)
+
+                    # Check for early stopping (main process only)
+                    if is_main_process and attention_monitor.should_stop():
+                        print(f"\n{'='*60}")
+                        print("⚠️  ATTENTION QUALITY ALERT - EARLY STOPPING TRIGGERED")
+                        print(f"{'='*60}")
+                        print(f"Step: {global_step}")
+                        print(f"Health Score: {metrics.health_score:.4f}")
+                        print(f"Edge Ratio: {metrics.edge_ratio:.4f}")
+                        print(f"Entropy Ratio: {metrics.mean_entropy_ratio:.4f}")
+                        print(f"\nAttention has degraded to edge-detection mode.")
+                        print(f"Training will stop to prevent further degradation.")
+                        print(f"{'='*60}\n")
+
+                        # Log alert to WandB
+                        if wandb_logger:
+                            try:
+                                wandb_logger.log_metrics({
+                                    'attention_quality/early_stop_triggered': 1.0,
+                                    'attention_quality/stop_step': global_step,
+                                    'attention_quality/final_health': metrics.health_score,
+                                }, step=global_step)
+                            except Exception as e:
+                                print(f"WARNING: Failed to log attention stop alert to wandb: {e}")
+
+                        # Return with early stop flag
+                        avg_loss = total_loss / max(batch_idx + 1, 1)
+                        return avg_loss, global_step, 'attention'
+
+                    # Log attention quality metrics periodically
+                    if is_main_process and global_step % config.log_interval == 0 and wandb_logger:
+                        try:
+                            wandb_metrics = attention_monitor.get_wandb_metrics(metrics)
+                            wandb_logger.log_metrics(wandb_metrics, step=global_step)
+                        except Exception as e:
+                            if global_step % 100 == 0:
+                                print(f"WARNING: Failed to log attention quality metrics: {e}")
+            except Exception as e:
+                if global_step % 500 == 0:
+                    print(f"WARNING: Error in attention monitor at step {global_step}: {e}")
 
         # End batch tracking for carbon tracker and log compute metrics
         if carbon_tracker is not None:
@@ -2445,27 +2456,36 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                                 'attention/divergence': stats['divergence_statistic']
                             }, step=global_step)
 
-                # Memory visualizations
+                # Memory visualizations with quantization support
                 if config.use_memory and wandb_logger and viz_model.memory_state is not None:
-                    # Ensure memory_state is valid tuple with data
-                    if isinstance(viz_model.memory_state, tuple) and len(viz_model.memory_state) == 2 and viz_model.memory_state[0] is not None:
-                        # Get batch size from memory state
-                        M_batch_size = viz_model.memory_state[0].shape[0]
-                        # Use matching batch size for validation
-                        batch_size_for_vis = min(M_batch_size, len(input_ids))
-                        z_for_memory = viz_model.encode_text(input_ids[:batch_size_for_vis], attention_mask[:batch_size_for_vis])[
-                            0].mean(dim=1).unsqueeze(0)
-                        w_mean = viz_model.episodic_memory._solve_w_mean(
-                            z_for_memory, viz_model.memory_state[0][:batch_size_for_vis])
+                    try:
+                        # Ensure memory_state is valid tuple with data
+                        if isinstance(viz_model.memory_state, tuple) and len(viz_model.memory_state) == 2 and viz_model.memory_state[0] is not None:
+                            # Get batch size from memory state
+                            M_batch_size = viz_model.memory_state[0].shape[0]
+                            # Use matching batch size for validation
+                            batch_size_for_vis = min(M_batch_size, len(input_ids))
+                            z_for_memory = viz_model.encode_text(input_ids[:batch_size_for_vis], attention_mask[:batch_size_for_vis])[
+                                0].mean(dim=1).unsqueeze(0)
+                            w_mean = viz_model.episodic_memory._solve_w_mean(
+                                z_for_memory, viz_model.memory_state[0][:batch_size_for_vis])
 
-                        # Pass episodic memory module for quantization-aware logging
-                        wandb_logger.log_memory_heatmap(
-                            (viz_model.memory_state[0][:batch_size_for_vis],
-                             viz_model.memory_state[1][:batch_size_for_vis]),
-                            w_mean,
-                            global_step,
-                            episodic_memory_module=viz_model.episodic_memory
-                        )
+                            # Pass episodic memory module for quantization-aware logging
+                            wandb_logger.log_memory_heatmap(
+                                (viz_model.memory_state[0][:batch_size_for_vis],
+                                 viz_model.memory_state[1][:batch_size_for_vis]),
+                                w_mean,
+                                global_step,
+                                episodic_memory_module=viz_model.episodic_memory
+                            )
+                        else:
+                            if global_step % 500 == 0:
+                                print(f"[Visualization] WARNING: Memory state not valid for heatmap logging")
+                    except Exception as e:
+                        if global_step % 500 == 0:
+                            print(f"[Visualization] ERROR: Failed to log memory heatmap: {e}")
+                            import traceback
+                            traceback.print_exc()
 
             model.train()
 
