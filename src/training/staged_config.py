@@ -39,7 +39,7 @@ class TrainingConfig:
     min_learning_rate: float = 1e-6  # Minimum LR for cosine decay (never goes below this)
     warmup_steps: int = 1000
     weight_decay: float = 0.01
-    gradient_clip: float = 0.5
+    gradient_clip: float = 5.0  # Increased from 0.5 - allow more gradient flow for learning
 
     # Memory
     use_memory: bool = True
@@ -217,7 +217,7 @@ class Stage2Config(TrainingConfig):
     learning_rate: float = 5e-5  # Reasonable LR for Stage 2 fine-tuning
     min_learning_rate: float = 1e-6  # Minimum LR for cosine decay
     warmup_steps: int = 500  # Reduced warmup for faster training start
-    batch_size: int = 128  # Increased for better GPU utilization (2x A100 80GB can handle this in FP)
+    batch_size: int = 192  # Increased to 192 to better utilize GPU memory (2x A100 80GB with ~50GB free on GPU 1)
     gradient_accumulation_steps: int = 1  # Disabled - use full batch for better throughput
     num_workers: int = 32  # Increased for faster data loading (match CPU cores)
 

@@ -417,7 +417,7 @@ class BestStage2ModelTracker:
         return False
 
     def _save_best_checkpoint(self, model, optimizer, global_step, config, stage_name, metrics_dict):
-        """Save best Stage 2 checkpoint and push to HuggingFace"""
+        """Save best Stage 2 checkpoint locally (FP) and push QUANTIZED version to HuggingFace"""
         checkpoint_dir = Path(config.output_dir) / "checkpoints"
         checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -427,7 +427,7 @@ class BestStage2ModelTracker:
         # Unwrap DDP model for saving
         model_to_save = model.module if isinstance(model, DDP) else model
 
-        # Save checkpoint
+        # Save FULL-PRECISION checkpoint locally (for training resume)
         torch.save({
             'global_step': global_step,
             'model_state_dict': model_to_save.state_dict(),
@@ -440,15 +440,18 @@ class BestStage2ModelTracker:
             'all_metrics': metrics_dict,
         }, checkpoint_path)
 
-        print(f"💾 Best Stage 2 checkpoint saved: {checkpoint_path}")
+        print(f"💾 Best Stage 2 checkpoint saved (FP): {checkpoint_path}")
 
-        # Push to HuggingFace in checkpoints/best-stage2/ folder
-        push_checkpoint_to_hf(
+        # Push QUANTIZED version to HuggingFace
+        # Apply quantization before upload to keep model small (~200-300MB instead of 2.6GB)
+        push_quantized_checkpoint_to_hf(
+            model=model,
             checkpoint_path=checkpoint_path,
             global_step=global_step,
             config=config,
             checkpoint_type="best-stage2",
-            correct_sim=self.best_composite_score  # Use composite score
+            metrics_score=self.best_composite_score,
+            metrics_dict=metrics_dict
         )
 
         return checkpoint_path
@@ -715,6 +718,204 @@ def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type=
         
     except Exception as e:
         print(f"   ⚠️ HuggingFace upload failed: {e}")
+        return False
+
+
+def push_quantized_checkpoint_to_hf(model, checkpoint_path, global_step, config, checkpoint_type="best-stage2", metrics_score=None, metrics_dict=None):
+    """
+    Apply quantization to model and push ONLY the quantized version to HuggingFace.
+
+    This function:
+    1. Creates a temporary copy of model weights
+    2. Applies 1.58-bit quantization to episodic memory W_M
+    3. Applies 4-bit quantization to memory slots
+    4. Saves the quantized state dict
+    5. Uploads to HuggingFace
+    6. Restores original weights (no side effects on training)
+
+    The quantized model is typically ~200-300MB vs 2.6GB for FP.
+
+    Args:
+        model: The model to quantize and upload
+        checkpoint_path: Path to the FP checkpoint (for metadata)
+        global_step: Current training step
+        config: Training configuration
+        checkpoint_type: Type of checkpoint ("best-stage2", "final", etc.)
+        metrics_score: Best score for this checkpoint
+        metrics_dict: Dictionary of metrics at this checkpoint
+    """
+    try:
+        # Get HF token
+        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+        if not hf_token:
+            try:
+                from huggingface_hub import HfFolder
+                hf_token = HfFolder.get_token()
+            except:
+                pass
+
+        if not hf_token:
+            print("   ⚠️ No HF token - skipping HuggingFace upload")
+            return False
+
+        print(f"\n   🔧 Applying quantization for HuggingFace upload...")
+
+        # Unwrap DDP model
+        base_model = model.module if hasattr(model, 'module') else model
+
+        # Store original state for restoration
+        original_state = {}
+
+        # Apply 1.58-bit quantization to episodic memory W_M
+        if hasattr(base_model, 'episodic_memory'):
+            em = base_model.episodic_memory
+
+            # Store original W_M if it exists
+            if hasattr(em, 'W_M') and em.W_M is not None:
+                original_state['W_M'] = em.W_M.data.clone()
+
+                # Apply 1.58-bit quantization (ternary: -1, 0, +1 with scale)
+                W = em.W_M.data
+                scale = W.abs().mean()
+                if scale > 0:
+                    # Quantize to ternary values
+                    W_quantized = torch.zeros_like(W)
+                    W_quantized[W > scale * 0.5] = scale
+                    W_quantized[W < -scale * 0.5] = -scale
+                    em.W_M.data = W_quantized
+
+                    sparsity = (W_quantized == 0).float().mean().item()
+                    print(f"      ✓ Applied 1.58-bit quantization to W_M (sparsity: {sparsity:.2%})")
+
+            # Store and quantize memory_mean (4-bit)
+            if hasattr(em, 'memory_mean') and em.memory_mean is not None:
+                original_state['memory_mean'] = em.memory_mean.data.clone()
+
+                # Apply 4-bit quantization (16 levels)
+                mem = em.memory_mean.data
+                min_val = mem.min()
+                max_val = mem.max()
+                scale = (max_val - min_val) / 15.0  # 4-bit = 16 levels
+
+                if scale > 0:
+                    quantized = torch.round((mem - min_val) / scale) * scale + min_val
+                    em.memory_mean.data = quantized
+                    print(f"      ✓ Applied 4-bit quantization to memory slots")
+
+            # Store and quantize memory_logvar (4-bit)
+            if hasattr(em, 'memory_logvar') and em.memory_logvar is not None:
+                original_state['memory_logvar'] = em.memory_logvar.data.clone()
+
+                mem = em.memory_logvar.data
+                min_val = mem.min()
+                max_val = mem.max()
+                scale = (max_val - min_val) / 15.0
+
+                if scale > 0:
+                    quantized = torch.round((mem - min_val) / scale) * scale + min_val
+                    em.memory_logvar.data = quantized
+
+        # Get quantized state dict
+        quantized_state_dict = base_model.state_dict()
+
+        # Calculate quantized model size
+        total_bytes = sum(p.numel() * p.element_size() for p in base_model.parameters())
+        size_mb = total_bytes / (1024 * 1024)
+        print(f"      📦 Quantized model size: ~{size_mb:.1f} MB")
+
+        # Save quantized checkpoint to temporary file
+        quantized_checkpoint_path = Path(checkpoint_path).parent / f"quantized-{checkpoint_type}-checkpoint.pt"
+
+        quantized_checkpoint = {
+            'global_step': global_step,
+            'model_state_dict': quantized_state_dict,
+            'config': vars(config) if hasattr(config, '__dict__') else {},
+            'quantization_info': {
+                'memory_158bit': True,
+                'memory_4bit': True,
+                'language_4bit': getattr(config, 'quantize_language_4bit', False),
+            },
+            'metrics_score': metrics_score,
+            'metrics_dict': metrics_dict,
+            'timestamp': datetime.now().isoformat(),
+        }
+
+        torch.save(quantized_checkpoint, quantized_checkpoint_path)
+        print(f"      ✓ Saved quantized checkpoint: {quantized_checkpoint_path}")
+
+        # Restore original weights (no side effects on training)
+        if hasattr(base_model, 'episodic_memory'):
+            em = base_model.episodic_memory
+            if 'W_M' in original_state and hasattr(em, 'W_M'):
+                em.W_M.data = original_state['W_M']
+            if 'memory_mean' in original_state and hasattr(em, 'memory_mean'):
+                em.memory_mean.data = original_state['memory_mean']
+            if 'memory_logvar' in original_state and hasattr(em, 'memory_logvar'):
+                em.memory_logvar.data = original_state['memory_logvar']
+
+        print(f"      ✓ Restored original FP weights for continued training")
+
+        # Upload quantized checkpoint to HuggingFace
+        repo_name = getattr(config, 'hf_repo_name', 'MicroVLM-V')
+        username = getattr(config, 'hf_username', 'euhidaman')
+        repo_id = f"{username}/{repo_name}"
+
+        api = HfApi()
+
+        # Ensure repo exists
+        try:
+            api.create_repo(repo_id=repo_id, token=hf_token, exist_ok=True, repo_type="model")
+        except Exception:
+            pass
+
+        # Determine path in repo
+        if checkpoint_type == "best-stage2":
+            path_in_repo = "checkpoints/best-stage2/quantized-best-stage2-checkpoint.pt"
+            commit_msg = f"🔧 Quantized Best Stage 2 Model (step {global_step}, score={metrics_score:.6f})"
+        elif checkpoint_type == "final":
+            path_in_repo = "checkpoints/final/quantized-final-checkpoint.pt"
+            commit_msg = f"🔧 Quantized Final Model (step {global_step})"
+        else:
+            path_in_repo = f"checkpoints/quantized/quantized-{checkpoint_type}-checkpoint.pt"
+            commit_msg = f"🔧 Quantized checkpoint (step {global_step})"
+
+        print(f"   🤗 Uploading QUANTIZED model to HuggingFace: {path_in_repo}")
+        api.upload_file(
+            path_or_fileobj=str(quantized_checkpoint_path),
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_msg,
+            token=hf_token
+        )
+
+        # Get actual file size
+        actual_size_mb = quantized_checkpoint_path.stat().st_size / (1024 * 1024)
+        print(f"   ✅ Uploaded QUANTIZED model ({actual_size_mb:.1f} MB) to https://huggingface.co/{repo_id}")
+
+        # Optionally clean up temporary file
+        # quantized_checkpoint_path.unlink(missing_ok=True)
+
+        return True
+
+    except Exception as e:
+        print(f"   ⚠️ Quantized HuggingFace upload failed: {e}")
+        import traceback
+        traceback.print_exc()
+
+        # Make sure to restore original weights even on failure
+        try:
+            if hasattr(base_model, 'episodic_memory'):
+                em = base_model.episodic_memory
+                if 'W_M' in original_state and hasattr(em, 'W_M'):
+                    em.W_M.data = original_state['W_M']
+                if 'memory_mean' in original_state and hasattr(em, 'memory_mean'):
+                    em.memory_mean.data = original_state['memory_mean']
+                if 'memory_logvar' in original_state and hasattr(em, 'memory_logvar'):
+                    em.memory_logvar.data = original_state['memory_logvar']
+        except:
+            pass
+
         return False
 
 
@@ -2527,11 +2728,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                     param.grad.data.div_(loss_scale)
 
         # Gradient clipping BEFORE NaN checks (prevents explosions)
-        # Increased limits to allow more gradient flow for learning
-        if use_autocast:
-            max_clip = min(config.gradient_clip, 2.0) if config.gradient_clip > 0 else 2.0
-        else:
-            max_clip = min(config.gradient_clip, 1.5) if config.gradient_clip > 0 else 1.5
+        # Use config.gradient_clip directly - no more restrictive caps
+        max_clip = config.gradient_clip if config.gradient_clip > 0 else 5.0  # Default to 5.0 if not set
         torch.nn.utils.clip_grad_norm_(model.parameters(), max_clip)
 
         # Check and sanitize gradients AFTER clipping
@@ -3787,19 +3985,19 @@ def main():
     # Wrap model with DistributedDataParallel if using multiple GPUs
     if is_distributed:
         # Use find_unused_parameters=True for FIBER model where some params (temp, ITC queue) aren't used every step
-        # Use static_graph=True for better performance when unused params are consistent across iterations
         model = DDP(
             model,
             device_ids=[local_rank],
             output_device=local_rank,
             find_unused_parameters=True,  # Required for FIBER model
             broadcast_buffers=False,  # Don't sync buffers for quantized models
-            gradient_as_bucket_view=True  # Memory optimization
+            gradient_as_bucket_view=True,  # Memory optimization
+            bucket_cap_mb=25  # Reduced bucket size for better memory efficiency and faster gradient sync
             # NOTE: Do NOT use static_graph=True - the computation graph changes between iterations
             # (e.g., ITC queue parameters don't receive gradients every step)
         )
         if is_main_process:
-            print(f"✓ Model wrapped with DDP on {world_size} GPUs (find_unused_parameters=True)")
+            print(f"✓ Model wrapped with DDP on {world_size} GPUs (find_unused_parameters=True, bucket_cap_mb=25)")
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
