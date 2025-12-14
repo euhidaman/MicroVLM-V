@@ -424,10 +424,13 @@ class BestStage2ModelTracker:
         # Always use same filename for best checkpoint (overwrites previous best)
         checkpoint_path = checkpoint_dir / "best-stage2-checkpoint.pt"
 
+        # Unwrap DDP model for saving
+        model_to_save = model.module if isinstance(model, DDP) else model
+
         # Save checkpoint
         torch.save({
             'global_step': global_step,
-            'model_state_dict': model.state_dict(),
+            'model_state_dict': model_to_save.state_dict(),
             'optimizer_state_dict': optimizer.state_dict(),
             'config': vars(config),
             'stage_name': stage_name,
@@ -609,10 +612,13 @@ def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_na
     # Save checkpoint with epoch number
     checkpoint_path = checkpoint_dir / f"epoch_{epoch}_checkpoint.pt"
 
+    # Unwrap DDP model for saving
+    model_to_save = model.module if isinstance(model, DDP) else model
+
     torch.save({
         'epoch': epoch,
         'global_step': global_step,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'config': vars(config),
         'model_statistics': stats
@@ -735,9 +741,13 @@ def save_best_alignment_checkpoint(model, optimizer, global_step, config, stage_
 
     checkpoint_path = checkpoint_dir / f"best-checkpoint-step-{global_step}.pt"
     checkpoint_path = _unique_path(checkpoint_path)
+
+    # Unwrap DDP model for saving
+    model_to_save = model.module if isinstance(model, DDP) else model
+
     torch.save({
         'global_step': global_step,
-        'model_state_dict': model.state_dict(),
+        'model_state_dict': model_to_save.state_dict(),
         'optimizer_state_dict': optimizer.state_dict(),
         'stage_name': stage_name,
         'config': vars(config),
@@ -2897,6 +2907,28 @@ def main():
                         help="Torch device, e.g. cuda or cpu")
     args = parser.parse_args()
 
+    # Initialize distributed training if using torchrun
+    is_distributed = 'RANK' in os.environ and 'WORLD_SIZE' in os.environ
+    if is_distributed:
+        local_rank = int(os.environ['LOCAL_RANK'])
+        world_size = int(os.environ['WORLD_SIZE'])
+        rank = int(os.environ['RANK'])
+
+        # Initialize process group
+        dist.init_process_group(backend='nccl')
+        torch.cuda.set_device(local_rank)
+        device = torch.device(f'cuda:{local_rank}')
+
+        print(f"[Rank {rank}/{world_size}] Distributed training initialized on GPU {local_rank}")
+    else:
+        local_rank = 0
+        world_size = 1
+        rank = 0
+        device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        print("Single-GPU training mode")
+
+    is_main_process = (rank == 0)
+
     # Determine config name for run naming
     config_name = args.config
 
@@ -2911,28 +2943,31 @@ def main():
     if args.output_dir:
         config.output_dir = args.output_dir
 
-    # Set device
-    config.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+    # Set device (use distributed device if available)
+    config.device = device
 
     # Reproducibility
     seed = getattr(config, "seed", 42)
     torch.manual_seed(seed)
     np.random.seed(seed)
 
-    # Create run name (returns tuple of (name, counter))
-    run_name_result = create_run_name(config_name)
-    run_name_str = run_name_result[0]  # Extract just the string
-    config.wandb_run_name = run_name_str
+    # Create run name (returns tuple of (name, counter)) - only on main process
+    if is_main_process:
+        run_name_result = create_run_name(config_name)
+        run_name_str = run_name_result[0]  # Extract just the string
+        config.wandb_run_name = run_name_str
+    else:
+        run_name_str = "worker"  # Worker processes don't need run name
 
-    # Init wandb if requested
-    wandb_run = setup_wandb(config, run_name_str)
+    # Init wandb if requested (only on main process)
+    wandb_run = setup_wandb(config, run_name_str) if is_main_process else None
     wandb_logger = WandBLogger(config, wandb_run=wandb_run) if wandb_run else None
 
     # Build tokenizer
     tokenizer_name = getattr(config, 'text_model', None) or getattr(config, 'qwen_model', 'Qwen/Qwen2.5-0.5B')
     tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
 
-    # Build dataloaders with all required arguments
+    # Build dataloaders with distributed training support
     train_loader, val_loader, train_sampler = create_dataloaders(
         train_metadata_file=config.train_metadata_file,
         val_metadata_file=config.val_metadata_file,
@@ -2941,18 +2976,42 @@ def main():
         num_workers=config.num_workers,
         max_samples=getattr(config, 'max_samples', None),
         max_val_samples=getattr(config, 'max_val_samples', None),
-        distributed=False
+        distributed=is_distributed,
+        world_size=world_size,
+        rank=rank
     )
 
     # Create model
     if getattr(config, 'alignment_mode', 'fiber') == 'fiber':
-        model = create_microvlm_fiber(config)
+        model = create_microvlm_fiber(
+            config=config,
+            vision_checkpoint=getattr(config, 'vision_checkpoint', None),
+            language_checkpoint=getattr(config, 'language_checkpoint', None) or getattr(config, 'qwen_model', 'Qwen/Qwen2.5-0.5B'),
+            quantize_4bit=getattr(config, 'quantize_language_4bit', False),
+            quantize_memory_158bit=getattr(config, 'quantize_memory_158bit', False),
+            training_config=config,
+            alignment_mode=getattr(config, 'alignment_mode', 'fiber'),
+            fiber_config=None  # Will use defaults
+        )
     else:
-        model = create_microvlm(config)
+        model = create_microvlm(
+            config=config,
+            vision_checkpoint=getattr(config, 'vision_checkpoint', None),
+            language_checkpoint=getattr(config, 'language_checkpoint', None) or getattr(config, 'qwen_model', 'Qwen/Qwen2.5-0.5B'),
+            quantize_4bit=getattr(config, 'quantize_language_4bit', False),
+            quantize_memory_158bit=getattr(config, 'quantize_memory_158bit', False),
+            training_config=config
+        )
     model = model.to(config.device)
 
     # Apply freezing strategy
     apply_freezing_strategy(model, config, getattr(config, 'alignment_mode', 'baseline'))
+
+    # Wrap model with DistributedDataParallel if using multiple GPUs
+    if is_distributed:
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank, find_unused_parameters=True)
+        if is_main_process:
+            print(f"✓ Model wrapped with DDP on {world_size} GPUs")
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
@@ -3072,8 +3131,8 @@ def main():
             scaler=scaler,
             wandb_run=wandb_run,
             wandb_logger=wandb_logger,
-            is_distributed=False,
-            is_main_process=True,
+            is_distributed=is_distributed,
+            is_main_process=is_main_process,
             carbon_tracker=carbon_tracker,
             attention_monitor=attention_monitor,
             sliding_window_stopper=sliding_window_stopper,
@@ -3086,18 +3145,23 @@ def main():
         if stop_reason:
             print(f"Training stopped early due to: {stop_reason}")
             if stop_reason == 'sliding_window_plateau' and stopper_status:
-                # Save final checkpoint and push to HF
-                checkpoint_path = Path(config.output_dir) / "checkpoints" / f"final_epoch_{epoch}_checkpoint.pt"
-                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
-                torch.save({
-                    'epoch': epoch,
-                    'global_step': global_step,
-                    'model_state_dict': model.state_dict(),
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'config': vars(config),
-                    'early_stop_metrics': stopper_status,
-                }, checkpoint_path)
-                print(f"💾 Final checkpoint saved: {checkpoint_path}")
+                # Save final checkpoint and push to HF (only on main process)
+                if is_main_process:
+                    checkpoint_path = Path(config.output_dir) / "checkpoints" / f"final_epoch_{epoch}_checkpoint.pt"
+                    checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+
+                    # Unwrap DDP model for saving
+                    model_to_save = model.module if isinstance(model, DDP) else model
+
+                    torch.save({
+                        'epoch': epoch,
+                        'global_step': global_step,
+                        'model_state_dict': model_to_save.state_dict(),
+                        'optimizer_state_dict': optimizer.state_dict(),
+                        'config': vars(config),
+                        'early_stop_metrics': stopper_status,
+                    }, checkpoint_path)
+                    print(f"💾 Final checkpoint saved: {checkpoint_path}")
 
                 # Push to HuggingFace
                 push_stage2_final_to_hf(
