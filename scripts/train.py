@@ -3794,11 +3794,12 @@ def main():
             output_device=local_rank,
             find_unused_parameters=True,  # Required for FIBER model
             broadcast_buffers=False,  # Don't sync buffers for quantized models
-            gradient_as_bucket_view=True,  # Memory optimization
-            static_graph=True  # Optimizes for static computation graph (unused params are consistent)
+            gradient_as_bucket_view=True  # Memory optimization
+            # NOTE: Do NOT use static_graph=True - the computation graph changes between iterations
+            # (e.g., ITC queue parameters don't receive gradients every step)
         )
         if is_main_process:
-            print(f"✓ Model wrapped with DDP on {world_size} GPUs (static_graph=True)")
+            print(f"✓ Model wrapped with DDP on {world_size} GPUs (find_unused_parameters=True)")
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
