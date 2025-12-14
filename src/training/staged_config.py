@@ -203,13 +203,18 @@ class Stage2Config(TrainingConfig):
     Stage 2: Memory Integration Training
     Introduce episodic memory after alignment is learned
     Based on Larimar methodology
+
+    IMPORTANT: Quantization is DISABLED during training for numerical stability.
+    Quantization is applied ONLY during evaluation (every 500 steps) for:
+    - Comparing FP vs quantized metrics
+    - Publishing to HuggingFace if metrics are stable
     """
     # Override defaults for Stage 2
     alignment_mode: str = 'fiber'  # Must match Stage 1 checkpoint
     use_memory: bool = True  # Enable memory in Stage 2
     episode_size: int = 4  # Longer episodes for memory learning
     num_epochs: int = 10  # More epochs for memory learning
-    learning_rate: float = 5e-5  # Reasonable LR for Stage 2 fine-tuning (was 1e-4, too high)
+    learning_rate: float = 5e-5  # Reasonable LR for Stage 2 fine-tuning
     min_learning_rate: float = 1e-6  # Minimum LR for cosine decay
     warmup_steps: int = 500  # Reduced warmup for faster training start
     batch_size: int = 32  # Reduced from 128 to prevent OOM with 2x A100 80GB
@@ -223,11 +228,30 @@ class Stage2Config(TrainingConfig):
     train_memory: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Enable quantization for compact model (<800MB target)
-    enable_quantization: bool = True
-    quantize_memory_158bit: bool = True
-    quantize_vision_4bit: bool = False
-    quantize_language_4bit: bool = True  # 4-bit Qwen reduces ~2GB to ~500MB
+    # =========================================================================
+    # QUANTIZATION STRATEGY (REVISED FOR STABILITY)
+    # =========================================================================
+    # Training: NO quantization (full precision for numerical stability)
+    # Evaluation: Apply quantization temporarily, compare FP vs quantized
+    # Export: Quantize and push to HuggingFace if metrics are stable
+    # =========================================================================
+
+    # TRAINING quantization (DISABLED for stability)
+    enable_quantization: bool = False  # DISABLED during training
+    quantize_memory_158bit: bool = False  # DISABLED during training
+    quantize_vision_4bit: bool = False  # Keep disabled
+    quantize_language_4bit: bool = False  # DISABLED during training - train in FP for stability
+
+    # EVALUATION-ONLY quantization settings (applied temporarily every eval_quantization_interval steps)
+    eval_quantization_enabled: bool = True  # Enable quantization ONLY during evaluation
+    eval_quantization_interval: int = 500  # Apply quantized eval every 500 steps
+    eval_quantization_158bit_weights: bool = True  # 1.58-bit weight quantization for eval
+    eval_quantization_4bit_memory: bool = True  # 4-bit episodic memory quantization for eval
+
+    # Quantization stability thresholds (reject quantized model if metrics exceed these)
+    quantization_max_loss_increase: float = 0.5  # Max acceptable loss increase vs FP
+    quantization_min_accuracy_ratio: float = 0.9  # Quantized accuracy must be >= 90% of FP
+    quantization_reject_on_nan: bool = True  # Reject if any NaN/Inf in quantized outputs
 
     # Memory-specific settings (from Larimar) - REDUCED FOR MEMORY EFFICIENCY
     memory_size: int = 64  # Reduced from 512 to 64 slots to save memory
@@ -267,9 +291,11 @@ class Stage2Config(TrainingConfig):
     best_stage2_save_interval: int = 100  # Check for best model every N steps
     best_stage2_min_improvement: float = 0.01  # Minimum improvement to save new best
 
-    # Visualization
-    visualize_interval: int = 100
-    viz_save_interval: int = 5000
+    # Visualization - Enhanced for episodic memory heatmaps
+    visualize_interval: int = 100  # Log visualizations every 100 steps
+    viz_save_interval: int = 500  # Save visualization images every 500 steps
+    log_memory_heatmaps: bool = True  # Enable episodic memory evolution heatmaps
+    memory_heatmap_interval: int = 100  # Log memory heatmaps every 100 steps
 
     wandb_run_name: str = "stage2_memory"
 

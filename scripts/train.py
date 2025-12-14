@@ -721,6 +721,569 @@ def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type=
 
 
 
+# =============================================================================
+# EPISODIC MEMORY HEATMAP LOGGING
+# =============================================================================
+
+class EpisodicMemoryHeatmapTracker:
+    """
+    Tracks episodic memory evolution over time and creates heatmap visualizations.
+    Logs warm-color heatmaps showing how all memory slots evolve during training.
+    """
+
+    def __init__(self, memory_size=64, history_length=100):
+        """
+        Args:
+            memory_size: Number of memory slots
+            history_length: Number of time steps to keep in history
+        """
+        self.memory_size = memory_size
+        self.history_length = history_length
+        self.memory_history = []  # List of (step, memory_snapshot) tuples
+        self.usage_history = []  # List of (step, usage_stats) tuples
+
+    def record_memory_state(self, memory_state, global_step):
+        """
+        Record current memory state for heatmap visualization.
+
+        Args:
+            memory_state: Tuple of (memory_mean, memory_logvar) tensors
+            global_step: Current training step
+        """
+        if memory_state is None or len(memory_state) < 2:
+            return
+
+        memory_mean, memory_logvar = memory_state[0], memory_state[1]
+        if memory_mean is None:
+            return
+
+        # Detach and convert to numpy for visualization
+        try:
+            # Take first batch element if batched
+            if memory_mean.dim() == 3:
+                memory_mean = memory_mean[0]  # (memory_size, code_size)
+
+            memory_snapshot = memory_mean.detach().cpu().float().numpy()
+
+            # Compute per-slot statistics
+            slot_norms = np.linalg.norm(memory_snapshot, axis=1)  # (memory_size,)
+            slot_activity = np.abs(memory_snapshot).mean(axis=1)  # (memory_size,)
+
+            self.memory_history.append({
+                'step': global_step,
+                'slot_norms': slot_norms,
+                'slot_activity': slot_activity,
+                'memory_snapshot': memory_snapshot
+            })
+
+            # Keep only recent history
+            if len(self.memory_history) > self.history_length:
+                self.memory_history.pop(0)
+
+        except Exception as e:
+            print(f"⚠️ Failed to record memory state: {e}")
+
+    def create_heatmap(self, title="Episodic Memory Evolution"):
+        """
+        Create a time-evolving heatmap of all memory slots.
+
+        Returns:
+            matplotlib figure or None if not enough data
+        """
+        if len(self.memory_history) < 2:
+            return None
+
+        try:
+            import matplotlib.pyplot as plt
+            import matplotlib.colors as mcolors
+
+            # Build time x slot matrix
+            steps = [h['step'] for h in self.memory_history]
+            slot_activities = np.array([h['slot_activity'] for h in self.memory_history])
+            slot_norms = np.array([h['slot_norms'] for h in self.memory_history])
+
+            # Create figure with two subplots
+            fig, axes = plt.subplots(2, 1, figsize=(14, 10))
+
+            # Warm colormap (yellow -> orange -> red -> dark red)
+            warm_cmap = mcolors.LinearSegmentedColormap.from_list(
+                'warm_learning',
+                ['#FFFFCC', '#FFEDA0', '#FED976', '#FEB24C', '#FD8D3C', '#FC4E2A', '#E31A1C', '#B10026']
+            )
+
+            # Plot 1: Slot Activity Heatmap (warm colors)
+            im1 = axes[0].imshow(
+                slot_activities.T,  # Transpose: time on x, slots on y
+                aspect='auto',
+                cmap=warm_cmap,
+                interpolation='nearest'
+            )
+            axes[0].set_xlabel('Training Step Index')
+            axes[0].set_ylabel('Memory Slot')
+            axes[0].set_title(f'{title} - Slot Activity (Warm = High Learning)')
+
+            # Add step labels
+            num_ticks = min(10, len(steps))
+            tick_positions = np.linspace(0, len(steps)-1, num_ticks, dtype=int)
+            axes[0].set_xticks(tick_positions)
+            axes[0].set_xticklabels([str(steps[i]) for i in tick_positions], rotation=45)
+
+            plt.colorbar(im1, ax=axes[0], label='Activation Intensity')
+
+            # Plot 2: Slot Norms Heatmap
+            im2 = axes[1].imshow(
+                slot_norms.T,
+                aspect='auto',
+                cmap=warm_cmap,
+                interpolation='nearest'
+            )
+            axes[1].set_xlabel('Training Step Index')
+            axes[1].set_ylabel('Memory Slot')
+            axes[1].set_title(f'{title} - Slot Norms (Learning Magnitude)')
+            axes[1].set_xticks(tick_positions)
+            axes[1].set_xticklabels([str(steps[i]) for i in tick_positions], rotation=45)
+
+            plt.colorbar(im2, ax=axes[1], label='Norm Magnitude')
+
+            plt.tight_layout()
+            return fig
+
+        except Exception as e:
+            print(f"⚠️ Failed to create memory heatmap: {e}")
+            return None
+
+    def get_current_stats(self):
+        """Get current memory statistics for logging."""
+        if not self.memory_history:
+            return {}
+
+        latest = self.memory_history[-1]
+        return {
+            'memory/slot_activity_mean': float(np.mean(latest['slot_activity'])),
+            'memory/slot_activity_max': float(np.max(latest['slot_activity'])),
+            'memory/slot_activity_min': float(np.min(latest['slot_activity'])),
+            'memory/slot_activity_std': float(np.std(latest['slot_activity'])),
+            'memory/slot_norms_mean': float(np.mean(latest['slot_norms'])),
+            'memory/slot_norms_max': float(np.max(latest['slot_norms'])),
+            'memory/active_slots': int(np.sum(latest['slot_activity'] > 0.01)),
+            'memory/slot_usage_entropy': float(-np.sum(
+                (latest['slot_activity'] / (latest['slot_activity'].sum() + 1e-8)) *
+                np.log(latest['slot_activity'] / (latest['slot_activity'].sum() + 1e-8) + 1e-8)
+            ))
+        }
+
+
+# =============================================================================
+# QUANTIZED EVALUATION (FP vs QUANTIZED COMPARISON)
+# =============================================================================
+
+def run_quantized_evaluation(
+    model,
+    val_loader,
+    config,
+    global_step,
+    wandb_logger=None,
+    is_main_process=True,
+    max_batches=50
+):
+    """
+    Run evaluation comparing full-precision (FP) model vs temporarily quantized model.
+
+    This function:
+    1. Evaluates the model in current FP state
+    2. Temporarily applies quantization
+    3. Evaluates again in quantized state
+    4. Compares metrics and logs to wandb
+    5. Returns quantization stability verdict
+
+    Args:
+        model: The model (may be DDP-wrapped)
+        val_loader: Validation data loader
+        config: Training config
+        global_step: Current training step
+        wandb_logger: WandB logger instance
+        is_main_process: Whether this is the main process (for logging)
+        max_batches: Maximum number of validation batches to run
+
+    Returns:
+        dict with keys:
+            - fp_metrics: Full-precision evaluation metrics
+            - quantized_metrics: Quantized evaluation metrics
+            - comparison: Comparison metrics (loss diff, etc.)
+            - is_stable: Whether quantized model is stable (no NaN, acceptable degradation)
+            - should_push: Whether to push quantized model to HuggingFace
+    """
+    if is_main_process:
+        print(f"\n{'='*60}")
+        print(f"🔬 QUANTIZED EVALUATION at Step {global_step}")
+        print(f"{'='*60}")
+
+    # Get base model (unwrap DDP if needed)
+    base_model = model.module if isinstance(model, DDP) else model
+    device = next(base_model.parameters()).device
+
+    # Store original state for restoration
+    model.eval()
+
+    results = {
+        'fp_metrics': {},
+        'quantized_metrics': {},
+        'comparison': {},
+        'is_stable': False,
+        'should_push': False
+    }
+
+    # =========================================================================
+    # PHASE 1: Full-Precision Evaluation
+    # =========================================================================
+    if is_main_process:
+        print("\n📊 Phase 1: Full-Precision Evaluation...")
+
+    fp_metrics = _evaluate_model(base_model, val_loader, device, max_batches, is_main_process)
+    results['fp_metrics'] = fp_metrics
+
+    if is_main_process:
+        print(f"   FP Loss: {fp_metrics.get('loss', float('nan')):.4f}")
+        print(f"   FP ITM Loss: {fp_metrics.get('itm_loss', float('nan')):.4f}")
+        print(f"   FP Memory KL: {fp_metrics.get('memory_kl', float('nan')):.6f}")
+
+    # =========================================================================
+    # PHASE 2: Apply Temporary Quantization
+    # =========================================================================
+    if is_main_process:
+        print("\n⚡ Phase 2: Applying Temporary Quantization...")
+
+    # Store original memory state before quantization
+    original_memory_state = None
+    if hasattr(base_model, 'episodic_memory') and base_model.episodic_memory is not None:
+        em = base_model.episodic_memory
+        original_memory_state = {
+            'memory_mean': em.memory_mean.data.clone() if hasattr(em, 'memory_mean') else None,
+            'memory_logvar': em.memory_logvar.data.clone() if hasattr(em, 'memory_logvar') else None,
+        }
+
+    # Apply quantization temporarily
+    quantization_applied = False
+    try:
+        if getattr(config, 'eval_quantization_158bit_weights', True):
+            _apply_158bit_quantization(base_model)
+            quantization_applied = True
+            if is_main_process:
+                print("   ✓ Applied 1.58-bit weight quantization")
+
+        if getattr(config, 'eval_quantization_4bit_memory', True) and hasattr(base_model, 'episodic_memory'):
+            _apply_4bit_memory_quantization(base_model.episodic_memory)
+            if is_main_process:
+                print("   ✓ Applied 4-bit memory quantization")
+    except Exception as e:
+        if is_main_process:
+            print(f"   ⚠️ Quantization failed: {e}")
+        results['is_stable'] = False
+        model.train()
+        return results
+
+    # =========================================================================
+    # PHASE 3: Quantized Evaluation
+    # =========================================================================
+    if is_main_process:
+        print("\n📊 Phase 3: Quantized Evaluation...")
+
+    quantized_metrics = _evaluate_model(base_model, val_loader, device, max_batches, is_main_process)
+    results['quantized_metrics'] = quantized_metrics
+
+    if is_main_process:
+        print(f"   Quantized Loss: {quantized_metrics.get('loss', float('nan')):.4f}")
+        print(f"   Quantized ITM Loss: {quantized_metrics.get('itm_loss', float('nan')):.4f}")
+        print(f"   Quantized Memory KL: {quantized_metrics.get('memory_kl', float('nan')):.6f}")
+
+    # =========================================================================
+    # PHASE 4: Remove Quantization (Restore FP State)
+    # =========================================================================
+    if is_main_process:
+        print("\n🔄 Phase 4: Removing Quantization (Restoring FP)...")
+
+    try:
+        _remove_quantization(base_model)
+
+        # Restore original memory state
+        if original_memory_state is not None and hasattr(base_model, 'episodic_memory'):
+            em = base_model.episodic_memory
+            if original_memory_state['memory_mean'] is not None and hasattr(em, 'memory_mean'):
+                em.memory_mean.data.copy_(original_memory_state['memory_mean'])
+            if original_memory_state['memory_logvar'] is not None and hasattr(em, 'memory_logvar'):
+                em.memory_logvar.data.copy_(original_memory_state['memory_logvar'])
+
+        if is_main_process:
+            print("   ✓ Restored full-precision state")
+    except Exception as e:
+        if is_main_process:
+            print(f"   ⚠️ Failed to restore FP state: {e}")
+
+    # =========================================================================
+    # PHASE 5: Compare Metrics
+    # =========================================================================
+    if is_main_process:
+        print("\n📈 Phase 5: Comparing FP vs Quantized...")
+
+    comparison = _compare_metrics(fp_metrics, quantized_metrics, config)
+    results['comparison'] = comparison
+    results['is_stable'] = comparison.get('is_stable', False)
+    results['should_push'] = comparison.get('should_push', False)
+
+    if is_main_process:
+        print(f"\n   Loss Difference: {comparison.get('loss_diff', float('nan')):.4f}")
+        print(f"   Loss Increase %: {comparison.get('loss_increase_pct', float('nan')):.2f}%")
+        print(f"   Has NaN/Inf: {comparison.get('has_nan_inf', True)}")
+        print(f"   Is Stable: {comparison.get('is_stable', False)}")
+        print(f"   Should Push to HF: {comparison.get('should_push', False)}")
+
+    # =========================================================================
+    # PHASE 6: Log to WandB
+    # =========================================================================
+    if wandb_logger and is_main_process:
+        _log_quantized_comparison_to_wandb(
+            wandb_logger, fp_metrics, quantized_metrics, comparison, global_step
+        )
+
+    # Restore training mode
+    model.train()
+
+    if is_main_process:
+        print(f"\n{'='*60}")
+        print(f"✅ Quantized Evaluation Complete")
+        print(f"{'='*60}\n")
+
+    return results
+
+
+def _evaluate_model(model, val_loader, device, max_batches, is_main_process):
+    """Run evaluation and return metrics dict."""
+    model.eval()
+
+    total_loss = 0.0
+    total_itm_loss = 0.0
+    total_memory_kl = 0.0
+    total_lm_loss = 0.0
+    num_batches = 0
+    has_nan = False
+    has_inf = False
+
+    with torch.no_grad():
+        for batch_idx, batch in enumerate(val_loader):
+            if batch_idx >= max_batches:
+                break
+
+            try:
+                images = batch['image'].to(device)
+                input_ids = batch['input_ids'].to(device)
+                attention_mask = batch['attention_mask'].to(device)
+                labels = input_ids.clone()
+
+                outputs = model(
+                    images=images,
+                    input_ids=input_ids,
+                    attention_mask=attention_mask,
+                    labels=labels,
+                    use_memory=True,
+                    use_alignment=True
+                )
+
+                loss = outputs.get('loss', torch.tensor(0.0))
+
+                # Check for NaN/Inf
+                if torch.isnan(loss) or torch.isinf(loss):
+                    has_nan = True
+                    continue
+
+                total_loss += loss.item()
+                total_itm_loss += outputs.get('itm_loss', torch.tensor(0.0)).item() if outputs.get('itm_loss') is not None else 0.0
+                total_memory_kl += outputs.get('memory_kl', torch.tensor(0.0)).item() if outputs.get('memory_kl') is not None else 0.0
+                total_lm_loss += outputs.get('lm_loss', torch.tensor(0.0)).item() if outputs.get('lm_loss') is not None else 0.0
+                num_batches += 1
+
+            except Exception as e:
+                if is_main_process and batch_idx == 0:
+                    print(f"   ⚠️ Eval batch failed: {e}")
+                continue
+
+    if num_batches == 0:
+        return {
+            'loss': float('nan'),
+            'itm_loss': float('nan'),
+            'memory_kl': float('nan'),
+            'lm_loss': float('nan'),
+            'has_nan_inf': True,
+            'num_batches': 0
+        }
+
+    return {
+        'loss': total_loss / num_batches,
+        'itm_loss': total_itm_loss / num_batches,
+        'memory_kl': total_memory_kl / num_batches,
+        'lm_loss': total_lm_loss / num_batches,
+        'has_nan_inf': has_nan or has_inf,
+        'num_batches': num_batches
+    }
+
+
+def _apply_158bit_quantization(model):
+    """
+    Apply 1.58-bit weight quantization (ternary: -1, 0, +1) to model weights.
+    This is a TEMPORARY quantization for evaluation only.
+    """
+    # Find quantizable linear layers (excluding embeddings and layer norms)
+    for name, module in model.named_modules():
+        if isinstance(module, torch.nn.Linear):
+            if 'embed' in name.lower() or 'norm' in name.lower():
+                continue
+
+            # Store original weights
+            if not hasattr(module, '_original_weight'):
+                module._original_weight = module.weight.data.clone()
+
+            # Apply ternary quantization: round to {-1, 0, +1} * scale
+            weight = module.weight.data
+            scale = weight.abs().mean()
+            quantized = torch.sign(weight) * (weight.abs() > scale * 0.5).float()
+            module.weight.data = quantized * scale
+
+
+def _apply_4bit_memory_quantization(episodic_memory):
+    """
+    Apply 4-bit quantization to episodic memory slots.
+    This is a TEMPORARY quantization for evaluation only.
+    """
+    if not hasattr(episodic_memory, 'memory_mean'):
+        return
+
+    # Store original memory
+    if not hasattr(episodic_memory, '_original_memory_mean'):
+        episodic_memory._original_memory_mean = episodic_memory.memory_mean.data.clone()
+
+    # Apply 4-bit quantization (16 levels)
+    memory = episodic_memory.memory_mean.data
+    min_val = memory.min()
+    max_val = memory.max()
+    scale = (max_val - min_val) / 15.0  # 4-bit = 16 levels
+
+    if scale > 0:
+        quantized = torch.round((memory - min_val) / scale) * scale + min_val
+        episodic_memory.memory_mean.data = quantized
+
+
+def _remove_quantization(model):
+    """
+    Remove temporary quantization and restore original weights.
+    """
+    for name, module in model.named_modules():
+        # Restore Linear layer weights
+        if isinstance(module, torch.nn.Linear) and hasattr(module, '_original_weight'):
+            module.weight.data = module._original_weight
+            delattr(module, '_original_weight')
+
+        # Restore episodic memory
+        if hasattr(module, '_original_memory_mean'):
+            if hasattr(module, 'memory_mean'):
+                module.memory_mean.data = module._original_memory_mean
+            delattr(module, '_original_memory_mean')
+
+
+def _compare_metrics(fp_metrics, quantized_metrics, config):
+    """
+    Compare FP vs quantized metrics and determine stability.
+    """
+    comparison = {}
+
+    # Loss comparison
+    fp_loss = fp_metrics.get('loss', float('nan'))
+    q_loss = quantized_metrics.get('loss', float('nan'))
+
+    if not (math.isnan(fp_loss) or math.isnan(q_loss)):
+        comparison['loss_diff'] = q_loss - fp_loss
+        comparison['loss_increase_pct'] = ((q_loss - fp_loss) / max(fp_loss, 1e-6)) * 100
+    else:
+        comparison['loss_diff'] = float('nan')
+        comparison['loss_increase_pct'] = float('nan')
+
+    # ITM loss comparison
+    fp_itm = fp_metrics.get('itm_loss', float('nan'))
+    q_itm = quantized_metrics.get('itm_loss', float('nan'))
+    if not (math.isnan(fp_itm) or math.isnan(q_itm)):
+        comparison['itm_loss_diff'] = q_itm - fp_itm
+    else:
+        comparison['itm_loss_diff'] = float('nan')
+
+    # Memory KL comparison
+    fp_kl = fp_metrics.get('memory_kl', float('nan'))
+    q_kl = quantized_metrics.get('memory_kl', float('nan'))
+    if not (math.isnan(fp_kl) or math.isnan(q_kl)):
+        comparison['memory_kl_diff'] = q_kl - fp_kl
+    else:
+        comparison['memory_kl_diff'] = float('nan')
+
+    # Check for NaN/Inf
+    comparison['has_nan_inf'] = (
+        fp_metrics.get('has_nan_inf', True) or
+        quantized_metrics.get('has_nan_inf', True) or
+        math.isnan(q_loss) or math.isinf(q_loss)
+    )
+
+    # Determine stability
+    max_loss_increase = getattr(config, 'quantization_max_loss_increase', 0.5)
+    reject_on_nan = getattr(config, 'quantization_reject_on_nan', True)
+
+    is_stable = True
+    should_push = True
+
+    # Check NaN/Inf
+    if comparison['has_nan_inf'] and reject_on_nan:
+        is_stable = False
+        should_push = False
+
+    # Check loss increase
+    if not math.isnan(comparison.get('loss_diff', float('nan'))):
+        if comparison['loss_diff'] > max_loss_increase:
+            is_stable = False
+            should_push = False
+
+    comparison['is_stable'] = is_stable
+    comparison['should_push'] = should_push
+
+    return comparison
+
+
+def _log_quantized_comparison_to_wandb(wandb_logger, fp_metrics, quantized_metrics, comparison, global_step):
+    """Log FP vs Quantized comparison metrics to wandb."""
+    try:
+        metrics = {
+            # FP metrics
+            'eval_fp/loss': fp_metrics.get('loss', float('nan')),
+            'eval_fp/itm_loss': fp_metrics.get('itm_loss', float('nan')),
+            'eval_fp/memory_kl': fp_metrics.get('memory_kl', float('nan')),
+            'eval_fp/lm_loss': fp_metrics.get('lm_loss', float('nan')),
+
+            # Quantized metrics
+            'eval_quantized/loss': quantized_metrics.get('loss', float('nan')),
+            'eval_quantized/itm_loss': quantized_metrics.get('itm_loss', float('nan')),
+            'eval_quantized/memory_kl': quantized_metrics.get('memory_kl', float('nan')),
+            'eval_quantized/lm_loss': quantized_metrics.get('lm_loss', float('nan')),
+
+            # Comparison metrics
+            'quantization/loss_diff': comparison.get('loss_diff', float('nan')),
+            'quantization/loss_increase_pct': comparison.get('loss_increase_pct', float('nan')),
+            'quantization/itm_loss_diff': comparison.get('itm_loss_diff', float('nan')),
+            'quantization/memory_kl_diff': comparison.get('memory_kl_diff', float('nan')),
+            'quantization/is_stable': 1.0 if comparison.get('is_stable', False) else 0.0,
+            'quantization/should_push': 1.0 if comparison.get('should_push', False) else 0.0,
+        }
+
+        wandb_logger.log_metrics(metrics, step=global_step)
+        print(f"   ✓ Logged FP vs Quantized comparison to wandb at step {global_step}")
+
+    except Exception as e:
+        print(f"   ⚠️ Failed to log quantization comparison: {e}")
+
+
 def ensure_alignment_tracking_state(config):
     """Initialize alignment tracking attributes if needed."""
     if hasattr(config, '_best_alignment_sim'):
@@ -1762,7 +2325,8 @@ def compute_gradient_flow_metrics(model):
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, scaler=None, wandb_run=None, wandb_logger=None,
                 is_distributed=False, is_main_process=True, carbon_tracker=None,
-                attention_monitor=None, sliding_window_stopper=None, best_stage2_tracker=None):
+                attention_monitor=None, sliding_window_stopper=None, best_stage2_tracker=None,
+                val_loader=None, memory_heatmap_tracker=None):
     """Train for one epoch
     
     Args:
@@ -1782,11 +2346,15 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         attention_monitor: AttentionQualityMonitor for tracking attention quality
         sliding_window_stopper: SlidingWindowEarlyStopping object for plateau detection
         best_stage2_tracker: BestStage2ModelTracker for tracking optimal Stage 2 model
+        val_loader: Validation data loader (for quantized evaluation)
+        memory_heatmap_tracker: EpisodicMemoryHeatmapTracker for memory evolution visualization
     """
     # ============================================================================
     # CONSTANTS FOR LOGGING INTERVALS
     # ============================================================================
     COMPREHENSIVE_LOG_INTERVAL = 200  # Log detailed metrics every 200 steps
+    QUANTIZED_EVAL_INTERVAL = getattr(config, 'eval_quantization_interval', 500)  # Quantized eval every 500 steps
+    MEMORY_HEATMAP_INTERVAL = getattr(config, 'memory_heatmap_interval', 100)  # Memory heatmaps every 100 steps
 
     # CRITICAL DEBUG: Verify wandb_logger is passed to train_epoch
     print(f"\n{'='*60}")
@@ -2318,6 +2886,107 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
                 if is_new_best:
                     print(f"🌟 NEW BEST MODEL at step {global_step}! Composite score: {best_stage2_tracker.best_composite_score:.4f}")
+
+        # =========================================================================
+        # EPISODIC MEMORY HEATMAP RECORDING
+        # Record memory state for time-evolving heatmap visualization
+        # =========================================================================
+        if memory_heatmap_tracker is not None and is_main_process:
+            if global_step % MEMORY_HEATMAP_INTERVAL == 0:
+                # Get base model for memory access
+                base_model = model.module if hasattr(model, 'module') else model
+
+                # Record memory state if available
+                if hasattr(base_model, 'memory_state') and base_model.memory_state is not None:
+                    memory_heatmap_tracker.record_memory_state(base_model.memory_state, global_step)
+                elif hasattr(base_model, 'episodic_memory') and hasattr(base_model.episodic_memory, 'memory_mean'):
+                    em = base_model.episodic_memory
+                    if em.memory_mean is not None:
+                        memory_state = (em.memory_mean, getattr(em, 'memory_logvar', None))
+                        memory_heatmap_tracker.record_memory_state(memory_state, global_step)
+
+                # Log current memory stats to wandb
+                if wandb_logger:
+                    memory_stats = memory_heatmap_tracker.get_current_stats()
+                    if memory_stats:
+                        wandb_logger.log_metrics(memory_stats, step=global_step)
+
+                # Create and log heatmap every 500 steps
+                if global_step % QUANTIZED_EVAL_INTERVAL == 0:
+                    heatmap_fig = memory_heatmap_tracker.create_heatmap(
+                        title=f"Episodic Memory Evolution (up to step {global_step})"
+                    )
+                    if heatmap_fig is not None and wandb_logger and wandb_logger.wandb_run:
+                        try:
+                            import wandb as wandb_module
+                            wandb_logger.wandb_run.log({
+                                'memory_viz/evolution_heatmap': wandb_module.Image(heatmap_fig)
+                            }, step=global_step)
+                            import matplotlib.pyplot as plt
+                            plt.close(heatmap_fig)
+                            print(f"  📊 Logged episodic memory evolution heatmap at step {global_step}")
+                        except Exception as e:
+                            print(f"  ⚠️ Failed to log memory heatmap: {e}")
+                            import matplotlib.pyplot as plt
+                            plt.close(heatmap_fig)
+
+        # =========================================================================
+        # QUANTIZED EVALUATION (Every eval_quantization_interval steps)
+        # Compare FP vs Quantized metrics and decide whether to push to HF
+        # =========================================================================
+        if is_main_process and getattr(config, 'eval_quantization_enabled', False):
+            if global_step % QUANTIZED_EVAL_INTERVAL == 0 and val_loader is not None:
+                try:
+                    # Run quantized evaluation (temporarily applies quantization)
+                    quant_results = run_quantized_evaluation(
+                        model=model,
+                        val_loader=val_loader,
+                        config=config,
+                        global_step=global_step,
+                        wandb_logger=wandb_logger,
+                        is_main_process=is_main_process,
+                        max_batches=50  # Use 50 validation batches for quick eval
+                    )
+
+                    # If quantized model is stable and good, push to HuggingFace
+                    if quant_results.get('should_push', False):
+                        print(f"\n✅ Quantized model is stable at step {global_step}")
+                        print(f"   FP Loss: {quant_results['fp_metrics'].get('loss', 'N/A'):.4f}")
+                        print(f"   Quantized Loss: {quant_results['quantized_metrics'].get('loss', 'N/A'):.4f}")
+                        print(f"   Loss Difference: {quant_results['comparison'].get('loss_diff', 'N/A'):.4f}")
+
+                        # Optionally push quantized checkpoint to HF
+                        if getattr(config, 'push_to_hf_on_stop', False):
+                            # Save and push quantized checkpoint
+                            model_to_save = model.module if isinstance(model, DDP) else model
+                            quant_checkpoint_dir = Path(config.output_dir) / "checkpoints" / "quantized"
+                            quant_checkpoint_dir.mkdir(parents=True, exist_ok=True)
+                            quant_checkpoint_path = quant_checkpoint_dir / f"quantized-checkpoint-step-{global_step}.pt"
+
+                            torch.save({
+                                'global_step': global_step,
+                                'model_state_dict': model_to_save.state_dict(),
+                                'config': vars(config),
+                                'fp_metrics': quant_results['fp_metrics'],
+                                'quantized_metrics': quant_results['quantized_metrics'],
+                                'comparison': quant_results['comparison'],
+                            }, quant_checkpoint_path)
+
+                            push_checkpoint_to_hf(
+                                quant_checkpoint_path, global_step, config,
+                                checkpoint_type="best-stage2",
+                                correct_sim=quant_results['fp_metrics'].get('loss', 0.0)
+                            )
+                    else:
+                        print(f"\n⚠️ Quantized model unstable at step {global_step} - not pushing to HF")
+
+                except Exception as e:
+                    print(f"\n⚠️ Quantized evaluation failed at step {global_step}: {e}")
+                    import traceback
+                    traceback.print_exc()
+
+                # Ensure model is back in training mode
+                model.train()
 
         # Step-based checkpointing disabled - only epoch checkpoints used
         # This ensures consistent checkpoint behavior across all stages
@@ -3190,6 +3859,28 @@ def main():
         )
         print(f"\n📉 Early Stopping: patience={early_stopper.patience}, min_delta={early_stopper.min_delta}")
 
+    # Initialize Episodic Memory Heatmap Tracker (for Stage 2 memory evolution visualization)
+    memory_heatmap_tracker = None
+    if getattr(config, 'log_memory_heatmaps', False) and config.use_memory:
+        memory_size = getattr(config, 'memory_size', 64)
+        memory_heatmap_tracker = EpisodicMemoryHeatmapTracker(
+            memory_size=memory_size,
+            history_length=100  # Keep 100 time points of history
+        )
+        if is_main_process:
+            print(f"\n📊 Memory Heatmap Tracker initialized ({memory_size} slots)")
+
+    # Log training mode info
+    if is_main_process:
+        print(f"\n🔧 Training Configuration:")
+        print(f"   Quantization during training: DISABLED (FP training for stability)")
+        print(f"   Quantized evaluation interval: {getattr(config, 'eval_quantization_interval', 500)} steps")
+        print(f"   Memory heatmap interval: {getattr(config, 'memory_heatmap_interval', 100)} steps")
+        if getattr(config, 'eval_quantization_enabled', False):
+            print(f"   ✓ Quantized evaluation enabled (FP vs Quantized comparison)")
+        else:
+            print(f"   ✗ Quantized evaluation disabled")
+
     print(f"Starting training for up to {config.num_epochs} epochs...")
 
     # Training loop
@@ -3216,7 +3907,9 @@ def main():
             carbon_tracker=carbon_tracker,
             attention_monitor=attention_monitor,
             sliding_window_stopper=sliding_window_stopper,
-            best_stage2_tracker=best_stage2_tracker
+            best_stage2_tracker=best_stage2_tracker,
+            val_loader=val_loader,
+            memory_heatmap_tracker=memory_heatmap_tracker
         )
 
         print(f"Epoch {epoch} complete. Loss={avg_loss:.4f}")
