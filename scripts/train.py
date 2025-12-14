@@ -1865,33 +1865,61 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         optimizer.zero_grad()
 
         try:
-            scaler.scale(loss).backward()
+            if use_autocast:
+                # With autocast/mixed precision: use gradient scaling
+                scaler.scale(loss).backward()
+            else:
+                # With 4-bit quantization: no autocast, no gradient scaling
+                # Use loss scaling for numerical stability with quantized models
+                # Scale loss by a small factor to prevent underflow in gradients
+                scaled_loss = loss * 2.0  # Moderate scaling for stability
+                scaled_loss.backward()
         except RuntimeError as e:
             if is_main_process:
                 print(f"\n⚠️ Backward pass failed at step {global_step}: {e}")
             optimizer.zero_grad()
-            scaler.update()
+            if use_autocast:
+                scaler.update()
             continue
 
-        # Unscale gradients for NaN check
-        scaler.unscale_(optimizer)
+        # Unscale gradients for NaN check (only if using autocast/scaling)
+        if use_autocast:
+            scaler.unscale_(optimizer)
 
-        # Check and sanitize gradients
+        # CRITICAL: Clip gradients BEFORE checking for NaNs (prevents gradient explosion)
+        # Use more conservative clipping for quantized models to prevent instability
+        if use_autocast:
+            # Standard clipping for FP16 training
+            max_clip = min(config.gradient_clip, 1.0) if config.gradient_clip > 0 else 1.0
+        else:
+            # More aggressive clipping for 4-bit quantized models
+            max_clip = min(config.gradient_clip, 0.5) if config.gradient_clip > 0 else 0.5
+
+        torch.nn.utils.clip_grad_norm_(model.parameters(), max_clip)
+
+        # Check and sanitize gradients AFTER clipping
         has_nan = False
+        has_inf = False
         for param in model.parameters():
             if param.grad is not None:
-                if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                if torch.isnan(param.grad).any():
                     has_nan = True
                     param.grad.zero_()
+                elif torch.isinf(param.grad).any():
+                    has_inf = True
+                    param.grad.zero_()
 
-        if has_nan:
+        if has_nan or has_inf:
             if is_main_process and global_step % 50 == 0:
-                print(f"\n⚠️  NaN gradients detected at step {global_step} - zeroed and continuing")
+                issue_type = "NaN" if has_nan else "Inf"
+                print(f"\n⚠️  {issue_type} gradients detected at step {global_step} after clipping")
+                print(f"   This indicates numerical instability - consider reducing learning rate")
             optimizer.zero_grad()
-            scaler.update()
+            if use_autocast:
+                scaler.update()
             continue
 
-        # Compute gradient norm before clipping
+        # Compute gradient norm AFTER clipping
         total_norm = 0.0
         for p in model.parameters():
             if p.grad is not None:
@@ -1899,18 +1927,23 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 total_norm += param_norm.item() ** 2
         total_norm = total_norm ** 0.5
 
-        # Gradient clipping
-        if config.gradient_clip > 0:
-            torch.nn.utils.clip_grad_norm_(
-                model.parameters(), min(config.gradient_clip, 1.0))
-
         # Log gradient norm periodically
         if is_main_process and global_step % 100 == 0:
-            print(f"\n  [Step {global_step}] Gradient norm: {total_norm:.4f}")
+            print(f"\n  [Step {global_step}] Gradient norm (after clip): {total_norm:.4f}, max_clip: {max_clip:.2f}")
 
-        # Optimizer step with gradient scaling
-        scaler.step(optimizer)
-        scaler.update()
+        # Compensate for loss scaling in optimizer step (only for quantized path)
+        if not use_autocast:
+            # Since we scaled loss by 2.0, scale gradients back down
+            for param in model.parameters():
+                if param.grad is not None:
+                    param.grad.data.div_(2.0)
+
+        # Optimizer step with gradient scaling (conditional)
+        if use_autocast:
+            scaler.step(optimizer)
+            scaler.update()
+        else:
+            optimizer.step()
 
         if scheduler is not None:
             scheduler.step()
