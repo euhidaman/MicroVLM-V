@@ -2872,3 +2872,253 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 avg_loss = total_loss / max(batch_idx + 1, 1)
                 return avg_loss, global_step, 'sliding_window_plateau', stopper_status
 
+    # End of epoch - return normally
+    avg_loss = total_loss / max(len(train_loader), 1)
+    return avg_loss, global_step, None, None
+
+
+def main():
+    """Entry point: parse args, set up training, run epochs."""
+    import argparse
+    from transformers import AutoTokenizer
+
+    parser = argparse.ArgumentParser(description="MicroVLM-V Trainer")
+    parser.add_argument("--config", type=str, default="stage1",
+                        help="Config name or path (stage1, stage2, etc.)")
+    parser.add_argument("--resume", type=str, default=None,
+                        help="Optional checkpoint path to resume from")
+    parser.add_argument("--output_dir", type=str, default="checkpoints",
+                        help="Directory for checkpoints and logs")
+    parser.add_argument("--device", type=str, default="cuda",
+                        help="Torch device, e.g. cuda or cpu")
+    args = parser.parse_args()
+
+    # Determine config name for run naming
+    config_name = args.config
+
+    # Load configuration (staged configs supported)
+    if os.path.isdir(args.config) or args.config.endswith((".yaml", ".yml", ".json")):
+        config = load_config(args.config)
+        config_name = Path(args.config).stem
+    else:
+        config = load_staged_config(args.config)
+
+    # Override output dir if specified
+    if args.output_dir:
+        config.output_dir = args.output_dir
+
+    # Set device
+    config.device = torch.device(args.device if torch.cuda.is_available() else "cpu")
+
+    # Reproducibility
+    seed = getattr(config, "seed", 42)
+    torch.manual_seed(seed)
+    np.random.seed(seed)
+
+    # Create run name (returns tuple of (name, counter))
+    run_name_result = create_run_name(config_name)
+    run_name_str = run_name_result[0]  # Extract just the string
+    config.wandb_run_name = run_name_str
+
+    # Init wandb if requested
+    wandb_run = setup_wandb(config, run_name_str)
+    wandb_logger = WandBLogger(wandb_run, enabled=config.use_wandb) if wandb_run else None
+
+    # Build tokenizer
+    tokenizer_name = getattr(config, 'text_model', None) or getattr(config, 'qwen_model', 'Qwen/Qwen2.5-0.5B')
+    tokenizer = AutoTokenizer.from_pretrained(tokenizer_name)
+
+    # Build dataloaders with all required arguments
+    train_loader, val_loader, train_sampler = create_dataloaders(
+        train_metadata_file=config.train_metadata_file,
+        val_metadata_file=config.val_metadata_file,
+        tokenizer=tokenizer,
+        batch_size=config.batch_size,
+        num_workers=config.num_workers,
+        max_samples=getattr(config, 'max_samples', None),
+        max_val_samples=getattr(config, 'max_val_samples', None),
+        distributed=False
+    )
+
+    # Create model
+    if getattr(config, 'alignment_mode', 'fiber') == 'fiber':
+        model = create_microvlm_fiber(config)
+    else:
+        model = create_microvlm(config)
+    model = model.to(config.device)
+
+    # Apply freezing strategy
+    apply_freezing_strategy(model, config, getattr(config, 'alignment_mode', 'baseline'))
+
+    # Create optimizer and scheduler
+    optimizer = create_optimizer(model, config)
+    total_steps = len(train_loader) * config.num_epochs
+    scheduler = create_scheduler(optimizer, config, total_steps)
+
+    # Gradient scaler for mixed precision
+    use_mixed_precision = not getattr(config, 'quantize_language_4bit', False)
+    scaler = GradScaler(enabled=use_mixed_precision)
+
+    # Resume checkpoint if provided
+    start_epoch = 0
+    global_step = 0
+    if args.resume and os.path.exists(args.resume):
+        print(f"Resuming from checkpoint: {args.resume}")
+        checkpoint = torch.load(args.resume, map_location=config.device)
+
+        # Load model state with flexibility for architecture changes
+        model_state = checkpoint.get('model_state_dict', checkpoint)
+        missing, unexpected = model.load_state_dict(model_state, strict=False)
+        if missing:
+            print(f"   ℹ️  Missing keys (new modules): {len(missing)} keys")
+        if unexpected:
+            print(f"   ℹ️  Unexpected keys (removed modules): {len(unexpected)} keys")
+
+        # Try to restore optimizer state
+        try:
+            if 'optimizer_state_dict' in checkpoint:
+                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        except Exception as e:
+            print(f"   ⚠️  Could not restore optimizer state (architecture changed): {e}")
+            print(f"   Starting with fresh optimizer state")
+
+        start_epoch = checkpoint.get('epoch', 0)
+        global_step = checkpoint.get('global_step', 0)
+        print(f"   ✓ Resumed from epoch {start_epoch}, step {global_step}")
+
+    # Optional helpers
+    visualizer = None
+    if getattr(config, 'enable_visualizations', True):
+        try:
+            visualizer = create_attention_visualizer(config)
+        except Exception as e:
+            print(f"Warning: Could not create visualizer: {e}")
+
+    attention_monitor = None
+    if getattr(config, 'use_attention_monitor', False):
+        try:
+            attention_monitor = AttentionQualityMonitor(config)
+        except Exception as e:
+            print(f"Warning: Could not create attention monitor: {e}")
+
+    # Sliding window early stopping for Stage 2
+    sliding_window_stopper = None
+    if getattr(config, 'use_sliding_window_early_stop', False):
+        sliding_window_stopper = SlidingWindowEarlyStopping(
+            window_size=getattr(config, 'sliding_window_size', 500),
+            min_delta=getattr(config, 'sliding_window_min_delta', 0.05),
+            patience_steps=getattr(config, 'sliding_window_patience_steps', 3000),
+            eval_interval=getattr(config, 'sliding_window_eval_interval', 100),
+            verbose=True
+        )
+        print(f"\n🪟 Sliding Window Early Stopping:")
+        print(f"   Window size: {sliding_window_stopper.window_size} steps")
+        print(f"   Min delta: {sliding_window_stopper.min_delta} (loss must improve by at least this amount)")
+        print(f"   Patience: {sliding_window_stopper.patience_steps} steps")
+
+    # Best Stage 2 model tracker
+    best_stage2_tracker = None
+    if getattr(config, 'track_best_stage2', False):
+        best_stage2_tracker = BestStage2ModelTracker(
+            save_interval=getattr(config, 'best_stage2_save_interval', 100),
+            min_improvement=getattr(config, 'best_stage2_min_improvement', 0.01),
+            verbose=True
+        )
+        print(f"\n⭐ Best Stage 2 Model Tracking:")
+        print(f"   Metrics: {best_stage2_tracker.metrics}")
+        print(f"   Check interval: {best_stage2_tracker.save_interval} steps")
+
+    # Carbon tracker
+    carbon_tracker = None
+    if getattr(config, 'use_carbon_tracker', False):
+        try:
+            carbon_tracker = CarbonComputeTracker(config.device)
+            print(f"[CarbonTracker] Initialized")
+        except Exception as e:
+            print(f"[CarbonTracker] Warning: Could not initialize: {e}")
+
+    # Early stopping (epoch-based)
+    early_stopper = None
+    if getattr(config, 'use_early_stopping', False):
+        early_stopper = EarlyStopping(
+            patience=getattr(config, 'early_stop_patience', 3),
+            min_delta=getattr(config, 'early_stop_min_delta', 0.005),
+            verbose=True
+        )
+        print(f"\n📉 Early Stopping: patience={early_stopper.patience}, min_delta={early_stopper.min_delta}")
+
+    print(f"Starting training for up to {config.num_epochs} epochs...")
+
+    # Training loop
+    model.train()
+    for epoch in range(start_epoch, config.num_epochs):
+        # Set epoch for distributed sampler
+        if train_sampler:
+            train_sampler.set_epoch(epoch)
+
+        avg_loss, global_step, stop_reason, stopper_status = train_epoch(
+            model=model,
+            train_loader=train_loader,
+            optimizer=optimizer,
+            scheduler=scheduler,
+            config=config,
+            visualizer=visualizer,
+            epoch=epoch,
+            global_step=global_step,
+            scaler=scaler,
+            wandb_run=wandb_run,
+            wandb_logger=wandb_logger,
+            is_distributed=False,
+            is_main_process=True,
+            carbon_tracker=carbon_tracker,
+            attention_monitor=attention_monitor,
+            sliding_window_stopper=sliding_window_stopper,
+            best_stage2_tracker=best_stage2_tracker
+        )
+
+        print(f"Epoch {epoch} complete. Loss={avg_loss:.4f}")
+
+        # Check for early stop from train_epoch
+        if stop_reason:
+            print(f"Training stopped early due to: {stop_reason}")
+            if stop_reason == 'sliding_window_plateau' and stopper_status:
+                # Save final checkpoint and push to HF
+                checkpoint_path = Path(config.output_dir) / "checkpoints" / f"final_epoch_{epoch}_checkpoint.pt"
+                checkpoint_path.parent.mkdir(parents=True, exist_ok=True)
+                torch.save({
+                    'epoch': epoch,
+                    'global_step': global_step,
+                    'model_state_dict': model.state_dict(),
+                    'optimizer_state_dict': optimizer.state_dict(),
+                    'config': vars(config),
+                    'early_stop_metrics': stopper_status,
+                }, checkpoint_path)
+                print(f"💾 Final checkpoint saved: {checkpoint_path}")
+
+                # Push to HuggingFace
+                push_stage2_final_to_hf(
+                    checkpoint_path=str(checkpoint_path),
+                    config=config,
+                    early_stop_metrics=stopper_status,
+                    training_history=None,
+                    model_statistics=get_model_statistics(model, config)
+                )
+            break
+
+        # Save epoch checkpoint
+        save_epoch_checkpoint(model, optimizer, epoch, global_step, config)
+
+        # Epoch-based early stopping
+        if early_stopper and early_stopper(epoch, avg_loss):
+            print("Epoch-based early stopping triggered")
+            break
+
+    # Finish wandb run
+    if wandb_run:
+        wandb_run.finish()
+
+    print("Training complete!")
+
+
+if __name__ == "__main__":
+    main()
