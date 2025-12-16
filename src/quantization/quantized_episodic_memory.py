@@ -121,9 +121,11 @@ class QuantizedLinear158BitGrad(nn.Module):
         Forward with straight-through estimator for gradients
         Uses BitNet-style 1.58-bit weight quantization
         """
-        # Ensure input matches weight dtype (fix for 4-bit base models outputting float16)
-        if x.dtype != self.weight.dtype:
-            x = x.to(self.weight.dtype)
+        # Store original dtype for consistent output
+        original_dtype = x.dtype
+
+        # Convert input to weight dtype for computation
+        x = x.to(self.weight.dtype)
 
         # Quantize weights during forward pass
         quantized_weight, scale = quantize_weights_158bit(self.weight)
@@ -139,10 +141,22 @@ class QuantizedLinear158BitGrad(nn.Module):
         # Optional: quantize activations for full BitNet emulation
         if self.training:
             x_quant, act_scale = quantize_activations_int8(x)
-            x = x_quant.float() / act_scale
+            # Keep in weight dtype instead of converting to float()
+            x = x_quant.to(self.weight.dtype) / act_scale
 
-        return F.linear(x, quantized_weight_ste, self.bias)
-    
+        # Ensure bias matches weight dtype if present
+        bias = self.bias
+        if bias is not None and bias.dtype != self.weight.dtype:
+            bias = bias.to(self.weight.dtype)
+
+        output = F.linear(x, quantized_weight_ste, bias)
+
+        # Convert output back to original dtype if needed
+        if output.dtype != original_dtype:
+            output = output.to(original_dtype)
+
+        return output
+
     def get_quantization_stats(self):
         """Return quantization error for monitoring"""
         quantized_weight, _ = quantize_weights_158bit(self.weight)
