@@ -72,6 +72,10 @@ class TrainingConfig:
     publish_quantized_variants: bool = True  # Upload to HuggingFace
     hf_quantized_repo_base: str = "MicroVLM-V-Stage2-Best"  # Base name for HF repos
 
+    # Quantization Evaluation (Comprehensive analysis of quantized variants)
+    evaluate_quantized_variants: bool = True  # Run evaluation on all variants
+    quant_eval_batches: int = 50  # Number of batches for evaluation per variant
+
     # Optimization
     optimizer: str = "adamw"
     lr_scheduler: str = "cosine"

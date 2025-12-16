@@ -18,7 +18,8 @@ from src.quantization.quantize_4bit import QuantizationConfig
 from src.quantization.post_training_quantization import (
     generate_quantized_variants,
     publish_quantized_variants_to_hf,
-    create_statistics_json
+    create_statistics_json,
+    evaluate_quantized_variants
 )
 from src.visualization.wandb_logger import WandBLogger
 from src.visualization.attention_vis import create_attention_visualizer
@@ -3751,6 +3752,85 @@ def main():
                     print("\n✅ POST-TRAINING QUANTIZATION COMPLETE")
                     print(f"   Generated variants: {list(variants_info.keys())}")
                     print(f"   Variants directory: {Path(config.output_dir) / 'quantized_variants'}")
+
+                    # ========== COMPREHENSIVE QUANTIZATION EVALUATION ==========
+                    # Evaluate all quantized variants on episodic memory, attention,
+                    # vision/language encoders, fusion, and log to wandb
+                    run_quant_evaluation = getattr(config, 'evaluate_quantized_variants', True)
+
+                    if run_quant_evaluation and val_dataloader is not None:
+                        print("\n" + "="*80)
+                        print("🔬 RUNNING COMPREHENSIVE QUANTIZATION EVALUATION")
+                        print("="*80)
+                        print("⚙️  Evaluating: Episodic Memory, Attention, Vision/Language Encoders, Fusion")
+                        print("⚙️  Logging all metrics and visualizations to WandB")
+                        print("="*80 + "\n")
+
+                        try:
+                            # Get number of evaluation batches from config
+                            num_eval_batches = getattr(config, 'quant_eval_batches', 50)
+
+                            # Run comprehensive evaluation on all variants
+                            eval_metrics = evaluate_quantized_variants(
+                                variants_info=variants_info,
+                                model_factory_fn=create_model_for_quantization,
+                                config=config,
+                                eval_dataloader=val_dataloader,
+                                wandb_logger=wandb_logger,
+                                num_eval_batches=num_eval_batches
+                            )
+
+                            # Save evaluation results to file
+                            eval_results_path = Path(config.output_dir) / "quantized_variants" / "evaluation_results.json"
+
+                            # Convert numpy arrays to lists for JSON serialization
+                            def convert_for_json(obj):
+                                if isinstance(obj, np.ndarray):
+                                    return obj.tolist()
+                                elif isinstance(obj, dict):
+                                    return {k: convert_for_json(v) for k, v in obj.items()}
+                                elif isinstance(obj, list):
+                                    return [convert_for_json(item) for item in obj]
+                                elif isinstance(obj, (np.float32, np.float64)):
+                                    return float(obj)
+                                elif isinstance(obj, (np.int32, np.int64)):
+                                    return int(obj)
+                                return obj
+
+                            serializable_metrics = convert_for_json(eval_metrics)
+
+                            with open(eval_results_path, 'w') as f:
+                                json.dump(serializable_metrics, f, indent=2)
+
+                            print(f"\n✅ QUANTIZATION EVALUATION COMPLETE")
+                            print(f"   Results saved to: {eval_results_path}")
+
+                            # Print summary comparison
+                            print("\n📊 EVALUATION SUMMARY:")
+                            print("-" * 70)
+                            print(f"{'Variant':<20} {'Loss':<12} {'Mem Util':<12} {'Attn Entropy':<12}")
+                            print("-" * 70)
+                            for variant_name, metrics in eval_metrics.items():
+                                loss = metrics.get('losses', {}).get('total_loss_mean', 'N/A')
+                                mem_util = metrics.get('episodic_memory', {}).get('slot_utilization_mean', 'N/A')
+                                attn_ent = metrics.get('attention', {}).get('entropy_mean', 'N/A')
+
+                                loss_str = f"{loss:.4f}" if isinstance(loss, (int, float)) else str(loss)
+                                mem_str = f"{mem_util:.4f}" if isinstance(mem_util, (int, float)) else str(mem_util)
+                                attn_str = f"{attn_ent:.4f}" if isinstance(attn_ent, (int, float)) else str(attn_ent)
+
+                                print(f"{variant_name:<20} {loss_str:<12} {mem_str:<12} {attn_str:<12}")
+                            print("-" * 70)
+
+                        except Exception as e:
+                            print(f"\n⚠️  QUANTIZATION EVALUATION FAILED: {e}")
+                            import traceback
+                            traceback.print_exc()
+                    else:
+                        if not run_quant_evaluation:
+                            print("\n⚠️  Quantization evaluation disabled in config")
+                        elif val_dataloader is None:
+                            print("\n⚠️  No validation dataloader available for evaluation")
 
                 except Exception as e:
                     print(f"\n⚠️  POST-TRAINING QUANTIZATION FAILED: {e}")
