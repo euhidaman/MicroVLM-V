@@ -20,11 +20,13 @@ All variants are evaluation/deployment artifacts only.
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from pathlib import Path
 import json
 from datetime import datetime
-from typing import Dict, Optional, List
+from typing import Dict, Optional, List, Tuple, Any
 import copy
+import numpy as np
 
 from .quantize_4bit import (
     quantize_4bit_symmetric,
@@ -38,6 +40,565 @@ from .quantize_158bit import (
 )
 from .quantized_episodic_memory import get_memory_quantization_stats
 
+
+# ============================================================================
+# COMPREHENSIVE QUANTIZATION EVALUATION MODULE
+# ============================================================================
+
+class QuantizationEvaluator:
+    """
+    Comprehensive evaluator for quantized model variants.
+    Analyzes episodic memory, attention, vision/language encoders, and fusion.
+    """
+
+    def __init__(self, wandb_logger=None, device='cuda'):
+        """
+        Args:
+            wandb_logger: WandB logger instance for metric logging
+            device: Device to run evaluation on
+        """
+        self.wandb_logger = wandb_logger
+        self.device = device if torch.cuda.is_available() else 'cpu'
+
+        # Storage for comparative analysis
+        self.variant_metrics = {}
+        self.memory_heatmaps = {}
+        self.attention_maps = {}
+
+    def evaluate_all_variants(
+        self,
+        variants_info: Dict[str, Dict],
+        model_factory_fn,
+        config,
+        eval_dataloader,
+        num_eval_batches: int = 50
+    ) -> Dict[str, Dict]:
+        """
+        Run comprehensive evaluation on all quantized variants.
+
+        Args:
+            variants_info: Dict mapping variant_name -> {path, bit_width, ...}
+            model_factory_fn: Function to create model instance
+            config: Training configuration
+            eval_dataloader: DataLoader for evaluation data
+            num_eval_batches: Number of batches to evaluate
+
+        Returns:
+            all_metrics: Dict mapping variant_name -> metrics
+        """
+        print("\n" + "="*80)
+        print("🔬 COMPREHENSIVE QUANTIZATION EVALUATION")
+        print("="*80 + "\n")
+
+        all_metrics = {}
+
+        for variant_name, variant_data in variants_info.items():
+            print(f"\n{'='*60}")
+            print(f"📊 Evaluating: {variant_name} ({variant_data['bit_width']}-bit)")
+            print(f"{'='*60}")
+
+            # Load model
+            model = self._load_variant_model(
+                variant_data['path'],
+                model_factory_fn,
+                config
+            )
+            model = model.to(self.device)
+            model.eval()
+
+            # Run evaluation
+            metrics = self._evaluate_single_variant(
+                model=model,
+                variant_name=variant_name,
+                bit_width=variant_data['bit_width'],
+                eval_dataloader=eval_dataloader,
+                num_batches=num_eval_batches
+            )
+
+            all_metrics[variant_name] = metrics
+            self.variant_metrics[variant_name] = metrics
+
+            # Log to wandb
+            if self.wandb_logger:
+                self._log_variant_metrics(variant_name, metrics)
+
+            # Cleanup
+            del model
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+
+        # Generate comparative analysis
+        self._generate_comparative_analysis(all_metrics)
+
+        print("\n" + "="*80)
+        print("✨ EVALUATION COMPLETE")
+        print("="*80 + "\n")
+
+        return all_metrics
+
+    def _load_variant_model(self, checkpoint_path: str, model_factory_fn, config):
+        """Load a model variant from checkpoint."""
+        checkpoint = torch.load(checkpoint_path, map_location='cpu')
+        model = model_factory_fn(config)
+        model.load_state_dict(checkpoint['model_state_dict'], strict=False)
+        return model
+
+    def _evaluate_single_variant(
+        self,
+        model: nn.Module,
+        variant_name: str,
+        bit_width: int,
+        eval_dataloader,
+        num_batches: int
+    ) -> Dict[str, Any]:
+        """
+        Comprehensive evaluation of a single model variant.
+        """
+        metrics = {
+            'bit_width': bit_width,
+            'variant_name': variant_name,
+            'episodic_memory': {},
+            'attention': {},
+            'vision_encoder': {},
+            'language_encoder': {},
+            'fusion': {},
+            'losses': {}
+        }
+
+        # Initialize accumulators
+        memory_slot_activations = []
+        memory_update_magnitudes = []
+        attention_entropies = []
+        attention_sparsities = []
+        vision_feature_norms = []
+        text_feature_norms = []
+        alignment_similarities = []
+        itc_losses = []
+        itm_losses = []
+        total_losses = []
+
+        # Hook storage for attention capture
+        attention_outputs = {}
+
+        def capture_attention_hook(name):
+            def hook(module, input, output):
+                if isinstance(output, tuple):
+                    attention_outputs[name] = output[1] if len(output) > 1 else output[0]
+                else:
+                    attention_outputs[name] = output
+            return hook
+
+        # Register hooks for attention layers
+        hooks = []
+        for name, module in model.named_modules():
+            if 'attention' in name.lower() or 'attn' in name.lower():
+                hooks.append(module.register_forward_hook(capture_attention_hook(name)))
+
+        with torch.no_grad():
+            for batch_idx, batch in enumerate(eval_dataloader):
+                if batch_idx >= num_batches:
+                    break
+
+                # Move batch to device
+                images = batch['image'].to(self.device) if 'image' in batch else batch[0].to(self.device)
+
+                # Handle different batch formats
+                if isinstance(batch, dict):
+                    input_ids = batch.get('input_ids', batch.get('caption_ids')).to(self.device)
+                    attention_mask = batch.get('attention_mask', torch.ones_like(input_ids)).to(self.device)
+                else:
+                    input_ids = batch[1].to(self.device)
+                    attention_mask = batch[2].to(self.device) if len(batch) > 2 else torch.ones_like(input_ids)
+
+                try:
+                    # Forward pass
+                    outputs = model(
+                        images=images,
+                        input_ids=input_ids,
+                        attention_mask=attention_mask,
+                        return_dict=True
+                    )
+
+                    # === 1. Episodic Memory Analysis ===
+                    if hasattr(model, 'episodic_memory') or hasattr(model, 'module'):
+                        base_model = model.module if hasattr(model, 'module') else model
+                        if hasattr(base_model, 'episodic_memory'):
+                            mem_metrics = self._analyze_episodic_memory(
+                                base_model.episodic_memory,
+                                batch_idx
+                            )
+                            memory_slot_activations.append(mem_metrics['slot_activations'])
+                            memory_update_magnitudes.append(mem_metrics['update_magnitude'])
+
+                    # === 2. Attention Analysis ===
+                    for attn_name, attn_weights in attention_outputs.items():
+                        if attn_weights is not None and isinstance(attn_weights, torch.Tensor):
+                            entropy, sparsity = self._compute_attention_metrics(attn_weights)
+                            attention_entropies.append(entropy)
+                            attention_sparsities.append(sparsity)
+
+                    # === 3. Vision Encoder Analysis ===
+                    if hasattr(outputs, 'vision_features') or 'vision_features' in outputs:
+                        vision_feats = outputs.get('vision_features', outputs.vision_features)
+                        if vision_feats is not None:
+                            vision_feature_norms.append(vision_feats.norm(dim=-1).mean().item())
+
+                    # === 4. Language Encoder Analysis ===
+                    if hasattr(outputs, 'text_features') or 'text_features' in outputs:
+                        text_feats = outputs.get('text_features', outputs.text_features)
+                        if text_feats is not None:
+                            text_feature_norms.append(text_feats.norm(dim=-1).mean().item())
+
+                    # === 5. Fusion & Alignment Analysis ===
+                    if hasattr(outputs, 'alignment_sim') or 'alignment_sim' in outputs:
+                        sim = outputs.get('alignment_sim', getattr(outputs, 'alignment_sim', None))
+                        if sim is not None:
+                            alignment_similarities.append(sim.mean().item() if torch.is_tensor(sim) else sim)
+
+                    # === 6. Loss Analysis ===
+                    if hasattr(outputs, 'loss') or 'loss' in outputs:
+                        loss = outputs.get('loss', getattr(outputs, 'loss', None))
+                        if loss is not None:
+                            total_losses.append(loss.item() if torch.is_tensor(loss) else loss)
+
+                    if hasattr(outputs, 'itc_loss') or 'itc_loss' in outputs:
+                        itc = outputs.get('itc_loss', getattr(outputs, 'itc_loss', None))
+                        if itc is not None:
+                            itc_losses.append(itc.item() if torch.is_tensor(itc) else itc)
+
+                    if hasattr(outputs, 'itm_loss') or 'itm_loss' in outputs:
+                        itm = outputs.get('itm_loss', getattr(outputs, 'itm_loss', None))
+                        if itm is not None:
+                            itm_losses.append(itm.item() if torch.is_tensor(itm) else itm)
+
+                except Exception as e:
+                    print(f"   ⚠️ Batch {batch_idx} evaluation error: {e}")
+                    continue
+
+                attention_outputs.clear()
+
+                if batch_idx % 10 == 0:
+                    print(f"   Processed batch {batch_idx}/{num_batches}")
+
+        # Remove hooks
+        for hook in hooks:
+            hook.remove()
+
+        # === Aggregate Metrics ===
+
+        # Episodic Memory
+        if memory_slot_activations:
+            slot_acts = np.array(memory_slot_activations)
+            metrics['episodic_memory'] = {
+                'slot_utilization_mean': float(np.mean(slot_acts > 0.1)),
+                'slot_utilization_std': float(np.std(np.mean(slot_acts > 0.1, axis=1))),
+                'update_magnitude_mean': float(np.mean(memory_update_magnitudes)) if memory_update_magnitudes else 0,
+                'update_magnitude_std': float(np.std(memory_update_magnitudes)) if memory_update_magnitudes else 0,
+                'dead_slots_ratio': float(np.mean(np.all(slot_acts < 0.01, axis=0))),
+                'saturation_ratio': float(np.mean(np.all(slot_acts > 0.9, axis=0))),
+                'heatmap': slot_acts.tolist()  # Time x Slot matrix
+            }
+            self.memory_heatmaps[variant_name] = slot_acts
+
+        # Attention
+        if attention_entropies:
+            metrics['attention'] = {
+                'entropy_mean': float(np.mean(attention_entropies)),
+                'entropy_std': float(np.std(attention_entropies)),
+                'sparsity_mean': float(np.mean(attention_sparsities)),
+                'sparsity_std': float(np.std(attention_sparsities)),
+                'stability': 1.0 - float(np.std(attention_entropies) / (np.mean(attention_entropies) + 1e-8))
+            }
+
+        # Vision Encoder
+        if vision_feature_norms:
+            metrics['vision_encoder'] = {
+                'feature_norm_mean': float(np.mean(vision_feature_norms)),
+                'feature_norm_std': float(np.std(vision_feature_norms)),
+                'activation_stability': 1.0 - float(np.std(vision_feature_norms) / (np.mean(vision_feature_norms) + 1e-8))
+            }
+
+        # Language Encoder
+        if text_feature_norms:
+            metrics['language_encoder'] = {
+                'feature_norm_mean': float(np.mean(text_feature_norms)),
+                'feature_norm_std': float(np.std(text_feature_norms)),
+                'embedding_stability': 1.0 - float(np.std(text_feature_norms) / (np.mean(text_feature_norms) + 1e-8))
+            }
+
+        # Fusion & Alignment
+        if alignment_similarities:
+            metrics['fusion'] = {
+                'alignment_similarity_mean': float(np.mean(alignment_similarities)),
+                'alignment_similarity_std': float(np.std(alignment_similarities)),
+                'alignment_drift': float(np.std(alignment_similarities))
+            }
+
+        # Losses
+        metrics['losses'] = {
+            'total_loss_mean': float(np.mean(total_losses)) if total_losses else None,
+            'total_loss_std': float(np.std(total_losses)) if total_losses else None,
+            'itc_loss_mean': float(np.mean(itc_losses)) if itc_losses else None,
+            'itm_loss_mean': float(np.mean(itm_losses)) if itm_losses else None,
+        }
+
+        return metrics
+
+    def _analyze_episodic_memory(self, episodic_memory, step: int) -> Dict:
+        """Analyze episodic memory state."""
+        metrics = {
+            'slot_activations': np.zeros(64),  # Default size
+            'update_magnitude': 0.0,
+            'write_frequency': 0.0,
+            'read_frequency': 0.0
+        }
+
+        try:
+            # Get memory state
+            if hasattr(episodic_memory, 'memory_mean'):
+                memory_mean = episodic_memory.memory_mean.detach().cpu().numpy()
+                metrics['slot_activations'] = np.abs(memory_mean).mean(axis=-1)
+                metrics['update_magnitude'] = float(np.std(memory_mean))
+
+            # Check for quantized memory slots
+            if hasattr(episodic_memory, 'quantized_memory_slots'):
+                qms = episodic_memory.quantized_memory_slots
+                if hasattr(qms, 'dequantize_memory'):
+                    mem_mean, mem_logvar = qms.dequantize_memory()
+                    metrics['slot_activations'] = mem_mean.abs().mean(dim=-1).cpu().numpy()
+                    metrics['update_magnitude'] = float(mem_mean.std().item())
+        except Exception as e:
+            pass  # Use default values
+
+        return metrics
+
+    def _compute_attention_metrics(self, attention_weights: torch.Tensor) -> Tuple[float, float]:
+        """Compute attention entropy and sparsity."""
+        try:
+            # Handle different attention shapes
+            if attention_weights.dim() > 2:
+                attn = attention_weights.mean(dim=tuple(range(attention_weights.dim() - 2)))
+            else:
+                attn = attention_weights
+
+            # Normalize to probabilities
+            attn = F.softmax(attn.float(), dim=-1)
+
+            # Entropy: -sum(p * log(p))
+            entropy = -(attn * (attn + 1e-10).log()).sum(dim=-1).mean().item()
+
+            # Sparsity: ratio of near-zero values
+            sparsity = (attn < 0.01).float().mean().item()
+
+            return entropy, sparsity
+        except:
+            return 0.0, 0.0
+
+    def _log_variant_metrics(self, variant_name: str, metrics: Dict):
+        """Log metrics to wandb with proper prefixing."""
+        if not self.wandb_logger:
+            return
+
+        bit_width = metrics['bit_width']
+        prefix = f"quant_eval/{bit_width}bit"
+
+        flat_metrics = {}
+
+        # Episodic Memory
+        if metrics['episodic_memory']:
+            for k, v in metrics['episodic_memory'].items():
+                if k != 'heatmap' and v is not None:
+                    flat_metrics[f"{prefix}/memory/{k}"] = v
+
+        # Attention
+        if metrics['attention']:
+            for k, v in metrics['attention'].items():
+                if v is not None:
+                    flat_metrics[f"{prefix}/attention/{k}"] = v
+
+        # Vision Encoder
+        if metrics['vision_encoder']:
+            for k, v in metrics['vision_encoder'].items():
+                if v is not None:
+                    flat_metrics[f"{prefix}/vision/{k}"] = v
+
+        # Language Encoder
+        if metrics['language_encoder']:
+            for k, v in metrics['language_encoder'].items():
+                if v is not None:
+                    flat_metrics[f"{prefix}/language/{k}"] = v
+
+        # Fusion
+        if metrics['fusion']:
+            for k, v in metrics['fusion'].items():
+                if v is not None:
+                    flat_metrics[f"{prefix}/fusion/{k}"] = v
+
+        # Losses
+        if metrics['losses']:
+            for k, v in metrics['losses'].items():
+                if v is not None:
+                    flat_metrics[f"{prefix}/loss/{k}"] = v
+
+        # Log all metrics
+        try:
+            self.wandb_logger.log_metrics(flat_metrics, step=0)
+
+            # Log memory heatmap as image if available
+            if variant_name in self.memory_heatmaps:
+                import wandb
+                heatmap = self.memory_heatmaps[variant_name]
+                wandb.log({
+                    f"{prefix}/memory_heatmap": wandb.Image(
+                        self._create_heatmap_image(heatmap),
+                        caption=f"Memory Slot Activations ({bit_width}-bit)"
+                    )
+                })
+        except Exception as e:
+            print(f"   ⚠️ WandB logging error: {e}")
+
+    def _create_heatmap_image(self, heatmap: np.ndarray) -> np.ndarray:
+        """Create a heatmap image from numpy array."""
+        try:
+            import matplotlib
+            matplotlib.use('Agg')
+            import matplotlib.pyplot as plt
+
+            fig, ax = plt.subplots(figsize=(12, 8))
+            im = ax.imshow(heatmap, aspect='auto', cmap='hot', interpolation='nearest')
+            ax.set_xlabel('Memory Slot')
+            ax.set_ylabel('Time Step')
+            ax.set_title('Episodic Memory Slot Activations Over Time')
+            plt.colorbar(im, ax=ax, label='Activation')
+
+            # Convert to numpy array
+            fig.canvas.draw()
+            img = np.frombuffer(fig.canvas.tostring_rgb(), dtype=np.uint8)
+            img = img.reshape(fig.canvas.get_width_height()[::-1] + (3,))
+            plt.close(fig)
+
+            return img
+        except Exception as e:
+            # Return blank image if matplotlib fails
+            return np.zeros((480, 640, 3), dtype=np.uint8)
+
+    def _generate_comparative_analysis(self, all_metrics: Dict[str, Dict]):
+        """Generate cross-variant comparative analysis and log to wandb."""
+        if not self.wandb_logger:
+            return
+
+        print("\n📈 Generating Comparative Analysis...")
+
+        try:
+            import wandb
+
+            # Create comparison tables
+            comparison_data = []
+            for variant_name, metrics in all_metrics.items():
+                row = {
+                    'Variant': variant_name,
+                    'Bit Width': metrics['bit_width'],
+                }
+
+                # Add key metrics
+                if metrics['episodic_memory']:
+                    row['Memory Utilization'] = metrics['episodic_memory'].get('slot_utilization_mean', 0)
+                    row['Dead Slots %'] = metrics['episodic_memory'].get('dead_slots_ratio', 0) * 100
+
+                if metrics['attention']:
+                    row['Attn Entropy'] = metrics['attention'].get('entropy_mean', 0)
+                    row['Attn Sparsity'] = metrics['attention'].get('sparsity_mean', 0)
+
+                if metrics['vision_encoder']:
+                    row['Vision Norm'] = metrics['vision_encoder'].get('feature_norm_mean', 0)
+
+                if metrics['language_encoder']:
+                    row['Text Norm'] = metrics['language_encoder'].get('feature_norm_mean', 0)
+
+                if metrics['fusion']:
+                    row['Alignment Sim'] = metrics['fusion'].get('alignment_similarity_mean', 0)
+
+                if metrics['losses']:
+                    row['Total Loss'] = metrics['losses'].get('total_loss_mean', 0)
+
+                comparison_data.append(row)
+
+            # Log comparison table
+            wandb.log({
+                "quant_eval/comparison_table": wandb.Table(
+                    columns=list(comparison_data[0].keys()) if comparison_data else [],
+                    data=[list(row.values()) for row in comparison_data]
+                )
+            })
+
+            # Create bar charts for key metrics
+            bit_widths = [m['bit_width'] for m in all_metrics.values()]
+
+            # Memory utilization comparison
+            if all(m.get('episodic_memory', {}).get('slot_utilization_mean') is not None for m in all_metrics.values()):
+                mem_utils = [m['episodic_memory']['slot_utilization_mean'] for m in all_metrics.values()]
+                wandb.log({
+                    "quant_eval/memory_utilization_comparison": wandb.plot.bar(
+                        wandb.Table(data=[[str(b), u] for b, u in zip(bit_widths, mem_utils)],
+                                   columns=["Bit Width", "Memory Utilization"]),
+                        "Bit Width", "Memory Utilization",
+                        title="Memory Utilization by Quantization Level"
+                    )
+                })
+
+            # Loss comparison
+            if all(m.get('losses', {}).get('total_loss_mean') is not None for m in all_metrics.values()):
+                losses = [m['losses']['total_loss_mean'] for m in all_metrics.values()]
+                wandb.log({
+                    "quant_eval/loss_comparison": wandb.plot.bar(
+                        wandb.Table(data=[[str(b), l] for b, l in zip(bit_widths, losses)],
+                                   columns=["Bit Width", "Loss"]),
+                        "Bit Width", "Loss",
+                        title="Loss by Quantization Level"
+                    )
+                })
+
+            print("   ✅ Comparative analysis logged to WandB")
+
+        except Exception as e:
+            print(f"   ⚠️ Comparative analysis error: {e}")
+
+
+def evaluate_quantized_variants(
+    variants_info: Dict[str, Dict],
+    model_factory_fn,
+    config,
+    eval_dataloader,
+    wandb_logger=None,
+    num_eval_batches: int = 50
+) -> Dict[str, Dict]:
+    """
+    Main entry point for quantization evaluation.
+
+    Args:
+        variants_info: Dict from generate_quantized_variants()
+        model_factory_fn: Function to create model instance
+        config: Training configuration
+        eval_dataloader: DataLoader for evaluation
+        wandb_logger: Optional WandB logger
+        num_eval_batches: Number of batches to evaluate
+
+    Returns:
+        all_metrics: Comprehensive evaluation metrics for all variants
+    """
+    evaluator = QuantizationEvaluator(wandb_logger=wandb_logger)
+
+    return evaluator.evaluate_all_variants(
+        variants_info=variants_info,
+        model_factory_fn=model_factory_fn,
+        config=config,
+        eval_dataloader=eval_dataloader,
+        num_eval_batches=num_eval_batches
+    )
+
+
+# ============================================================================
+# ORIGINAL QUANTIZATION FUNCTIONS (UNCHANGED)
+# ============================================================================
 
 def quantize_3bit_symmetric(tensor, bits=3):
     """
@@ -522,4 +1083,3 @@ model.load_state_dict(checkpoint['model_state_dict'])
     print("\n" + "="*80)
     print("✨ PUBLISHING COMPLETE")
     print("="*80 + "\n")
-
