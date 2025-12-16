@@ -121,41 +121,35 @@ class QuantizedLinear158BitGrad(nn.Module):
         Forward with straight-through estimator for gradients
         Uses BitNet-style 1.58-bit weight quantization
         """
-        # Store original dtype for consistent output
-        original_dtype = x.dtype
+        # Use input dtype as the computation dtype (handles float16 from 4-bit models)
+        compute_dtype = x.dtype
 
-        # Convert input to weight dtype for computation
-        x = x.to(self.weight.dtype)
+        # Convert weight to computation dtype
+        weight = self.weight.to(compute_dtype)
 
-        # Quantize weights during forward pass
-        quantized_weight, scale = quantize_weights_158bit(self.weight)
+        # Quantize weights during forward pass (now preserves dtype)
+        quantized_weight, scale = quantize_weights_158bit(weight)
         dequantized_weight = dequantize_weights_158bit(quantized_weight, scale)
         
-        # Track quantization error
+        # Track quantization error (use original weight for accuracy)
         with torch.no_grad():
-            self.quant_error.fill_((self.weight - dequantized_weight).abs().mean())
-        
+            self.quant_error.fill_((weight - dequantized_weight).abs().mean())
+
         # Straight-through estimator: forward uses quantized, backward uses full precision
-        quantized_weight_ste = dequantized_weight + (self.weight - self.weight.detach())
-        
+        quantized_weight_ste = dequantized_weight + (weight - weight.detach())
+
         # Optional: quantize activations for full BitNet emulation
         if self.training:
             x_quant, act_scale = quantize_activations_int8(x)
-            # Keep in weight dtype instead of converting to float()
-            x = x_quant.to(self.weight.dtype) / act_scale
+            # Convert back to computation dtype
+            x = x_quant.to(compute_dtype) / act_scale
 
-        # Ensure bias matches weight dtype if present
+        # Ensure bias matches computation dtype if present
         bias = self.bias
-        if bias is not None and bias.dtype != self.weight.dtype:
-            bias = bias.to(self.weight.dtype)
+        if bias is not None:
+            bias = bias.to(compute_dtype)
 
-        output = F.linear(x, quantized_weight_ste, bias)
-
-        # Convert output back to original dtype if needed
-        if output.dtype != original_dtype:
-            output = output.to(original_dtype)
-
-        return output
+        return F.linear(x, quantized_weight_ste, bias)
 
     def get_quantization_stats(self):
         """Return quantization error for monitoring"""

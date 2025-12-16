@@ -20,9 +20,12 @@ def quantize_weights_158bit(weight):
         weight: torch.Tensor of any shape
     
     Returns:
-        quantized_weight: torch.Tensor with values in {-1, 0, 1}
+        quantized_weight: torch.Tensor with values in {-1, 0, 1} (same dtype as input)
         scale: scaling factor (gamma) for dequantization
     """
+    # Store original dtype to preserve it
+    original_dtype = weight.dtype
+
     # Compute scale (gamma) as mean absolute value following BitNet
     scale = weight.abs().mean().clamp(min=1e-5)
 
@@ -31,7 +34,8 @@ def quantize_weights_158bit(weight):
     
     # Quantize to {-1, 0, +1} using sign and threshold
     # BitNet uses: round(clip(w/gamma, -1, 1))
-    quantized = torch.sign(normalized) * (normalized.abs() > 0.5).float()
+    # Use to(original_dtype) instead of .float() to preserve dtype
+    quantized = torch.sign(normalized) * (normalized.abs() > 0.5).to(original_dtype)
 
     return quantized, scale
 
