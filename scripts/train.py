@@ -2005,11 +2005,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         checkpoint_interval = getattr(config, 'checkpoint_interval_steps', 500)
         push_checkpoints_to_hf = getattr(config, 'push_checkpoints_to_hf', True)
 
-        # Synchronize all ranks BEFORE checkpoint saving
-        if global_step % checkpoint_interval == 0 and is_distributed:
+        should_checkpoint = global_step % checkpoint_interval == 0
+
+        # Barrier BEFORE checkpoint - all ranks wait here
+        if should_checkpoint and is_distributed:
             dist.barrier()
 
-        if global_step % checkpoint_interval == 0 and is_main_process:
+        if should_checkpoint and is_main_process:
             checkpoint_dir = Path(config.output_dir) / "checkpoints"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
 
@@ -2058,8 +2060,8 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 except Exception as e:
                     print(f"   ⚠️  Failed to push to HuggingFace: {e}")
 
-        # Synchronize all ranks after checkpoint saving (main process only operation)
-        if is_distributed and global_step % checkpoint_interval == 0:
+        # Barrier AFTER checkpoint - all ranks wait here
+        if should_checkpoint and is_distributed:
             dist.barrier()
 
         # Alignment-specific tracking (Stage 1)
@@ -2229,19 +2231,23 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 wandb_run.log(metrics, step=global_step)
 
         # Visualization (main process only)
-        # Synchronize BEFORE visualization so rank 1 waits immediately
-        if global_step % config.visualize_interval == 0 and (visualizer is not None or wandb_logger):
+        # ALL ranks must synchronize before visualization starts
+        should_visualize = global_step % config.visualize_interval == 0 and (visualizer is not None or wandb_logger)
+
+        if should_visualize:
+            # Barrier BEFORE - all ranks wait here
             if is_distributed:
                 dist.barrier()
 
+            # Only main process does visualization
             if is_main_process:
                 model.eval()
                 # Get underlying model for DDP/DP wrapped models
                 viz_model = model.module if hasattr(model, 'module') else model
                 with torch.no_grad():
-                # Extract features for visualization
-                # Handle both baseline (2 returns) and FIBER (4 returns) models
-                encode_result = viz_model.encode_image(images[:4])
+                    # Extract features for visualization
+                    # Handle both baseline (2 returns) and FIBER (4 returns) models
+                    encode_result = viz_model.encode_image(images[:4])
                 if len(encode_result) == 4:
                     # FIBER model returns: prefix_tokens, image_features, patch_embeddings_proj, fiber_attention
                     prefix_tokens, image_features, _, _ = encode_result
@@ -2529,9 +2535,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                              viz_model.memory_state[1][:batch_size_for_vis]), w_mean, global_step
                         )
 
-                model.train()
+                    model.train()
 
-            # Synchronize all ranks after visualization completes
+            # Barrier AFTER - all ranks wait here
             if is_distributed:
                 dist.barrier()
 
