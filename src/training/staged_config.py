@@ -227,9 +227,10 @@ class Stage2Config(TrainingConfig):
     train_memory: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Enable 4-bit quantization for both base models (memory still uses 1.58-bit)
+    # Enable 4-bit quantization for both base models (frozen backbones)
+    # Memory quantization is disabled during training - applied post-training only
     enable_quantization: bool = True
-    quantize_memory_158bit: bool = True
+    quantize_memory_158bit: bool = False  # DISABLED: Apply only post-training, not during training
     quantize_vision_4bit: bool = True    # Load DeiT in 4-bit
     quantize_language_4bit: bool = True  # Load Qwen in 4-bit
 
@@ -309,9 +310,10 @@ class Stage3Config(TrainingConfig):
     freeze_adapter: bool = False  # Keep adapter trainable
     unfreeze_last_n_layers: int = 8  # Unfreeze more layers for instruction tuning
 
-    # Quantization - 4-bit for both base models (match Stage 2 settings)
+    # Quantization - 4-bit for both base models (frozen backbones)
+    # Memory quantization is disabled during training - applied post-training only
     enable_quantization: bool = True
-    quantize_memory_158bit: bool = True
+    quantize_memory_158bit: bool = False  # DISABLED: Apply only post-training
     quantize_vision_4bit: bool = True    # Load DeiT in 4-bit
     quantize_language_4bit: bool = True  # Load Qwen in 4-bit
 
