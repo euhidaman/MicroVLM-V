@@ -2804,6 +2804,12 @@ def main():
     local_rank = 0
     world_size = 1
     
+    # Clear CUDA cache at startup to prevent OOM from previous runs
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        # Also synchronize to ensure cleanup is complete
+        torch.cuda.synchronize()
+
     # Check for torchrun environment variables (preferred method)
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
         is_distributed = True
@@ -3021,6 +3027,12 @@ def main():
               f"({100*trainable_params/total_params:.2f}%)")
         if args.alignment_mode == 'fiber':
             print("  ✓ FIBER fusion layers are trainable")
+
+    # Clear CUDA cache before moving model to device to prevent OOM
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+        if is_main_process:
+            print(f"Cleared CUDA cache before model loading")
 
     # Move to device (use local_rank for DDP, otherwise config.device)
     if is_distributed:
