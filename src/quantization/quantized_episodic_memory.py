@@ -121,6 +121,10 @@ class QuantizedLinear158BitGrad(nn.Module):
         Forward with straight-through estimator for gradients
         Uses BitNet-style 1.58-bit weight quantization
         """
+        # Ensure input matches weight dtype (fix for 4-bit base models outputting float16)
+        if x.dtype != self.weight.dtype:
+            x = x.to(self.weight.dtype)
+
         # Quantize weights during forward pass
         quantized_weight, scale = quantize_weights_158bit(self.weight)
         dequantized_weight = dequantize_weights_158bit(quantized_weight, scale)
