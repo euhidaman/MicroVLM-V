@@ -2054,6 +2054,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 except Exception as e:
                     print(f"   ⚠️  Failed to push to HuggingFace: {e}")
 
+        # Synchronize all ranks after checkpoint saving (main process only operation)
+        if is_distributed and global_step % checkpoint_interval == 0:
+            dist.barrier()
 
         # Alignment-specific tracking (Stage 1)
         alignment_stop_code = 0
@@ -2518,6 +2521,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         )
 
             model.train()
+
+            # Synchronize all ranks after visualization to prevent NCCL timeout
+            # Visualization only runs on main process, so other ranks need to wait
+            if is_distributed:
+                dist.barrier()
 
         # ===== Robust Sliding Window Early Stopping =====
         # Check early stopping - only main process decides, then broadcasts to all ranks
