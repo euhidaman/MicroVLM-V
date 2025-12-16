@@ -167,9 +167,9 @@ class Stage1Config(TrainingConfig):
     train_adapter_only: bool = True
     unfreeze_last_n_layers: int = 0
 
-    # Quantization - 4-bit for language model to reduce size < 1GB
+    # Quantization - 4-bit for both base models to reduce size < 1GB
     enable_quantization: bool = True
-    quantize_vision_4bit: bool = False
+    quantize_vision_4bit: bool = True    # Load DeiT in 4-bit
     quantize_language_4bit: bool = True  # Reduces Qwen from ~2GB to ~250MB
 
     # Attention Quality Monitoring (prevents attention degradation to edge-detection)
@@ -227,11 +227,11 @@ class Stage2Config(TrainingConfig):
     train_memory: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Disable quantization for higher compute (memory still uses 1.58-bit)
+    # Enable 4-bit quantization for both base models (memory still uses 1.58-bit)
     enable_quantization: bool = True
     quantize_memory_158bit: bool = True
-    quantize_vision_4bit: bool = False
-    quantize_language_4bit: bool = False
+    quantize_vision_4bit: bool = True    # Load DeiT in 4-bit
+    quantize_language_4bit: bool = True  # Load Qwen in 4-bit
 
     # Memory-specific settings (from Larimar)
     memory_size: int = 512
@@ -309,11 +309,11 @@ class Stage3Config(TrainingConfig):
     freeze_adapter: bool = False  # Keep adapter trainable
     unfreeze_last_n_layers: int = 8  # Unfreeze more layers for instruction tuning
 
-    # Quantization - match Stage 2 settings
+    # Quantization - 4-bit for both base models (match Stage 2 settings)
     enable_quantization: bool = True
     quantize_memory_158bit: bool = True
-    quantize_vision_4bit: bool = False
-    quantize_language_4bit: bool = False
+    quantize_vision_4bit: bool = True    # Load DeiT in 4-bit
+    quantize_language_4bit: bool = True  # Load Qwen in 4-bit
 
     # Stage 3 output directory
     output_dir: str = "./checkpoints/stage3"
