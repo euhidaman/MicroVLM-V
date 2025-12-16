@@ -13,16 +13,25 @@ class DeiTVisionEncoder(nn.Module):
     """
     DeiT-Tiny vision encoder with 4-bit quantization support
     Extracts patch tokens as visual embeddings
+
+    QUANTIZATION MODES:
+        1. use_hf_model=True + quantize_4bit=True: HuggingFace DeiT in 4-bit (BitsAndBytes)
+        2. use_hf_model=True + quantize_4bit=False: HuggingFace DeiT in FP32
+        3. use_hf_model=False: Custom PyTorch implementation in FP32
+
+    RECOMMENDED: use_hf_model=True + quantize_4bit=True for frozen backbone
     """
     
-    def __init__(self, config, pretrained_path=None):
+    def __init__(self, config, pretrained_path=None, quantize_4bit=False, use_hf_model=True):
         super().__init__()
         
         self.image_size = config.get('image_size', 224)
         self.patch_size = config.get('patch_size', 16)
         self.hidden_size = config.get('deit_embed_dim', 192)
         self.num_patches = config.get('num_patches', 196)
-        
+        self.quantize_4bit = quantize_4bit
+        self.use_hf_model = use_hf_model
+
         # Image preprocessing
         self.preprocess = transforms.Compose([
             transforms.Resize((self.image_size, self.image_size)),
@@ -31,6 +40,65 @@ class DeiTVisionEncoder(nn.Module):
                                std=[0.229, 0.224, 0.225])
         ])
         
+        # Choose between HuggingFace model (supports 4-bit) or custom implementation
+        if use_hf_model:
+            self._init_hf_model(pretrained_path, quantize_4bit)
+        else:
+            self._init_custom_model(pretrained_path)
+
+    def _init_hf_model(self, pretrained_path=None, quantize_4bit=False):
+        """Initialize HuggingFace DeiT model with optional 4-bit quantization"""
+        from transformers import AutoModel, AutoImageProcessor
+
+        model_name = pretrained_path or "facebook/deit-tiny-patch16-224"
+
+        print(f"Loading DeiT from HuggingFace: {model_name}")
+
+        if quantize_4bit:
+            print("  ⚙️  Loading DeiT in 4-bit quantized format (BitsAndBytes NF4)")
+            from transformers import BitsAndBytesConfig
+
+            bnb_config = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_use_double_quant=True,
+                bnb_4bit_quant_type="nf4"
+            )
+
+            self.hf_model = AutoModel.from_pretrained(
+                model_name,
+                quantization_config=bnb_config,
+                trust_remote_code=True,
+                device_map="auto"
+            )
+            print("  ✅ DeiT loaded in 4-bit (frozen backbone)")
+        else:
+            print("  ⚙️  Loading DeiT in full precision (FP32)")
+            self.hf_model = AutoModel.from_pretrained(
+                model_name,
+                torch_dtype=torch.float32,
+                trust_remote_code=True
+            )
+            print("  ✅ DeiT loaded in FP32")
+
+        # Get image processor
+        self.image_processor = AutoImageProcessor.from_pretrained(model_name)
+
+        # Mark as HF model
+        self.patch_embed = None  # Not used in HF mode
+        self.cls_token = None
+        self.pos_embed = None
+        self.transformer = None
+        self.norm = None
+
+    def _init_custom_model(self, pretrained_path=None):
+        """Initialize custom PyTorch DeiT implementation (FP32 only)"""
+        print("Using custom DeiT implementation (FP32)")
+
+        # Mark as custom model
+        self.hf_model = None
+        self.image_processor = None
+
         # Patch embedding layer
         self.patch_embed = nn.Conv2d(
             in_channels=3,
@@ -104,6 +172,37 @@ class DeiTVisionEncoder(nn.Module):
         Returns:
             patch_embeddings: (batch_size, num_patches, hidden_size)
         """
+        # Use HuggingFace model if available
+        if self.hf_model is not None:
+            return self._forward_hf(images)
+        else:
+            return self._forward_custom(images)
+
+    def _forward_hf(self, images):
+        """Forward pass with HuggingFace model"""
+        # Handle PIL images
+        if isinstance(images, list):
+            # Use HF image processor
+            inputs = self.image_processor(images=images, return_tensors="pt")
+            pixel_values = inputs['pixel_values'].to(self.hf_model.device)
+        else:
+            # Already tensors - no processing needed
+            pixel_values = images
+
+        # Get model outputs
+        outputs = self.hf_model(pixel_values)
+
+        # Extract hidden states (excluding CLS token)
+        # DeiT output: [batch_size, num_patches + 1, hidden_size]
+        hidden_states = outputs.last_hidden_state
+
+        # Return only patch tokens (exclude CLS token at position 0)
+        patch_tokens = hidden_states[:, 1:, :]
+
+        return patch_tokens
+
+    def _forward_custom(self, images):
+        """Forward pass with custom PyTorch model"""
         # Handle PIL images
         if isinstance(images, list):
             images = torch.stack([self.preprocess(img) for img in images])
@@ -139,11 +238,36 @@ class DeiTVisionEncoder(nn.Module):
         Extract CLS token for image-level representation
         
         Args:
-            images: (batch_size, 3, H, W)
-        
+            images: (batch_size, 3, H, W) or list of PIL Images
+
         Returns:
             cls_features: (batch_size, hidden_size)
         """
+        # Use HuggingFace model if available
+        if self.hf_model is not None:
+            return self._get_cls_token_hf(images)
+        else:
+            return self._get_cls_token_custom(images)
+
+    def _get_cls_token_hf(self, images):
+        """Get CLS token with HuggingFace model"""
+        # Handle PIL images
+        if isinstance(images, list):
+            inputs = self.image_processor(images=images, return_tensors="pt")
+            pixel_values = inputs['pixel_values'].to(self.hf_model.device)
+        else:
+            pixel_values = images
+
+        # Get model outputs
+        outputs = self.hf_model(pixel_values)
+
+        # Extract CLS token (first token)
+        cls_token = outputs.last_hidden_state[:, 0, :]
+
+        return cls_token
+
+    def _get_cls_token_custom(self, images):
+        """Get CLS token with custom model"""
         # Handle PIL images
         if isinstance(images, list):
             images = torch.stack([self.preprocess(img) for img in images])

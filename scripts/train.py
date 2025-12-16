@@ -15,6 +15,11 @@ if str(project_root) not in sys.path:
 
 from src.quantization.quantized_episodic_memory import get_memory_quantization_stats
 from src.quantization.quantize_4bit import QuantizationConfig
+from src.quantization.post_training_quantization import (
+    generate_quantized_variants,
+    publish_quantized_variants_to_hf,
+    create_statistics_json
+)
 from src.visualization.wandb_logger import WandBLogger
 from src.visualization.attention_vis import create_attention_visualizer
 from src.training.staged_config import load_config as load_staged_config
@@ -3658,6 +3663,103 @@ def main():
                     print(f"   ⚠️  Failed to push best model to HuggingFace: {e}")
             else:
                 print(f"   ⚠️  No best model checkpoint found to push")
+
+        # ========== POST-TRAINING QUANTIZATION ==========
+        # Apply quantization ONLY to the best model, AFTER training is complete
+        apply_post_training_quantization = getattr(config, 'apply_post_training_quantization', True)
+
+        if apply_post_training_quantization and best_model_tracker is not None:
+            best_info = best_model_tracker.get_best_info()
+            if best_info['best_checkpoint_path']:
+                print("\n" + "="*80)
+                print("🔧 STARTING POST-TRAINING QUANTIZATION")
+                print("="*80)
+                print("⚠️  CRITICAL: Quantization is applied ONLY to the best model")
+                print("⚠️  Base models (Qwen + DiET) remain 4-bit as loaded")
+                print("⚠️  Trainable components will be quantized to 4-bit, 3-bit, and 1.58-bit")
+                print("="*80 + "\n")
+
+                # Define model factory function to recreate model
+                def create_model_for_quantization(cfg):
+                    """Recreate model for quantization"""
+                    if args.alignment_mode == 'fiber':
+                        fiber_config = {
+                            'fiber_fusion_layers': fiber_fusion_layers,
+                            'cross_attention_heads': 4,
+                            'cross_attention_dim': model_config['model_dimensions'].get('vision_hidden_size', 192),
+                            'use_bidirectional': True,
+                            'alpha_init': 0.0,
+                            'embed_dim': 256,
+                            'itc_weight': args.itc_weight,
+                            'itm_weight': args.itm_weight,
+                        }
+
+                        quantize_4bit_lang = getattr(cfg, 'quantize_language_4bit', True)
+                        quantize_memory_158bit = getattr(cfg, 'quantize_memory_158bit', False)
+
+                        model = create_microvlm_fiber(
+                            config=model_config['model_dimensions'],
+                            vision_checkpoint=getattr(cfg, 'vision_checkpoint', cfg.deit_checkpoint),
+                            language_checkpoint=getattr(cfg, 'language_checkpoint', cfg.qwen_model),
+                            quantize_4bit=quantize_4bit_lang,
+                            quantize_memory_158bit=quantize_memory_158bit,
+                            training_config=cfg,
+                            fiber_config=fiber_config
+                        )
+                    else:
+                        model = create_microvlm(
+                            config=model_config['model_dimensions'],
+                            language_checkpoint=getattr(cfg, 'language_checkpoint', cfg.qwen_model),
+                            vision_checkpoint=getattr(cfg, 'vision_checkpoint', cfg.deit_checkpoint),
+                            quantize_4bit=(getattr(cfg, 'quantize_vision_4bit', False) or
+                                         getattr(cfg, 'quantize_language_4bit', False)),
+                            quantize_memory_158bit=getattr(cfg, 'quantize_memory_158bit', False),
+                            training_config=cfg
+                        )
+                    return model
+
+                try:
+                    # Generate quantized variants (4-bit, 3-bit, 1.58-bit)
+                    bit_widths_to_generate = getattr(config, 'quantization_bit_widths', [4, 3, 1.58])
+
+                    variants_info = generate_quantized_variants(
+                        best_checkpoint_path=best_info['best_checkpoint_path'],
+                        output_dir=config.output_dir,
+                        config=config,
+                        model_factory_fn=create_model_for_quantization,
+                        bit_widths=bit_widths_to_generate
+                    )
+
+                    # Log quantization results to WandB
+                    if wandb_logger and wandb_run:
+                        for variant_name, variant_data in variants_info.items():
+                            wandb_logger.log_metrics({
+                                f'quantization/{variant_name}/size_mb': variant_data['estimated_size_mb'],
+                                f'quantization/{variant_name}/bit_width': variant_data['bit_width'],
+                                f'quantization/{variant_name}/total_params': variant_data['total_params'],
+                            }, step=global_step)
+
+                    # Publish to Hugging Face
+                    publish_to_hf = getattr(config, 'publish_quantized_variants', True)
+                    if publish_to_hf:
+                        publish_quantized_variants_to_hf(
+                            variants_info=variants_info,
+                            config=config,
+                            repo_base_name=getattr(config, 'hf_quantized_repo_base', 'MicroVLM-V-Stage2-Best')
+                        )
+
+                    print("\n✅ POST-TRAINING QUANTIZATION COMPLETE")
+                    print(f"   Generated variants: {list(variants_info.keys())}")
+                    print(f"   Variants directory: {Path(config.output_dir) / 'quantized_variants'}")
+
+                except Exception as e:
+                    print(f"\n⚠️  POST-TRAINING QUANTIZATION FAILED: {e}")
+                    import traceback
+                    traceback.print_exc()
+            else:
+                print("\n⚠️  Skipping post-training quantization: No best checkpoint found")
+        else:
+            print("\n⚠️  Post-training quantization disabled in config")
 
         if wandb_run:
             wandb_run.summary["actual_epochs"] = actual_epochs

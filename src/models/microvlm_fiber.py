@@ -108,8 +108,15 @@ class MicroVLM_FIBER(nn.Module):
             )
         else:
             print("📷 Using baseline DeiT Vision Encoder")
+            # Get quantization setting for vision encoder from config
+            quantize_vision_4bit = getattr(training_config, 'quantize_vision_4bit', False) if training_config else False
+            use_hf_deit = getattr(training_config, 'use_hf_deit', True) if training_config else True
+
             self.vision_encoder = DeiTVisionEncoder(
-                config, pretrained_path=vision_checkpoint
+                config,
+                pretrained_path=vision_checkpoint,
+                quantize_4bit=quantize_vision_4bit,
+                use_hf_model=use_hf_deit
             )
         
         # Multimodal adapter

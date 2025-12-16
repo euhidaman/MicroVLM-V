@@ -69,6 +69,12 @@ class Qwen2LanguageModel(nn.Module):
         Args:
             model_name_or_path: HuggingFace model identifier or local path
             quantize_4bit: whether to apply 4-bit quantization
+
+        QUANTIZATION POLICY:
+            - When quantize_4bit=True: Base model loaded in 4-bit NF4 format using BitsAndBytes
+            - This is INITIAL quantization for the frozen backbone
+            - Trainable components remain in full precision during training
+            - Post-training quantization applies to trainable components only
         """
         print(f"Loading Qwen2.5-0.5B from {model_name_or_path}")
 
@@ -80,6 +86,7 @@ class Qwen2LanguageModel(nn.Module):
 
         # Load model with optional quantization
         if quantize_4bit:
+            print("  ⚙️  Loading Qwen in 4-bit quantized format (BitsAndBytes NF4)")
             from transformers import BitsAndBytesConfig
 
             bnb_config = BitsAndBytesConfig(
@@ -95,7 +102,9 @@ class Qwen2LanguageModel(nn.Module):
                 trust_remote_code=True,
                 device_map="auto"
             )
+            print("  ✅ Qwen loaded in 4-bit (frozen backbone)")
         else:
+            print("  ⚙️  Loading Qwen in full precision (FP32)")
             # Load in float32 for consistent dtype handling across all environments
             # Mixed precision should be handled by torch.cuda.amp.autocast, not model loading
             self.model = AutoModelForCausalLM.from_pretrained(
@@ -103,6 +112,7 @@ class Qwen2LanguageModel(nn.Module):
                 torch_dtype=torch.float32,
                 trust_remote_code=True
             )
+            print("  ✅ Qwen loaded in FP32")
 
         # Extract model components
         self.embed_tokens = self.model.model.embed_tokens

@@ -36,9 +36,16 @@ class MicroVLM(nn.Module):
         self.quantize_4bit = quantize_4bit
         self.quantize_memory_158bit = quantize_memory_158bit
 
-        # Vision encoder: DeiT-Tiny
+        # Vision encoder: DeiT-Tiny with optional 4-bit quantization
+        quantize_vision_4bit = getattr(training_config, 'quantize_vision_4bit', False) if training_config else False
+        use_hf_deit = getattr(training_config, 'use_hf_deit', True) if training_config else True
+
         self.vision_encoder = DeiTVisionEncoder(
-            config, pretrained_path=vision_checkpoint)
+            config,
+            pretrained_path=vision_checkpoint,
+            quantize_4bit=quantize_vision_4bit,
+            use_hf_model=use_hf_deit
+        )
 
         # Multimodal adapter
         self.multimodal_adapter = MultimodalAdapter(config)

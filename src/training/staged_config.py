@@ -3,7 +3,7 @@ Training Configuration with Staged Learning and Quantization
 """
 
 from dataclasses import dataclass, field
-from typing import Optional
+from typing import Optional, List
 
 
 @dataclass
@@ -58,11 +58,18 @@ class TrainingConfig:
     freeze_language: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Quantization - 4-bit for language model to reduce size < 1GB
+    # Quantization - 4-bit for both vision and language models to reduce size
     enable_quantization: bool = True
     quantize_memory_158bit: bool = False
-    quantize_vision_4bit: bool = False
-    quantize_language_4bit: bool = True  # Reduces Qwen from ~2GB to ~250MB
+    quantize_vision_4bit: bool = True   # Load DeiT in 4-bit (via HuggingFace)
+    quantize_language_4bit: bool = True  # Load Qwen in 4-bit (reduces from ~2GB to ~250MB)
+    use_hf_deit: bool = True  # Use HuggingFace DeiT (supports 4-bit quantization)
+
+    # Post-Training Quantization (Applied ONLY after best model selection)
+    apply_post_training_quantization: bool = True  # Generate quantized variants at end
+    quantization_bit_widths: List[float] = field(default_factory=lambda: [4, 3, 1.58])  # Variants to generate
+    publish_quantized_variants: bool = True  # Upload to HuggingFace
+    hf_quantized_repo_base: str = "MicroVLM-V-Stage2-Best"  # Base name for HF repos
 
     # Optimization
     optimizer: str = "adamw"
