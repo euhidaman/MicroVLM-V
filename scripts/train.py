@@ -2005,6 +2005,10 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         checkpoint_interval = getattr(config, 'checkpoint_interval_steps', 500)
         push_checkpoints_to_hf = getattr(config, 'push_checkpoints_to_hf', True)
 
+        # Synchronize all ranks BEFORE checkpoint saving
+        if global_step % checkpoint_interval == 0 and is_distributed:
+            dist.barrier()
+
         if global_step % checkpoint_interval == 0 and is_main_process:
             checkpoint_dir = Path(config.output_dir) / "checkpoints"
             checkpoint_dir.mkdir(parents=True, exist_ok=True)
@@ -2225,11 +2229,16 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 wandb_run.log(metrics, step=global_step)
 
         # Visualization (main process only)
-        if is_main_process and global_step % config.visualize_interval == 0 and (visualizer is not None or wandb_logger):
-            model.eval()
-            # Get underlying model for DDP/DP wrapped models
-            viz_model = model.module if hasattr(model, 'module') else model
-            with torch.no_grad():
+        # Synchronize BEFORE visualization so rank 1 waits immediately
+        if global_step % config.visualize_interval == 0 and (visualizer is not None or wandb_logger):
+            if is_distributed:
+                dist.barrier()
+
+            if is_main_process:
+                model.eval()
+                # Get underlying model for DDP/DP wrapped models
+                viz_model = model.module if hasattr(model, 'module') else model
+                with torch.no_grad():
                 # Extract features for visualization
                 # Handle both baseline (2 returns) and FIBER (4 returns) models
                 encode_result = viz_model.encode_image(images[:4])
@@ -2520,10 +2529,9 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                              viz_model.memory_state[1][:batch_size_for_vis]), w_mean, global_step
                         )
 
-            model.train()
+                model.train()
 
-            # Synchronize all ranks after visualization to prevent NCCL timeout
-            # Visualization only runs on main process, so other ranks need to wait
+            # Synchronize all ranks after visualization completes
             if is_distributed:
                 dist.barrier()
 
