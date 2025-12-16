@@ -58,12 +58,13 @@ class TrainingConfig:
     freeze_language: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Quantization - 4-bit for both vision and language models to reduce size
+    # Quantization - DISABLED during training for stability & checkpoint compatibility
+    # Post-training quantization will generate 4-bit, 3-bit, 1.58-bit variants
     enable_quantization: bool = True
     quantize_memory_158bit: bool = False
-    quantize_vision_4bit: bool = True   # Load DeiT in 4-bit (via HuggingFace)
-    quantize_language_4bit: bool = True  # Load Qwen in 4-bit (reduces from ~2GB to ~250MB)
-    use_hf_deit: bool = True  # Use HuggingFace DeiT (supports 4-bit quantization)
+    quantize_vision_4bit: bool = False   # DISABLED: Keep FP32 during training
+    quantize_language_4bit: bool = False # DISABLED: Keep FP32 during training
+    use_hf_deit: bool = False  # Use custom DeiT (FP32)
 
     # Post-Training Quantization (Applied ONLY after best model selection)
     apply_post_training_quantization: bool = True  # Generate quantized variants at end
@@ -167,10 +168,11 @@ class Stage1Config(TrainingConfig):
     train_adapter_only: bool = True
     unfreeze_last_n_layers: int = 0
 
-    # Quantization - 4-bit for both base models to reduce size < 1GB
+    # Quantization - DISABLED during training for checkpoint compatibility
+    # Post-training quantization will generate 4-bit, 3-bit, 1.58-bit variants
     enable_quantization: bool = True
-    quantize_vision_4bit: bool = True    # Load DeiT in 4-bit
-    quantize_language_4bit: bool = True  # Reduces Qwen from ~2GB to ~250MB
+    quantize_vision_4bit: bool = False   # DISABLED: Keep FP32 for training
+    quantize_language_4bit: bool = False # DISABLED: Keep FP32 for training
 
     # Attention Quality Monitoring (prevents attention degradation to edge-detection)
     use_attention_monitor: bool = True
@@ -231,8 +233,9 @@ class Stage2Config(TrainingConfig):
     # Memory quantization is disabled during training - applied post-training only
     enable_quantization: bool = True
     quantize_memory_158bit: bool = False  # DISABLED: Apply only post-training, not during training
-    quantize_vision_4bit: bool = True    # Load DeiT in 4-bit
-    quantize_language_4bit: bool = True  # Load Qwen in 4-bit
+    quantize_vision_4bit: bool = False   # DISABLED: Keep FP32 for checkpoint compatibility
+    quantize_language_4bit: bool = False # DISABLED: Keep FP32 for checkpoint compatibility
+    # NOTE: Post-training quantization will generate 4-bit, 3-bit, 1.58-bit variants
 
     # Memory-specific settings (from Larimar)
     memory_size: int = 512
@@ -310,12 +313,12 @@ class Stage3Config(TrainingConfig):
     freeze_adapter: bool = False  # Keep adapter trainable
     unfreeze_last_n_layers: int = 8  # Unfreeze more layers for instruction tuning
 
-    # Quantization - 4-bit for both base models (frozen backbones)
-    # Memory quantization is disabled during training - applied post-training only
+    # Quantization - DISABLED during training for checkpoint compatibility
+    # Post-training quantization will generate 4-bit, 3-bit, 1.58-bit variants
     enable_quantization: bool = True
     quantize_memory_158bit: bool = False  # DISABLED: Apply only post-training
-    quantize_vision_4bit: bool = True    # Load DeiT in 4-bit
-    quantize_language_4bit: bool = True  # Load Qwen in 4-bit
+    quantize_vision_4bit: bool = False   # DISABLED: Keep FP32 for checkpoint compatibility
+    quantize_language_4bit: bool = False # DISABLED: Keep FP32 for checkpoint compatibility
 
     # Stage 3 output directory
     output_dir: str = "./checkpoints/stage3"
