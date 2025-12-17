@@ -3,7 +3,7 @@ Training Configuration with Staged Learning and Quantization
 """
 
 from dataclasses import dataclass, field
-from typing import Optional, List
+from typing import Optional
 
 
 @dataclass
@@ -58,23 +58,11 @@ class TrainingConfig:
     freeze_language: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Quantization - DISABLED during training for stability & checkpoint compatibility
-    # Post-training quantization will generate 4-bit, 3-bit, 1.58-bit variants
+    # Quantization - 4-bit for language model to reduce size < 1GB
     enable_quantization: bool = True
     quantize_memory_158bit: bool = False
-    quantize_vision_4bit: bool = False   # DISABLED: Keep FP32 during training
-    quantize_language_4bit: bool = False # DISABLED: Keep FP32 during training
-    use_hf_deit: bool = False  # Use custom DeiT (FP32)
-
-    # Post-Training Quantization (Applied ONLY after best model selection)
-    apply_post_training_quantization: bool = True  # Generate quantized variants at end
-    quantization_bit_widths: List[float] = field(default_factory=lambda: [4, 3, 1.58])  # Variants to generate
-    publish_quantized_variants: bool = True  # Upload to HuggingFace
-    hf_quantized_repo_base: str = "MicroVLM-V-Stage2-Best"  # Base name for HF repos
-
-    # Quantization Evaluation (Comprehensive analysis of quantized variants)
-    evaluate_quantized_variants: bool = True  # Run evaluation on all variants
-    quant_eval_batches: int = 50  # Number of batches for evaluation per variant
+    quantize_vision_4bit: bool = False
+    quantize_language_4bit: bool = True  # Reduces Qwen from ~2GB to ~250MB
 
     # Optimization
     optimizer: str = "adamw"
@@ -99,6 +87,7 @@ class TrainingConfig:
     alignment_negative_patience: int = 100
     save_best_alignment_checkpoint: bool = True
     alignment_save_cooldown: int = 100  # min steps between best-checkpoint saves
+    alignment_min_stop_steps: int = 0  # do not stop on alignment before this step
     alignment_min_stop_steps: int = 0  # do not stop on alignment before this step
 
     # WandB
@@ -172,11 +161,10 @@ class Stage1Config(TrainingConfig):
     train_adapter_only: bool = True
     unfreeze_last_n_layers: int = 0
 
-    # Quantization - DISABLED during training for checkpoint compatibility
-    # Post-training quantization will generate 4-bit, 3-bit, 1.58-bit variants
+    # Quantization - 4-bit for language model to reduce size < 1GB
     enable_quantization: bool = True
-    quantize_vision_4bit: bool = False   # DISABLED: Keep FP32 for training
-    quantize_language_4bit: bool = False # DISABLED: Keep FP32 for training
+    quantize_vision_4bit: bool = False
+    quantize_language_4bit: bool = True  # Reduces Qwen from ~2GB to ~250MB
 
     # Attention Quality Monitoring (prevents attention degradation to edge-detection)
     use_attention_monitor: bool = True
@@ -233,13 +221,11 @@ class Stage2Config(TrainingConfig):
     train_memory: bool = True
     unfreeze_last_n_layers: int = 4
 
-    # Enable 4-bit quantization for both base models (frozen backbones)
-    # Memory quantization is disabled during training - applied post-training only
+    # Disable quantization for higher compute (memory still uses 1.58-bit)
     enable_quantization: bool = True
-    quantize_memory_158bit: bool = False  # DISABLED: Apply only post-training, not during training
-    quantize_vision_4bit: bool = False   # DISABLED: Keep FP32 for checkpoint compatibility
-    quantize_language_4bit: bool = False # DISABLED: Keep FP32 for checkpoint compatibility
-    # NOTE: Post-training quantization will generate 4-bit, 3-bit, 1.58-bit variants
+    quantize_memory_158bit: bool = True
+    quantize_vision_4bit: bool = False
+    quantize_language_4bit: bool = False
 
     # Memory-specific settings (from Larimar)
     memory_size: int = 512
@@ -250,95 +236,18 @@ class Stage2Config(TrainingConfig):
 
     # Stage 2 output directory and HF repo
     output_dir: str = "./checkpoints/stage2"
-    hf_repo_name: str = "MicroVLM-V-stage2"  # Separate repo for Stage 2
+    hf_repo_name: str = "MicroVLM-V-stage2"
 
     # Early stopping for Stage 2 (loss-based)
     use_early_stopping: bool = True
     early_stop_patience: int = 3  # More patience for memory learning
     early_stop_min_delta: float = 0.005  # Smaller delta for finer convergence
 
-    # Sliding Window Early Stopping (step-based, robust to noisy losses)
-    use_sliding_window_early_stop: bool = True
-    sliding_window_size: int = 1000  # 1000 steps per window
-    sliding_window_min_delta: float = 0.05  # Loss must improve by at least 0.05 (handles 1.31-1.67 range)
-    sliding_window_patience_steps: int = 3000  # Stop after 3000 steps without improvement
-    sliding_window_eval_interval: int = 100  # Evaluate every 100 steps
-    sliding_window_num_eval_windows: int = 8  # Need 8 flat windows to confirm plateau
-    sliding_window_variance_threshold: float = 0.01  # Max variance for stable window
-
-    # Auto-push to HuggingFace on early stop
-    push_to_hf_on_stop: bool = True
-
-    # Checkpoint saving
-    checkpoint_interval: int = 500  # Save checkpoint every 500 steps
-
-    # Best Stage 2 Model Tracking (multi-metric optimization)
-    track_best_stage2: bool = True  # Enable best model tracking
-    best_stage2_metrics: list = None  # Will be set to default metrics if None
-    best_stage2_weights: dict = None  # Metric weights for composite score
-    best_stage2_save_interval: int = 100  # Check for best model every N steps
-    best_stage2_min_improvement: float = 0.01  # Minimum improvement to save new best
-
     # Visualization
     visualize_interval: int = 100
     viz_save_interval: int = 5000
 
     wandb_run_name: str = "stage2_memory"
-
-
-@dataclass
-class Stage3Config(TrainingConfig):
-    """
-    Stage 3: Instruction Tuning
-    Fine-tune on instruction-following data after Stage 2 memory integration
-    """
-    # Override defaults for Stage 3
-    alignment_mode: str = 'fiber'  # Must match Stage 1/2 checkpoints
-    use_memory: bool = True  # Keep memory from Stage 2
-    num_epochs: int = 3
-    learning_rate: float = 1e-5  # Very low LR for instruction tuning
-    warmup_steps: int = 500
-    batch_size: int = 8
-    gradient_accumulation_steps: int = 8  # Effective batch = 64
-    num_workers: int = 4
-    weight_decay: float = 0.01
-    gradient_clip: float = 1.0
-
-    # Loss weights for Stage 3 - INSTRUCTION TUNING ONLY
-    lm_loss_weight: float = 1.0  # Primary objective
-    alignment_loss_weight: float = 0.0  # Disable alignment loss
-    contrastive_loss_weight: float = 0.0  # Disable contrastive
-    fine_grained_loss_weight: float = 0.0  # Disable fine-grained
-    skip_lm_loss: bool = False  # Enable LM forward pass
-
-    # Frozen components - only train language model + adapter
-    freeze_vision: bool = True  # Keep vision frozen
-    freeze_language: bool = False  # Unfreeze language for instruction tuning
-    freeze_adapter: bool = False  # Keep adapter trainable
-    unfreeze_last_n_layers: int = 8  # Unfreeze more layers for instruction tuning
-
-    # Quantization - DISABLED during training for checkpoint compatibility
-    # Post-training quantization will generate 4-bit, 3-bit, 1.58-bit variants
-    enable_quantization: bool = True
-    quantize_memory_158bit: bool = False  # DISABLED: Apply only post-training
-    quantize_vision_4bit: bool = False   # DISABLED: Keep FP32 for checkpoint compatibility
-    quantize_language_4bit: bool = False # DISABLED: Keep FP32 for checkpoint compatibility
-
-    # Stage 3 output directory
-    output_dir: str = "./checkpoints/stage3"
-    hf_repo_name: str = "MicroVLM-V-stage3-instruct"
-
-    # Early stopping for Stage 3
-    use_early_stopping: bool = True
-    early_stop_patience: int = 2  # Stop quickly if overfitting
-    early_stop_min_delta: float = 0.005
-
-    # Visualization
-    log_interval: int = 50
-    visualize_interval: int = 200
-    viz_save_interval: int = 2000
-
-    wandb_run_name: str = "stage3_instruct"
 
 
 @dataclass
@@ -364,6 +273,7 @@ class TestConfig(TrainingConfig):
     device: str = "cuda"
     train_metadata: str = "train_metadata.json"
     val_metadata: str = "val_metadata.json"
+    max_samples: int = 5000
 
 
 @dataclass
@@ -401,7 +311,7 @@ def load_config(config_name: str = "default") -> TrainingConfig:
     Load configuration by name
 
     Args:
-        config_name: One of ['stage1', 'stage2', 'stage3', 'test', 'full_quantized', 'default']
+        config_name: One of ['stage1', 'stage2', 'test', 'full_quantized', 'default']
 
     Returns:
         TrainingConfig instance
@@ -409,7 +319,6 @@ def load_config(config_name: str = "default") -> TrainingConfig:
     configs = {
         'stage1': Stage1Config,
         'stage2': Stage2Config,
-        'stage3': Stage3Config,
         'test': TestConfig,
         'full_quantized': FullQuantizedConfig,
         'default': TrainingConfig,

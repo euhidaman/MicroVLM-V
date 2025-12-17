@@ -325,6 +325,11 @@ class StagedTrainingConfig:
     quantize_vision_4bit: bool = False    # DeiT stays FP16 (only 23MB)
     quantize_memory_158bit: bool = False  # Optional 1.58-bit memory
     
+    # HuggingFace settings
+    hf_username: str = "euhidaman"  # Your HuggingFace username
+    hf_repo_name: str = "MicroVLM-V"  # Base repository name
+    output_dir: str = "checkpoints/stage2"  # Output directory for checkpoints
+
     # Carbon/Compute Tracking
     track_carbon: bool = True    # Track CO2 emissions via CodeCarbon
     track_flops: bool = True     # Track FLOPs computation
