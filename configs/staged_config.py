@@ -45,6 +45,11 @@ class BaseModelConfig:
     num_prefix_tokens: int = 25
     adapter_hidden_size: int = 512
 
+    # Base Model Quantization (DISABLED - causes errors, quantize post-training instead)
+    quantize_vision_4bit: bool = False  # Load DiET in FP32 during training
+    quantize_language_4bit: bool = False  # Load Qwen in FP32 during training
+    quantize_memory_158bit: bool = False  # Keep memory in FP32 during training
+
 
 @dataclass
 class FIBERConfig:
@@ -167,6 +172,12 @@ class Stage2Config:
     push_to_hf_on_stop: bool = True
     push_best_model_on_stop: bool = True  # Push best model as final commit
     hf_stage2_repo_name: str = "MicroVLM-V-stage2-final"
+
+    # Post-Training Quantization (applies AFTER best model selection)
+    apply_post_training_quantization: bool = True  # Generate quantized variants at end
+    quantization_bit_widths: List[float] = field(default_factory=lambda: [4, 3, 1.58])
+    evaluate_quantized_variants: bool = True  # Run evaluation on all variants
+    publish_quantized_variants: bool = True  # Push to HuggingFace
 
     # Frozen components
     freeze_vision_encoder: bool = True

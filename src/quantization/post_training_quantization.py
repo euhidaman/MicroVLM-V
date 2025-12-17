@@ -687,20 +687,21 @@ def estimate_model_size_3bit(model):
 def apply_quantization_to_trainable_components(
     model,
     bit_width: int,
-    skip_frozen: bool = True
+    skip_frozen: bool = False  # Changed default to False - quantize everything
 ) -> nn.Module:
     """
-    Apply quantization to trainable components only (not base models).
+    Apply quantization to ALL model components (entire best model).
 
-    Base models (Qwen + DiET) are already loaded in 4-bit and should not be re-quantized.
+    CRITICAL: This quantizes the ENTIRE model (Qwen + DiET + Trainable components)
+    to the target bit-width. We're not loading in 4-bit at startup anymore.
 
     Args:
-        model: Model with trainable components
+        model: Full model to quantize (all components)
         bit_width: Target bit width (4, 3, or 1.58)
-        skip_frozen: If True, skip frozen parameters (base models)
+        skip_frozen: If True, skip frozen parameters (SHOULD BE FALSE for post-training)
 
     Returns:
-        quantized_model: Model with quantized trainable components
+        quantized_model: Entire model quantized to target bit-width
     """
     # Create a deep copy to avoid modifying the original
     quantized_model = copy.deepcopy(model)
@@ -754,9 +755,11 @@ def apply_quantization_to_trainable_components(
 
             quantized_count += 1
 
-    print(f"   Quantized {quantized_count} trainable linear layers to {bit_width}-bit")
+    print(f"   ✅ Quantized {quantized_count} linear layers to {bit_width}-bit")
     if skip_frozen:
-        print(f"   Skipped {skipped_count} frozen layers (base models remain 4-bit)")
+        print(f"   ⚠️  Skipped {skipped_count} frozen layers")
+    else:
+        print(f"   ✅ Quantized ENTIRE MODEL (Qwen + DiET + Trainable) to {bit_width}-bit")
 
     return quantized_model
 
@@ -838,12 +841,12 @@ def generate_quantized_variants(
         model.load_state_dict(checkpoint['model_state_dict'])
         model.eval()
 
-        # Apply quantization to trainable components only
+        # Apply quantization to ALL components (entire model)
         if bit_width in [4, 3, 1.58]:
             quantized_model = apply_quantization_to_trainable_components(
                 model,
                 bit_width=bit_width,
-                skip_frozen=True
+                skip_frozen=False  # Quantize EVERYTHING (Qwen + DiET + Trainable)
             )
         else:
             raise ValueError(f"Unsupported bit width: {bit_width}")
