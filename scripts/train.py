@@ -1429,7 +1429,8 @@ def compute_gradient_flow_metrics(model):
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, wandb_run=None, wandb_logger=None,
                 is_distributed=False, is_main_process=True, carbon_tracker=None,
-                attention_monitor=None, sliding_window_stopper=None):
+                attention_monitor=None, sliding_window_stopper=None,
+                best_model_tracker=None):
     """Train for one epoch
     
     Args:
@@ -1448,6 +1449,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         carbon_tracker: CarbonComputeTracker for emissions/FLOPs tracking
         attention_monitor: AttentionQualityMonitor for tracking attention quality
         sliding_window_stopper: SlidingWindowEarlyStopping instance (optional)
+        best_model_tracker: BestStage2ModelTracker for tracking best model (optional)
     """
     model.train()
 
@@ -1732,14 +1734,56 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
 
-                # Sliding window early stopping metrics
+                # Sliding window early stopping metrics (comprehensive logging for debugging)
                 if sliding_window_stopper is not None:
                     sw_status = sliding_window_stopper.get_status()
                     wandb_logger.log_metrics({
+                        # Core metrics
                         'sliding_window/best_window_loss': sw_status['best_window_loss'],
                         'sliding_window/current_window_loss': sw_status['current_window_loss'],
                         'sliding_window/steps_without_improvement': sw_status['steps_without_improvement'],
+                        # New diagnostic metrics
+                        'sliding_window/consecutive_stagnant_windows': sw_status.get('consecutive_stagnant_windows', 0),
+                        'sliding_window/windows_until_stop': sw_status.get('windows_until_stop', 0),
+                        'sliding_window/total_windows_completed': sw_status.get('total_windows_completed', 0),
+                        'sliding_window/last_improvement_delta_pct': sw_status.get('last_improvement_delta', 0) * 100,
                     }, step=global_step)
+
+        # Best Model Tracking (main process only, every best_model_check_interval steps)
+        best_check_interval = getattr(config, 'best_model_check_interval', 100)
+        if is_main_process and best_model_tracker is not None and global_step % best_check_interval == 0:
+            # Compute gradient norm for stability tracking
+            total_grad_norm = 0.0
+            for p in model.parameters():
+                if p.grad is not None:
+                    total_grad_norm += p.grad.data.norm(2).item() ** 2
+            total_grad_norm = total_grad_norm ** 0.5
+
+            # Prepare metrics for best model tracking
+            best_tracker_metrics = {
+                'loss': loss.item(),
+                'gradient_norm': total_grad_norm,
+                'memory_kl': outputs.get('memory_kl', torch.tensor(0.0)).item() if isinstance(outputs.get('memory_kl'), torch.Tensor) else outputs.get('memory_kl', 0.0),
+                'alignment_loss': outputs.get('alignment_loss', torch.tensor(0.0)).item() if isinstance(outputs.get('alignment_loss'), torch.Tensor) else outputs.get('alignment_loss', 0.0),
+            }
+
+            # Update best model tracker
+            is_new_best = best_model_tracker.update(
+                model=model,
+                optimizer=optimizer,
+                step=global_step,
+                metrics=best_tracker_metrics
+            )
+
+            # Log best model metrics to wandb
+            if wandb_logger:
+                best_info = best_model_tracker.get_best_info()
+                wandb_logger.log_metrics({
+                    'best_model/best_score': best_info['score'],
+                    'best_model/best_step': best_info['step'],
+                    'best_model/current_score': -best_tracker_metrics['loss'],
+                    'best_model/is_new_best': 1.0 if is_new_best else 0.0,
+                }, step=global_step)
 
             # Legacy simple logging (fallback)
             elif wandb_run:
@@ -2062,6 +2106,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         # ===== Sliding Window Early Stopping =====
         # Check sliding window early stopping after each batch
+        # Note: The stopper only evaluates at window boundaries (non-overlapping)
         if sliding_window_stopper is not None and is_main_process:
             should_stop = sliding_window_stopper.add_loss(loss.item(), global_step)
             if should_stop:
@@ -2077,6 +2122,11 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         'early_stopping/best_window_loss': stopper_status['best_window_loss'],
                         'early_stopping/current_window_loss': stopper_status['current_window_loss'],
                         'early_stopping/steps_without_improvement': stopper_status['steps_without_improvement'],
+                        # New detailed metrics
+                        'early_stopping/consecutive_stagnant_windows': stopper_status.get('consecutive_stagnant_windows', 0),
+                        'early_stopping/total_windows_completed': stopper_status.get('total_windows_completed', 0),
+                        'early_stopping/last_improvement_delta_pct': stopper_status.get('last_improvement_delta', 0) * 100,
+                        'early_stopping/relative_threshold_pct': stopper_status.get('relative_threshold', 0.02) * 100,
                     }, step=global_step)
 
                 # Return with sliding window stop signal
@@ -2749,21 +2799,55 @@ def main():
             print(f"\n📉 Early Stopping: patience={loss_early_stopper.patience}, min_delta={loss_early_stopper.min_delta}")
 
     # Initialize sliding window early stopping (for step-based early stopping)
+    # Uses NON-OVERLAPPING windows for robust plateau detection
     sliding_window_stopper = None
     use_sliding_window = getattr(config, 'use_sliding_window_early_stop', False)
     if use_sliding_window:
+        # Get new-style parameters with fallback to legacy names for backward compatibility
+        window_size = getattr(config, 'sliding_window_size', 500)
+        min_delta = getattr(config, 'sliding_window_min_delta', 0.02)  # 2% relative improvement
+        hysteresis = getattr(config, 'sliding_window_hysteresis', 0.005)
+        ema_alpha = getattr(config, 'sliding_window_ema_alpha', 0.1)
+
+        # Support both patience_windows (new) and patience_steps (legacy)
+        # If patience_windows is set, use it directly; otherwise convert from patience_steps
+        patience_windows = getattr(config, 'sliding_window_patience_windows', None)
+        if patience_windows is None:
+            patience_steps = getattr(config, 'sliding_window_patience_steps', 2500)
+            patience_windows = max(1, patience_steps // window_size)
+
         sliding_window_stopper = SlidingWindowEarlyStopping(
-            window_size=getattr(config, 'sliding_window_size', 300),
-            min_delta=getattr(config, 'sliding_window_min_delta', 0.002),
-            patience_steps=getattr(config, 'sliding_window_patience_steps', 3000),
-            verbose=is_main_process
+            window_size=window_size,
+            min_delta=min_delta,
+            patience_windows=patience_windows,
+            verbose=is_main_process,
+            hysteresis=hysteresis,
+            ema_alpha=ema_alpha
         )
         if is_main_process:
-            print(f"\n🪟 Sliding Window Early Stopping:")
-            print(f"   Window size: {sliding_window_stopper.window_size} steps")
-            print(f"   Min delta: {sliding_window_stopper.min_delta}")
-            print(f"   Patience: {sliding_window_stopper.patience_steps} steps")
+            print(f"\n🪟 Sliding Window Early Stopping (Non-Overlapping Design):")
+            print(f"   Window size: {sliding_window_stopper.window_size} steps (non-overlapping)")
+            print(f"   Min delta: {sliding_window_stopper.min_delta*100:.1f}% relative improvement")
+            print(f"   Patience: {sliding_window_stopper.patience_windows} consecutive stagnant windows")
+            print(f"   Hysteresis: {sliding_window_stopper.hysteresis*100:.2f}% (prevents noise resets)")
+            print(f"   Effective patience: ~{sliding_window_stopper.patience_windows * sliding_window_stopper.window_size} steps")
             print(f"   Auto-push to HF: {getattr(config, 'push_to_hf_on_stop', True)}")
+
+    # Initialize Best Stage 2 Model Tracker
+    # Tracks the best model during training and saves checkpoints
+    best_model_tracker = None
+    use_best_tracker = getattr(config, 'track_best_model', True)
+    best_check_interval = getattr(config, 'best_model_check_interval', 100)
+
+    if use_best_tracker and is_main_process:
+        best_model_tracker = BestStage2ModelTracker(
+            output_dir=config.output_dir,
+            config=config,
+            verbose=True
+        )
+        print(f"\n⭐ Best Stage 2 Model Tracking:")
+        print(f"   Check interval: {best_check_interval} steps")
+        print(f"   Checkpoint: {config.output_dir}/checkpoints/best-stage2-checkpoint.pt")
 
     # Training loop
     if is_main_process:
@@ -2794,7 +2878,8 @@ def main():
             is_main_process=is_main_process,
             carbon_tracker=carbon_tracker,
             attention_monitor=attention_monitor,
-            sliding_window_stopper=sliding_window_stopper
+            sliding_window_stopper=sliding_window_stopper,
+            best_model_tracker=best_model_tracker
         )
 
         # Unpack results (handle both old and new formats)
@@ -2817,8 +2902,12 @@ def main():
                 elif stop_reason == 'sliding_window_plateau':
                     print("   Reason: Sliding window plateau - no meaningful training loss improvement")
                     if stopper_status:
-                        print(f"   Best window loss: {stopper_status['best_window_loss']:.4f}")
-                        print(f"   Steps without improvement: {stopper_status['steps_without_improvement']}")
+                        print(f"   Best window loss: {stopper_status['best_window_loss']:.6f}")
+                        print(f"   Current window loss: {stopper_status['current_window_loss']:.6f}")
+                        print(f"   Consecutive stagnant windows: {stopper_status.get('consecutive_stagnant_windows', 'N/A')}")
+                        print(f"   Total windows evaluated: {stopper_status.get('total_windows_completed', 'N/A')}")
+                        print(f"   Last improvement delta: {stopper_status.get('last_improvement_delta', 0)*100:.3f}%")
+                        print(f"   Improvement threshold: {stopper_status.get('relative_threshold', 0.02)*100:.1f}%")
                 else:
                     print(f"   Reason: {stop_reason}")
                 print("   Saving final checkpoint before exit...")
@@ -2956,6 +3045,68 @@ def main():
         base_model = model.module if hasattr(model, 'module') else model
         base_model.save_checkpoint(str(final_path))
         print(f"Training complete! Final model saved to {final_path}")
+
+        # ============================================================
+        # POST-TRAINING QUANTIZATION (FINAL STEP)
+        # ============================================================
+        # Generate quantized variants (4-bit, 3-bit, 1.58-bit) from best model
+        # and push to HuggingFace if enabled
+        if getattr(config, 'apply_post_training_quantization', True):
+            print("\n" + "="*70)
+            print("🔧 RUNNING POST-TRAINING QUANTIZATION")
+            print("="*70)
+
+            # Find the best checkpoint to quantize
+            best_checkpoint_path = str(final_path)
+            best_stage2_path = Path(config.output_dir) / "checkpoints" / "best-stage2-checkpoint.pt"
+            if best_stage2_path.exists():
+                best_checkpoint_path = str(best_stage2_path)
+                print(f"📦 Using best Stage 2 checkpoint: {best_checkpoint_path}")
+            else:
+                print(f"📦 Using final checkpoint: {best_checkpoint_path}")
+
+            # Get model statistics for push
+            stats = get_model_statistics(model)
+
+            # Push to HF with quantization
+            success = push_stage2_final_to_hf(
+                checkpoint_path=best_checkpoint_path,
+                config=config,
+                early_stop_metrics=None,
+                training_history=training_history,
+                model_statistics=stats
+            )
+            if success:
+                print("✅ Post-training quantization and HuggingFace upload completed!")
+            else:
+                print("⚠️  Post-training quantization/upload had issues - check logs above")
+        else:
+            print("\n⚠️  Post-training quantization disabled in config")
+
+        # Print Best Model Information
+        if best_model_tracker is not None:
+            best_info = best_model_tracker.get_best_info()
+            print(f"\n⭐ Best Stage 2 Model Information:")
+            print(f"   Checkpoint: {best_info['path']}")
+            print(f"   Step: {best_info['step']}")
+            print(f"   Score: {best_info['score']:.6f}")
+            if best_info['metrics']:
+                print(f"   Best Metrics:")
+                for k, v in best_info['metrics'].items():
+                    print(f"     {k}: {v:.6f}")
+
+            # Log best model info to wandb
+            if wandb_run:
+                wandb_run.summary["best_model_step"] = best_info['step']
+                wandb_run.summary["best_model_score"] = best_info['score']
+                if best_info['metrics']:
+                    for k, v in best_info['metrics'].items():
+                        wandb_run.summary[f"best_model_{k}"] = v
+
+            # Note: The best checkpoint at best_info['path'] should be used for
+            # HuggingFace upload and post-training quantization, not the final model
+            print(f"\n📦 For deployment, use the best checkpoint at:")
+            print(f"   {best_info['path']}")
 
         if wandb_run:
             wandb_run.summary["actual_epochs"] = actual_epochs

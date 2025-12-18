@@ -243,6 +243,15 @@ class Stage2Config(TrainingConfig):
     early_stop_patience: int = 3  # More patience for memory learning
     early_stop_min_delta: float = 0.005  # Smaller delta for finer convergence
 
+    # Best model tracking
+    track_best_model: bool = True  # Track and save best model during training
+    best_model_check_interval: int = 100  # Check for best model every N steps
+
+    # Post-training quantization (generates 4-bit, 3-bit, 1.58-bit variants at end)
+    apply_post_training_quantization: bool = True  # Generate quantized variants when training ends
+    quantization_bit_widths: list = None  # Will default to [4, 3, 1.58] if None
+    push_to_hf_on_stop: bool = True  # Auto-push quantized variants to HuggingFace
+
     # Visualization
     visualize_interval: int = 100
     viz_save_interval: int = 5000
