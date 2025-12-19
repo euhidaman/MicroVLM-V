@@ -105,35 +105,48 @@ class SlidingWindowEarlyStopping:
     2. Compares window averages (not individual steps) to smooth out noise
     3. Patience is measured in WINDOWS, not steps, for more robust plateau detection
     4. Only triggers after seeing multiple consecutive plateau windows
+    5. GLOBAL BEST TRACKING: Maintains the absolute best loss across all windows
+    6. AUTO-SAVE: Automatically saves and pushes best model when new best is found
+    7. DECOUPLED SAVING: Best model saving is independent from early stopping
 
-    Example with window_size=500, patience_windows=4:
-    - Window 0 (steps 0-499): avg_loss = 2.1
-    - Window 1 (steps 500-999): avg_loss = 1.8 -> improvement, reset patience
-    - Window 2 (steps 1000-1499): avg_loss = 1.55 -> improvement, reset patience
-    - Window 3 (steps 1500-1999): avg_loss = 1.52 -> delta=0.03 < 0.05, patience=1
-    - Window 4 (steps 2000-2499): avg_loss = 1.50 -> delta=0.02 < 0.05, patience=2
-    - Window 5 (steps 2500-2999): avg_loss = 1.49 -> delta=0.01 < 0.05, patience=3
-    - Window 6 (steps 3000-3499): avg_loss = 1.48 -> delta=0.01 < 0.05, patience=4 -> STOP
+    Example with window_size=2000, patience_windows=3:
+    - Window 0 (steps 0-1999): avg_loss = 2.1 -> NEW BEST, save checkpoint
+    - Window 1 (steps 2000-3999): avg_loss = 1.8 -> NEW BEST, save checkpoint
+    - Window 2 (steps 4000-5999): avg_loss = 1.55 -> NEW BEST, save checkpoint
+    - Window 3 (steps 6000-7999): avg_loss = 1.52 -> delta=0.03 < 0.05, patience=1
+    - Window 4 (steps 8000-9999): avg_loss = 1.50 -> delta=0.02 < 0.05, patience=2
+    - Window 5 (steps 10000-11999): avg_loss = 1.49 -> delta=0.01 < 0.05, patience=3 -> STOP
     """
 
-    def __init__(self, window_size=500, min_delta=0.05, patience_windows=4, verbose=True):
+    def __init__(self, window_size=2000, min_delta=0.05, patience_windows=3, verbose=True,
+                 on_new_best_callback=None, wandb_logger=None):
         """
         Args:
             window_size: Number of steps per window (non-overlapping)
             min_delta: Minimum loss improvement between windows to count as progress
             patience_windows: Number of windows without improvement before stopping
             verbose: Print debug information
+            on_new_best_callback: Callback function(best_loss, step, window_idx) called when new best is found
+            wandb_logger: WandB logger for metrics logging
         """
         self.window_size = window_size
         self.min_delta = min_delta
         self.patience_windows = patience_windows
         self.verbose = verbose
+        self.on_new_best_callback = on_new_best_callback
+        self.wandb_logger = wandb_logger
 
         # Current window tracking
         self.current_window_losses = []  # Losses in current window
         self.current_window_start_step = 0
 
-        # Best tracking (across all completed windows)
+        # GLOBAL BEST TRACKING (persistent across all windows)
+        # This is the absolute minimum loss ever observed
+        self.best_loss = float('inf')
+        self.best_loss_step = 0
+        self.best_loss_window_idx = -1
+
+        # Best window average tracking (for patience/early stopping)
         self.best_window_avg = float('inf')
         self.best_window_step = 0
 
@@ -142,6 +155,42 @@ class SlidingWindowEarlyStopping:
 
         # History for debugging
         self.window_history = []  # List of (window_idx, avg_loss, step_range)
+
+        # Track if we found a new best this window (for callbacks)
+        self._new_best_this_window = False
+        self._pushed_to_hf = False
+
+    def restore_state(self, state_dict):
+        """
+        Restore state from checkpoint for resume training.
+
+        Args:
+            state_dict: Dictionary with saved state
+        """
+        self.best_loss = state_dict.get('best_loss', float('inf'))
+        self.best_loss_step = state_dict.get('best_loss_step', 0)
+        self.best_loss_window_idx = state_dict.get('best_loss_window_idx', -1)
+        self.best_window_avg = state_dict.get('best_window_avg', float('inf'))
+        self.best_window_step = state_dict.get('best_window_step', 0)
+        self.windows_without_improvement = state_dict.get('windows_without_improvement', 0)
+        self.window_history = state_dict.get('window_history', [])
+        self.current_window_start_step = state_dict.get('current_window_start_step', 0)
+
+        if self.verbose:
+            print(f"  [SlidingWindow] Restored state: best_loss={self.best_loss:.4f} at step {self.best_loss_step}")
+
+    def get_state_dict(self):
+        """Get state dict for checkpointing."""
+        return {
+            'best_loss': self.best_loss,
+            'best_loss_step': self.best_loss_step,
+            'best_loss_window_idx': self.best_loss_window_idx,
+            'best_window_avg': self.best_window_avg,
+            'best_window_step': self.best_window_step,
+            'windows_without_improvement': self.windows_without_improvement,
+            'window_history': self.window_history,
+            'current_window_start_step': self.current_window_start_step,
+        }
 
     def add_loss(self, loss, global_step):
         """
@@ -167,6 +216,14 @@ class SlidingWindowEarlyStopping:
         """
         Evaluate completed window and update state.
 
+        This method:
+        1. Computes window average loss
+        2. Checks if this is a new GLOBAL BEST (lowest loss ever)
+        3. Checks if there's meaningful improvement for patience tracking
+        4. Logs comprehensive metrics to W&B
+        5. Triggers callback if new best found
+        6. Returns True if early stopping should trigger
+
         Returns:
             bool: True if training should stop
         """
@@ -175,36 +232,100 @@ class SlidingWindowEarlyStopping:
         window_idx = len(self.window_history)
         step_range = (self.current_window_start_step, global_step)
 
-        # Record window history
+        # Reset tracking flags
+        self._new_best_this_window = False
+        self._pushed_to_hf = False
+
+        # ===== GLOBAL BEST LOSS TRACKING =====
+        # Check if this is the absolute lowest loss ever observed
+        # This is INDEPENDENT from patience tracking
+        delta_from_best = self.best_loss - window_avg
+        is_new_global_best = window_avg < self.best_loss
+
+        if is_new_global_best:
+            old_best = self.best_loss
+            self.best_loss = window_avg
+            self.best_loss_step = global_step
+            self.best_loss_window_idx = window_idx
+            self._new_best_this_window = True
+
+            if self.verbose:
+                print(f"\n  🏆 [SlidingWindow] NEW GLOBAL BEST LOSS!")
+                print(f"     Previous best: {old_best:.4f}")
+                print(f"     New best: {window_avg:.4f} (improvement: {old_best - window_avg:.4f})")
+                print(f"     Step: {global_step}, Window: {window_idx}")
+
+        # ===== PATIENCE TRACKING =====
+        # Check for MEANINGFUL improvement (>= min_delta) for patience
+        improvement = self.best_window_avg - window_avg
+        improved_for_patience = improvement >= self.min_delta
+
+        # Record window history with all metrics
         self.window_history.append({
             'window_idx': window_idx,
             'avg_loss': window_avg,
             'step_range': step_range,
-            'num_samples': len(self.current_window_losses)
+            'num_samples': len(self.current_window_losses),
+            'is_new_best': is_new_global_best,
+            'delta_from_best': delta_from_best,
+            'improvement': improvement,
+            'patience_counter': self.windows_without_improvement,
         })
-
-        # Check for improvement
-        improvement = self.best_window_avg - window_avg
-        improved = improvement >= self.min_delta
 
         if self.verbose:
             print(f"\n  [SlidingWindow] Window {window_idx} complete (steps {step_range[0]}-{step_range[1]})")
             print(f"    Window avg loss: {window_avg:.4f}")
+            print(f"    Global best loss: {self.best_loss:.4f} (delta: {delta_from_best:.4f})")
             print(f"    Best window avg: {self.best_window_avg:.4f}")
             print(f"    Improvement: {improvement:.4f} (threshold: {self.min_delta})")
+            print(f"    Is new global best: {is_new_global_best}")
 
-        if improved:
-            # Meaningful improvement - update best and reset patience
+        # ===== LOG TO WANDB =====
+        if self.wandb_logger:
+            self.wandb_logger.log_metrics({
+                'sliding_window/window_idx': window_idx,
+                'sliding_window/window_avg_loss': window_avg,
+                'sliding_window/global_best_loss': self.best_loss,
+                'sliding_window/delta_from_best': delta_from_best,
+                'sliding_window/patience_counter': self.windows_without_improvement,
+                'sliding_window/is_new_best': float(is_new_global_best),
+                'sliding_window/pushed_to_hf': 0.0,  # Will update if pushed
+                'sliding_window/improvement': improvement,
+                'sliding_window/min_delta_threshold': self.min_delta,
+            }, step=global_step)
+
+        # ===== TRIGGER CALLBACK FOR NEW BEST =====
+        if is_new_global_best and self.on_new_best_callback is not None:
+            try:
+                callback_result = self.on_new_best_callback(
+                    best_loss=self.best_loss,
+                    step=global_step,
+                    window_idx=window_idx
+                )
+                self._pushed_to_hf = callback_result if callback_result is not None else False
+
+                # Update W&B with push status
+                if self.wandb_logger and self._pushed_to_hf:
+                    self.wandb_logger.log_metrics({
+                        'sliding_window/pushed_to_hf': 1.0,
+                    }, step=global_step)
+
+            except Exception as e:
+                print(f"  ⚠️ [SlidingWindow] Callback error: {e}")
+
+        # ===== UPDATE PATIENCE =====
+        if improved_for_patience:
+            # Meaningful improvement - update best window avg and reset patience
             self.best_window_avg = window_avg
             self.best_window_step = global_step
             self.windows_without_improvement = 0
             if self.verbose:
-                print(f"    ✓ Improvement detected! Patience reset to 0")
+                print(f"    ✓ Meaningful improvement detected! Patience reset to 0")
         else:
             # No meaningful improvement - increment patience
             self.windows_without_improvement += 1
             if self.verbose:
-                print(f"    ✗ No meaningful improvement. Patience: {self.windows_without_improvement}/{self.patience_windows}")
+                print(f"    ✗ No meaningful improvement (< {self.min_delta}). Patience: {self.windows_without_improvement}/{self.patience_windows}")
 
         # Reset for next window
         self.current_window_losses = []
@@ -215,9 +336,10 @@ class SlidingWindowEarlyStopping:
             if self.verbose:
                 print(f"\n🛑 SLIDING WINDOW EARLY STOPPING TRIGGERED")
                 print(f"   No meaningful improvement (Δ >= {self.min_delta}) for {self.patience_windows} consecutive windows")
-                print(f"   Best window loss: {self.best_window_avg:.4f} at step {self.best_window_step}")
+                print(f"   Global best loss: {self.best_loss:.4f} at step {self.best_loss_step}")
                 print(f"   Current window loss: {window_avg:.4f}")
                 print(f"   Training stopped at step {global_step}")
+                print(f"   Best model should have been saved at step {self.best_loss_step}")
             return True
 
         return False
@@ -230,11 +352,18 @@ class SlidingWindowEarlyStopping:
             current_partial_avg = sum(self.current_window_losses) / len(self.current_window_losses)
 
         return {
+            # Global best tracking
+            'best_loss': self.best_loss,
+            'best_loss_step': self.best_loss_step,
+            'best_loss_window_idx': self.best_loss_window_idx,
+            # Window-level tracking
             'best_window_loss': self.best_window_avg,
             'best_window_step': self.best_window_step,
             'current_window_loss': current_partial_avg if current_partial_avg else self.best_window_avg,
+            # Patience tracking
             'windows_without_improvement': self.windows_without_improvement,
             'steps_without_improvement': self.windows_without_improvement * self.window_size,
+            # Meta
             'total_windows_completed': len(self.window_history),
             'current_window_progress': len(self.current_window_losses),
             'window_size': self.window_size,
@@ -245,9 +374,11 @@ class SlidingWindowEarlyStopping:
     def get_best_model_info(self):
         """Get information about when the best loss was achieved"""
         return {
-            'best_loss': self.best_window_avg,
-            'best_step': self.best_window_step,
+            'best_loss': self.best_loss,
+            'best_step': self.best_loss_step,
+            'best_window_idx': self.best_loss_window_idx,
             'windows_completed': len(self.window_history),
+            'best_window_avg': self.best_window_avg,
         }
 
 
@@ -492,7 +623,149 @@ def push_checkpoint_to_hf(checkpoint_path, global_step, config, checkpoint_type=
         )
         print(f"   ✅ Uploaded to https://huggingface.co/{repo_id}")
         return True
-        
+
+    except Exception as e:
+        print(f"   ⚠️ HuggingFace upload failed: {e}")
+        return False
+
+
+def save_best_loss_checkpoint(model, optimizer, global_step, config, best_loss, stage_name="stage2", wandb_logger=None):
+    """
+    Save and push the best model checkpoint when a new lowest loss is found.
+
+    This function is called by the SlidingWindowEarlyStopping callback when a new
+    global best loss is detected. It saves the checkpoint locally and pushes to HF.
+
+    Args:
+        model: The model to save (may be DDP wrapped)
+        optimizer: The optimizer
+        global_step: Current training step
+        config: Training configuration
+        best_loss: The new best loss value
+        stage_name: Name of training stage
+        wandb_logger: Optional WandB logger for metrics
+
+    Returns:
+        bool: True if successfully pushed to HuggingFace
+    """
+    checkpoint_dir = Path(config.output_dir) / "checkpoints" / "best"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Save checkpoint
+    checkpoint_path = checkpoint_dir / f"best-loss-checkpoint.pt"
+
+    # Get model statistics
+    stats = get_model_statistics(model, config)
+
+    torch.save({
+        'global_step': global_step,
+        'best_loss': best_loss,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'config': vars(config),
+        'stage_name': stage_name,
+        'model_statistics': stats,
+        'alignment_mode': getattr(config, 'alignment_mode', 'baseline'),
+        'timestamp': datetime.now().isoformat(),
+    }, checkpoint_path)
+
+    print(f"\n🏆 Best model checkpoint saved: {checkpoint_path}")
+    print(f"   Loss: {best_loss:.4f}")
+    print(f"   Step: {global_step}")
+
+    # Push to HuggingFace
+    pushed = push_best_loss_to_hf(checkpoint_path, global_step, config, best_loss, stats)
+
+    # Log to WandB
+    if wandb_logger:
+        wandb_logger.log_metrics({
+            'best_model/loss': best_loss,
+            'best_model/step': global_step,
+            'best_model/pushed_to_hf': float(pushed),
+        }, step=global_step)
+
+    return pushed
+
+
+def push_best_loss_to_hf(checkpoint_path, global_step, config, best_loss, stats=None):
+    """
+    Push the best-loss checkpoint to HuggingFace Hub.
+
+    Args:
+        checkpoint_path: Path to the checkpoint file
+        global_step: Training step when best was achieved
+        config: Training config with HF settings
+        best_loss: The best loss value
+        stats: Optional model statistics
+
+    Returns:
+        bool: True if upload succeeded
+    """
+    try:
+        # Get HF token
+        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+        if not hf_token:
+            try:
+                from huggingface_hub import HfFolder
+                hf_token = HfFolder.get_token()
+            except:
+                pass
+
+        if not hf_token:
+            print("   ⚠️ No HF token - skipping HuggingFace upload")
+            return False
+
+        # Get repo config
+        repo_name = getattr(config, 'hf_repo_name', 'MicroVLM-V')
+        username = getattr(config, 'hf_username', 'euhidaman')
+        repo_id = f"{username}/{repo_name}"
+
+        api = HfApi()
+
+        # Ensure repo exists
+        try:
+            api.create_repo(repo_id=repo_id, token=hf_token, exist_ok=True, repo_type="model")
+        except Exception:
+            pass  # Repo likely exists
+
+        # Upload checkpoint
+        checkpoint_name = Path(checkpoint_path).name
+        path_in_repo = f"checkpoints/best-loss/{checkpoint_name}"
+        commit_msg = f"Best loss checkpoint (step {global_step}, loss={best_loss:.4f})"
+
+        print(f"   🤗 Uploading best model to HuggingFace: {path_in_repo}")
+        api.upload_file(
+            path_or_fileobj=str(checkpoint_path),
+            path_in_repo=path_in_repo,
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_msg,
+            token=hf_token
+        )
+
+        # Also upload a metadata file
+        metadata = {
+            'best_loss': best_loss,
+            'step': global_step,
+            'timestamp': datetime.now().isoformat(),
+            'model_statistics': stats,
+        }
+        metadata_path = Path(checkpoint_path).parent / "best_model_metadata.json"
+        with open(metadata_path, 'w') as f:
+            json.dump(metadata, f, indent=2, default=str)
+
+        api.upload_file(
+            path_or_fileobj=str(metadata_path),
+            path_in_repo="checkpoints/best-loss/metadata.json",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=f"Best model metadata (loss={best_loss:.4f})",
+            token=hf_token
+        )
+
+        print(f"   ✅ Best model uploaded to https://huggingface.co/{repo_id}")
+        return True
+
     except Exception as e:
         print(f"   ⚠️ HuggingFace upload failed: {e}")
         return False
@@ -1728,13 +2001,20 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
 
-                # Sliding window early stopping metrics
+                # Sliding window early stopping metrics (enhanced)
                 if sliding_window_stopper is not None:
                     sw_status = sliding_window_stopper.get_status()
                     wandb_logger.log_metrics({
+                        # Global best tracking
+                        'sliding_window/global_best_loss': sw_status.get('best_loss', float('inf')),
+                        'sliding_window/global_best_step': sw_status.get('best_loss_step', 0),
+                        # Window-level tracking
                         'sliding_window/best_window_loss': sw_status['best_window_loss'],
                         'sliding_window/current_window_loss': sw_status['current_window_loss'],
+                        # Patience tracking
                         'sliding_window/steps_without_improvement': sw_status['steps_without_improvement'],
+                        'sliding_window/windows_without_improvement': sw_status['windows_without_improvement'],
+                        'sliding_window/windows_completed': sw_status['total_windows_completed'],
                     }, step=global_step)
 
             # Legacy simple logging (fallback)
@@ -2456,11 +2736,11 @@ def main():
             'itc_weight': args.itc_weight,
             'itm_weight': args.itm_weight,
         }
-        
+
         # Get quantization flags from config (default: 4-bit for language model)
         quantize_4bit = getattr(config, 'quantize_language_4bit', True)
         quantize_memory_158bit = getattr(config, 'quantize_memory_158bit', False)
-        
+
         # Debug: Print critical dimensions before model creation
         if is_main_process:
             dims = model_config['model_dimensions']
@@ -2748,17 +3028,49 @@ def main():
     sliding_window_stopper = None
     use_sliding_window = getattr(config, 'use_sliding_window_early_stop', False)
     if use_sliding_window:
+        # Create callback for saving best model when new lowest loss is found
+        def on_new_best_loss_callback(best_loss, step, window_idx):
+            """Callback triggered when SlidingWindowEarlyStopping finds a new lowest loss."""
+            if not is_main_process:
+                return False
+
+            print(f"\n📊 [Callback] New best loss detected: {best_loss:.4f} at step {step}")
+
+            # Save and push best model checkpoint
+            pushed = save_best_loss_checkpoint(
+                model=model,
+                optimizer=optimizer,
+                global_step=step,
+                config=config,
+                best_loss=best_loss,
+                stage_name=getattr(config, 'stage_name', args.config),
+                wandb_logger=wandb_logger
+            )
+
+            return pushed
+
         sliding_window_stopper = SlidingWindowEarlyStopping(
             window_size=getattr(config, 'sliding_window_size', 2000),
             min_delta=getattr(config, 'sliding_window_min_delta', 0.05),
             patience_windows=getattr(config, 'sliding_window_patience_windows', 3),
-            verbose=is_main_process
+            verbose=is_main_process,
+            on_new_best_callback=on_new_best_loss_callback if is_main_process else None,
+            wandb_logger=wandb_logger
         )
+
+        # Restore state from checkpoint if resuming
+        if args.resume and 'sliding_window_state' in checkpoint:
+            sliding_window_stopper.restore_state(checkpoint['sliding_window_state'])
+            if is_main_process:
+                print(f"   ✓ Restored sliding window state: best_loss={sliding_window_stopper.best_loss:.4f}")
+
         if is_main_process:
-            print(f"\n🪟 Sliding Window Early Stopping:")
+            print(f"\n🪟 Sliding Window Early Stopping (Enhanced):")
             print(f"   Window size: {sliding_window_stopper.window_size} steps")
             print(f"   Min delta: {sliding_window_stopper.min_delta}")
             print(f"   Patience: {sliding_window_stopper.patience_windows} windows ({sliding_window_stopper.patience_windows * sliding_window_stopper.window_size} steps)")
+            print(f"   Auto-save best model: ✓")
+            print(f"   Auto-push to HF: {getattr(config, 'push_to_hf_on_stop', True)}")
             print(f"   Auto-push to HF: {getattr(config, 'push_to_hf_on_stop', True)}")
 
     # Training loop
@@ -2813,8 +3125,10 @@ def main():
                 elif stop_reason == 'sliding_window_plateau':
                     print("   Reason: Sliding window plateau - no meaningful training loss improvement")
                     if stopper_status:
+                        print(f"   Global best loss: {stopper_status.get('best_loss', 'N/A'):.4f} at step {stopper_status.get('best_loss_step', 'N/A')}")
                         print(f"   Best window loss: {stopper_status['best_window_loss']:.4f}")
                         print(f"   Steps without improvement: {stopper_status['steps_without_improvement']}")
+                        print(f"   ✓ Best model was saved at step {stopper_status.get('best_loss_step', 'N/A')}")
                 else:
                     print(f"   Reason: {stop_reason}")
                 print("   Saving final checkpoint before exit...")
