@@ -238,10 +238,19 @@ class Stage2Config(TrainingConfig):
     output_dir: str = "./checkpoints/stage2"
     hf_repo_name: str = "MicroVLM-V-stage2"
 
-    # Early stopping for Stage 2 (loss-based)
+    # Early stopping for Stage 2 (loss-based, epoch-level)
     use_early_stopping: bool = True
     early_stop_patience: int = 3  # More patience for memory learning
     early_stop_min_delta: float = 0.005  # Smaller delta for finer convergence
+
+    # ===== SLIDING WINDOW EARLY STOPPING (step-based, robust plateau detection) =====
+    # Uses rolling window to compute loss average, checks every step
+    use_sliding_window_early_stop: bool = True  # Enable step-based early stopping
+    sliding_window_size: int = 2000  # Steps per window (rolling window of recent losses)
+    sliding_window_min_delta: float = 0.05  # Loss must improve by at least 0.05 to count as progress
+    sliding_window_patience_windows: int = 3  # Stop after 3 windows without improvement (6000 steps)
+    sliding_window_hysteresis: float = 0.005  # Extra threshold to reset patience (unused in current impl)
+    sliding_window_ema_alpha: float = 0.1  # EMA smoothing for noise reduction (unused in current impl)
 
     # Best model tracking
     track_best_model: bool = True  # Track and save best model during training
