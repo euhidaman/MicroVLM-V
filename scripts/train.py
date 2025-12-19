@@ -16,7 +16,6 @@ from src.models import create_microvlm, create_microvlm_fiber, MicroVLMFIBER
 import os
 import sys
 import json
-import random
 from datetime import datetime
 import math
 import torch
@@ -33,13 +32,6 @@ from huggingface_hub import HfApi, create_repo, upload_file
 
 # Add parent directory to path
 sys.path.insert(0, str(Path(__file__).parent.parent))
-
-# Import post-training quantization module
-from src.quantization.post_training_quantization import (
-    generate_quantized_variants,
-    publish_quantized_variants_to_hf,
-    QuantizationEvaluator
-)
 
 
 class EarlyStopping:
@@ -103,216 +95,159 @@ class EarlyStopping:
 
 class SlidingWindowEarlyStopping:
     """
-    STEP-WISE sliding window early stopping with robust plateau detection.
+    Step-wise sliding window early stopping based on training loss plateau detection.
 
-    Key Design Principles:
-    1. ROLLING WINDOW: Checks every step with a sliding window of recent losses
-    2. ABSOLUTE improvement threshold: Uses min_delta for loss improvement
-    3. NOISE-RESISTANT: Uses window average to smooth out step-to-step noise
-    4. PATIENCE in STEPS: Counts consecutive steps without meaningful improvement
+    This is designed to detect when training loss has truly plateaued by comparing
+    NON-OVERLAPPING windows of losses instead of step-by-step comparisons.
 
-    The window slides by 1 step each time, computing the average of the last
-    `window_size` loss values. Early stopping triggers when there's no improvement
-    of at least `min_delta` for `patience_steps` consecutive steps.
+    Key design decisions to avoid false triggers due to noise:
+    1. Uses non-overlapping windows to prevent artificial "improvements" from window overlap
+    2. Compares window averages (not individual steps) to smooth out noise
+    3. Patience is measured in WINDOWS, not steps, for more robust plateau detection
+    4. Only triggers after seeing multiple consecutive plateau windows
+
+    Example with window_size=500, patience_windows=4:
+    - Window 0 (steps 0-499): avg_loss = 2.1
+    - Window 1 (steps 500-999): avg_loss = 1.8 -> improvement, reset patience
+    - Window 2 (steps 1000-1499): avg_loss = 1.55 -> improvement, reset patience
+    - Window 3 (steps 1500-1999): avg_loss = 1.52 -> delta=0.03 < 0.05, patience=1
+    - Window 4 (steps 2000-2499): avg_loss = 1.50 -> delta=0.02 < 0.05, patience=2
+    - Window 5 (steps 2500-2999): avg_loss = 1.49 -> delta=0.01 < 0.05, patience=3
+    - Window 6 (steps 3000-3499): avg_loss = 1.48 -> delta=0.01 < 0.05, patience=4 -> STOP
     """
 
-    def __init__(self, window_size=1000, min_delta=0.05, patience_steps=3000,
-                 verbose=True):
+    def __init__(self, window_size=500, min_delta=0.05, patience_windows=4, verbose=True):
         """
         Args:
-            window_size: Number of recent losses to average (rolling window)
-            min_delta: Minimum ABSOLUTE improvement in window average to count as progress
-            patience_steps: Number of consecutive steps without improvement before stopping
-            verbose: Print status messages
+            window_size: Number of steps per window (non-overlapping)
+            min_delta: Minimum loss improvement between windows to count as progress
+            patience_windows: Number of windows without improvement before stopping
+            verbose: Print debug information
         """
         self.window_size = window_size
-        self.min_delta = min_delta  # Absolute improvement threshold
-        self.patience_steps = patience_steps
+        self.min_delta = min_delta
+        self.patience_windows = patience_windows
         self.verbose = verbose
 
-        # Rolling window of recent losses
-        self.loss_window = []
+        # Current window tracking
+        self.current_window_losses = []  # Losses in current window
+        self.current_window_start_step = 0
 
-        # Best window average tracking
+        # Best tracking (across all completed windows)
         self.best_window_avg = float('inf')
         self.best_window_step = 0
 
-        # Current window average
-        self.current_window_avg = float('inf')
+        # Patience tracking
+        self.windows_without_improvement = 0
 
-        # Patience tracking (step-based)
-        self.steps_without_improvement = 0
+        # History for debugging
+        self.window_history = []  # List of (window_idx, avg_loss, step_range)
 
-        # Total steps processed
-        self.total_steps = 0
-
-        # Variance tracking for debugging
-        self.current_window_var = 0.0
-
-    def add_loss(self, loss, step):
+    def add_loss(self, loss, global_step):
         """
-        Add a loss value and check for early stopping EVERY STEP.
+        Add a loss value and check if training should stop.
+
+        Args:
+            loss: Current step's loss value
+            global_step: Current training step
 
         Returns:
             bool: True if training should stop
         """
-        self.total_steps = step
+        # Add loss to current window
+        self.current_window_losses.append(loss)
 
-        # Add loss to rolling window
-        self.loss_window.append(loss)
+        # Check if window is complete
+        if len(self.current_window_losses) >= self.window_size:
+            return self._evaluate_window(global_step)
 
-        # Keep only the last window_size losses (sliding window)
-        if len(self.loss_window) > self.window_size:
-            self.loss_window = self.loss_window[-self.window_size:]
+        return False
 
-        # Need at least window_size losses to compute meaningful average
-        if len(self.loss_window) < self.window_size:
-            return False
+    def _evaluate_window(self, global_step):
+        """
+        Evaluate completed window and update state.
 
-        # Compute current window average
-        self.current_window_avg = sum(self.loss_window) / len(self.loss_window)
+        Returns:
+            bool: True if training should stop
+        """
+        # Compute window average
+        window_avg = sum(self.current_window_losses) / len(self.current_window_losses)
+        window_idx = len(self.window_history)
+        step_range = (self.current_window_start_step, global_step)
 
-        # Compute variance for debugging
-        mean = self.current_window_avg
-        self.current_window_var = sum((x - mean) ** 2 for x in self.loss_window) / len(self.loss_window)
+        # Record window history
+        self.window_history.append({
+            'window_idx': window_idx,
+            'avg_loss': window_avg,
+            'step_range': step_range,
+            'num_samples': len(self.current_window_losses)
+        })
 
-        # Check if we have meaningful improvement (current < best - min_delta)
-        improvement = self.best_window_avg - self.current_window_avg
+        # Check for improvement
+        improvement = self.best_window_avg - window_avg
+        improved = improvement >= self.min_delta
 
-        if improvement >= self.min_delta:
-            # Meaningful improvement found
-            self.best_window_avg = self.current_window_avg
-            self.best_window_step = step
-            self.steps_without_improvement = 0
+        if self.verbose:
+            print(f"\n  [SlidingWindow] Window {window_idx} complete (steps {step_range[0]}-{step_range[1]})")
+            print(f"    Window avg loss: {window_avg:.4f}")
+            print(f"    Best window avg: {self.best_window_avg:.4f}")
+            print(f"    Improvement: {improvement:.4f} (threshold: {self.min_delta})")
 
+        if improved:
+            # Meaningful improvement - update best and reset patience
+            self.best_window_avg = window_avg
+            self.best_window_step = global_step
+            self.windows_without_improvement = 0
             if self.verbose:
-                print(f"  [SlidingWindow] Loss improved to {self.current_window_avg:.4f} "
-                      f"(Δ={improvement:.4f}, var={self.current_window_var:.4f})")
+                print(f"    ✓ Improvement detected! Patience reset to 0")
         else:
-            # No meaningful improvement
-            self.steps_without_improvement += 1
+            # No meaningful improvement - increment patience
+            self.windows_without_improvement += 1
+            if self.verbose:
+                print(f"    ✗ No meaningful improvement. Patience: {self.windows_without_improvement}/{self.patience_windows}")
 
-            # Log progress periodically (not every step to avoid spam)
-            if self.verbose and self.steps_without_improvement % 100 == 0:
-                print(f"  [SlidingWindow] No improvement for {self.steps_without_improvement}/{self.patience_steps} steps")
-                print(f"     Current: {self.current_window_avg:.4f}, Best: {self.best_window_avg:.4f}, Δ={improvement:.4f}")
+        # Reset for next window
+        self.current_window_losses = []
+        self.current_window_start_step = global_step + 1
 
         # Check if patience exceeded
-        if self.steps_without_improvement >= self.patience_steps:
+        if self.windows_without_improvement >= self.patience_windows:
             if self.verbose:
                 print(f"\n🛑 SLIDING WINDOW EARLY STOPPING TRIGGERED")
-                print(f"   No meaningful improvement (Δ >= {self.min_delta}) for {self.patience_steps} steps")
+                print(f"   No meaningful improvement (Δ >= {self.min_delta}) for {self.patience_windows} consecutive windows")
                 print(f"   Best window loss: {self.best_window_avg:.4f} at step {self.best_window_step}")
-                print(f"   Current window loss: {self.current_window_avg:.4f}")
-                print(f"   Loss improvement: {improvement:.4f} (below threshold {self.min_delta})")
-                print(f"   Training stopped at step {step}")
+                print(f"   Current window loss: {window_avg:.4f}")
+                print(f"   Training stopped at step {global_step}")
             return True
 
         return False
 
     def get_status(self):
-        """Get current status for logging and WandB"""
+        """Get current status for logging/checkpointing"""
+        # Calculate current partial window average if any losses recorded
+        current_partial_avg = None
+        if self.current_window_losses:
+            current_partial_avg = sum(self.current_window_losses) / len(self.current_window_losses)
+
         return {
             'best_window_loss': self.best_window_avg,
             'best_window_step': self.best_window_step,
-            'current_window_loss': self.current_window_avg,
-            'steps_without_improvement': self.steps_without_improvement,
-            'patience_steps': self.patience_steps,
-            'total_steps': self.total_steps,
-            'min_delta': self.min_delta,
+            'current_window_loss': current_partial_avg if current_partial_avg else self.best_window_avg,
+            'windows_without_improvement': self.windows_without_improvement,
+            'steps_without_improvement': self.windows_without_improvement * self.window_size,
+            'total_windows_completed': len(self.window_history),
+            'current_window_progress': len(self.current_window_losses),
             'window_size': self.window_size,
-            'current_window_var': self.current_window_var,
+            'min_delta': self.min_delta,
+            'patience_windows': self.patience_windows,
         }
 
-
-class BestStage2ModelTracker:
-    """
-    Track and save the best model during Stage 2 training.
-    Monitors a composite score and saves checkpoints.
-    """
-
-    def __init__(self, output_dir, config, verbose=True):
-        """
-        Args:
-            output_dir: Directory to save best checkpoints
-            config: Training configuration
-            verbose: Print status messages
-        """
-        self.output_dir = Path(output_dir) / "checkpoints"
-        self.output_dir.mkdir(parents=True, exist_ok=True)
-        self.config = config
-        self.verbose = verbose
-
-        self.best_score = float('-inf')
-        self.best_step = 0
-        self.best_metrics = {}
-        self.best_checkpoint_path = None
-
-    def update(self, model, optimizer, step, metrics):
-        """
-        Check if current model is best and save if so.
-
-        Args:
-            model: Current model
-            optimizer: Optimizer
-            step: Current step
-            metrics: Dict with 'loss', 'gradient_norm', 'memory_kl', 'alignment_loss' etc.
-
-        Returns:
-            bool: True if this is a new best model
-        """
-        # Compute composite score (lower loss = higher score)
-        # Prioritize low loss with bonus for stable gradients and good alignment
-        loss = metrics.get('loss', float('inf'))
-        grad_norm = metrics.get('gradient_norm', 0)
-        memory_kl = metrics.get('memory_kl', 0)
-        alignment_loss = metrics.get('alignment_loss', 0)
-
-        # Composite score: negative loss (we want to maximize)
-        # Penalize high gradient norm (unstable) and high KL (poor memory)
-        score = -loss
-        if grad_norm > 10:  # Penalty for unstable gradients
-            score -= 0.1 * (grad_norm - 10)
-
-        if score > self.best_score:
-            self.best_score = score
-            self.best_step = step
-            self.best_metrics = metrics.copy()
-
-            # Save checkpoint
-            self.best_checkpoint_path = self.output_dir / "best-stage2-checkpoint.pt"
-
-            base_model = model.module if hasattr(model, 'module') else model
-            torch.save({
-                'global_step': step,
-                'model_state_dict': base_model.state_dict(),
-                'optimizer_state_dict': optimizer.state_dict(),
-                'best_score': self.best_score,
-                'best_metrics': self.best_metrics,
-                'config': vars(self.config),
-            }, self.best_checkpoint_path)
-
-            if self.verbose:
-                print(f"\n⭐ New best Stage 2 model saved at step {step}")
-                print(f"   Score: {score:.6f}")
-                print(f"   Loss: {loss:.6f}")
-                print(f"   Path: {self.best_checkpoint_path}")
-
-            return True
-
-        return False
-
-    def get_best_checkpoint_path(self):
-        """Return path to best checkpoint"""
-        return str(self.best_checkpoint_path) if self.best_checkpoint_path else None
-
-    def get_best_info(self):
-        """Get info about best model"""
+    def get_best_model_info(self):
+        """Get information about when the best loss was achieved"""
         return {
-            'path': self.get_best_checkpoint_path(),
-            'step': self.best_step,
-            'score': self.best_score,
-            'metrics': self.best_metrics,
+            'best_loss': self.best_window_avg,
+            'best_step': self.best_window_step,
+            'windows_completed': len(self.window_history),
         }
 
 
@@ -335,7 +270,7 @@ def get_model_statistics(model, config):
     """Get comprehensive model statistics"""
     # Unwrap DDP model if necessary
     base_model = model.module if hasattr(model, 'module') else model
-    
+
     stats = {}
 
     # Overall parameters (use base_model for accurate counting)
@@ -1121,116 +1056,130 @@ def push_to_huggingface(checkpoint_path, stats, epoch, total_epochs, stage_name,
         return False
 
 
-def push_stage2_final_to_hf(checkpoint_path, config, early_stop_metrics=None,
-                            training_history=None, model_statistics=None):
+def push_stage2_final_to_hf(checkpoint_path, config, early_stop_metrics, training_history, model_statistics):
     """
-    Push the final Stage 2 model to HuggingFace with post-training quantization.
-
-    This function:
-    1. Loads the best Stage 2 checkpoint
-    2. Generates quantized variants (4-bit, 3-bit, 1.58-bit)
-    3. Evaluates each variant
-    4. Pushes all variants to HuggingFace
+    Push the final Stage 2 model to HuggingFace after early stopping.
+    Uploads the checkpoint as the best model with comprehensive metadata.
 
     Args:
         checkpoint_path: Path to the checkpoint file
         config: Training configuration
-        early_stop_metrics: Metrics from early stopping (optional)
-        training_history: List of training history dicts (optional)
-        model_statistics: Model statistics dict (optional)
+        early_stop_metrics: Metrics from SlidingWindowEarlyStopping
+        training_history: List of training history entries
+        model_statistics: Model statistics dictionary
 
     Returns:
-        bool: True if successful
+        bool: True if upload successful
     """
-    print("\n" + "="*80)
-    print("🚀 STAGE 2 FINAL MODEL PROCESSING")
-    print("="*80)
-
-    # Check if post-training quantization is enabled
-    apply_quantization = getattr(config, 'apply_post_training_quantization', True)
-
-    if not apply_quantization:
-        print("⚠️  Post-training quantization disabled in config")
-        return False
-
     try:
-        # Import model factory function
-        from src.models import create_microvlm, create_microvlm_fiber
+        # Get HF token
+        hf_token = os.environ.get('HF_TOKEN') or os.environ.get('HUGGINGFACE_TOKEN')
+        if not hf_token:
+            try:
+                from huggingface_hub import HfFolder
+                hf_token = HfFolder.get_token()
+            except:
+                pass
 
-        # Determine which model factory to use
-        alignment_mode = getattr(config, 'alignment_mode', 'baseline')
-        if alignment_mode == 'fiber':
-            model_factory_fn = lambda cfg: create_microvlm_fiber(cfg)
-        else:
-            model_factory_fn = lambda cfg: create_microvlm(cfg)
+        if not hf_token:
+            print("⚠️  No HuggingFace token found - cannot push Stage 2 final model")
+            return False
 
-        # Find the best checkpoint
-        best_checkpoint_path = checkpoint_path
+        # Get repo config
+        repo_name = getattr(config, 'hf_repo_name', 'MicroVLM-V-stage2')
+        username = getattr(config, 'hf_username', 'euhidaman')
+        repo_id = f"{username}/{repo_name}"
 
-        # Check if there's a best-stage2 checkpoint
+        api = HfApi()
+
+        # Ensure repo exists
+        try:
+            api.create_repo(repo_id=repo_id, token=hf_token, exist_ok=True, repo_type="model")
+            print(f"   ✓ Repository ready: https://huggingface.co/{repo_id}")
+        except Exception:
+            pass  # Repo likely exists
+
+        # Prepare checkpoint directory
         checkpoint_dir = Path(checkpoint_path).parent
-        best_stage2_path = checkpoint_dir / "best-stage2-checkpoint.pt"
-        if best_stage2_path.exists():
-            best_checkpoint_path = str(best_stage2_path)
-            print(f"📦 Using best Stage 2 checkpoint: {best_checkpoint_path}")
-        else:
-            print(f"📦 Using provided checkpoint: {best_checkpoint_path}")
 
-        # Generate quantized variants
-        print("\n🔧 GENERATING QUANTIZED VARIANTS...")
-        output_dir = getattr(config, 'output_dir', 'checkpoints/stage2')
+        # Create best model file
+        import shutil
+        best_model_path = checkpoint_dir / "best-stage2-checkpoint.pt"
+        shutil.copy(checkpoint_path, best_model_path)
 
-        variants_info = generate_quantized_variants(
-            best_checkpoint_path=best_checkpoint_path,
-            output_dir=output_dir,
-            config=config,
-            model_factory_fn=model_factory_fn,
-            bit_widths=[4, 3, 1.58]  # Full precision is automatically included
-        )
-
-        print("\n📊 QUANTIZED VARIANTS GENERATED:")
-        for variant_name, variant_data in variants_info.items():
-            print(f"   {variant_name}:")
-            print(f"      - Path: {variant_data['path']}")
-            print(f"      - Bit Width: {variant_data['bit_width']}")
-            print(f"      - Size: {variant_data['estimated_size_mb']:.2f} MB")
-
-        # Publish to HuggingFace
-        print("\n🤗 PUBLISHING TO HUGGING FACE...")
-        repo_base_name = getattr(config, 'hf_repo_name', 'MicroVLM-V') + "-stage2"
-
-        publish_quantized_variants_to_hf(
-            variants_info=variants_info,
-            config=config,
-            repo_base_name=repo_base_name
-        )
-
-        # Save manifest with training info
-        manifest_path = Path(output_dir) / "quantized_variants" / "final_manifest.json"
-        manifest = {
-            'best_checkpoint': best_checkpoint_path,
-            'variants': variants_info,
-            'early_stop_metrics': early_stop_metrics,
-            'model_statistics': model_statistics,
-            'training_history_summary': {
-                'total_steps': training_history[-1]['step'] if training_history else 0,
-                'final_loss': training_history[-1].get('loss') if training_history else None,
-            } if training_history else None,
+        # Create comprehensive statistics JSON
+        final_stats = {
+            **model_statistics,
+            'early_stopping': {
+                'triggered': True,
+                'reason': 'sliding_window_plateau',
+                'best_window_loss': early_stop_metrics.get('best_window_loss', None),
+                'best_window_step': early_stop_metrics.get('best_window_step', None),
+                'windows_completed': early_stop_metrics.get('total_windows_completed', None),
+                'final_loss': early_stop_metrics.get('current_window_loss', None),
+            },
+            'training_summary': {
+                'total_steps': training_history[-1].get('step', 0) if training_history else 0,
+                'final_lr': training_history[-1].get('lr', 0) if training_history else 0,
+                'final_epoch': training_history[-1].get('epoch', 0) if training_history else 0,
+            },
             'timestamp': datetime.now().isoformat(),
         }
 
-        with open(manifest_path, 'w') as f:
-            json.dump(manifest, f, indent=2, default=str)
+        stats_path = checkpoint_dir / "best-stage2-statistics.json"
+        with open(stats_path, 'w') as f:
+            json.dump(final_stats, f, indent=2)
 
-        print(f"\n✅ Final manifest saved: {manifest_path}")
-        print("="*80)
-        print("✨ STAGE 2 PROCESSING COMPLETE")
-        print("="*80 + "\n")
+        # Create commit message
+        best_loss = early_stop_metrics.get('best_window_loss', 0)
+        best_step = early_stop_metrics.get('best_window_step', 0)
+        commit_message = f"Stage 2 Final: Best loss={best_loss:.4f} at step {best_step} (early stopped)"
+
+        # Upload best checkpoint
+        print(f"   ⏳ Uploading best-stage2-checkpoint.pt...")
+        api.upload_file(
+            path_or_fileobj=str(best_model_path),
+            path_in_repo="checkpoints/best-stage2/best-stage2-checkpoint.pt",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+
+        # Upload statistics
+        print(f"   ⏳ Uploading best-stage2-statistics.json...")
+        api.upload_file(
+            path_or_fileobj=str(stats_path),
+            path_in_repo="checkpoints/best-stage2/best-stage2-statistics.json",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+
+        # Also upload as main model.pt for easy loading
+        print(f"   ⏳ Uploading as model.pt (main model)...")
+        api.upload_file(
+            path_or_fileobj=str(best_model_path),
+            path_in_repo="model.pt",
+            repo_id=repo_id,
+            repo_type="model",
+            commit_message=commit_message,
+            token=hf_token
+        )
+
+        print(f"   ✅ Stage 2 final model uploaded successfully!")
+        print(f"   🔗 View at: https://huggingface.co/{repo_id}")
+        print(f"   📊 Best window loss: {best_loss:.4f} at step {best_step}")
+
+        # Cleanup temporary file
+        best_model_path.unlink(missing_ok=True)
+        stats_path.unlink(missing_ok=True)
 
         return True
 
     except Exception as e:
-        print(f"\n❌ Error during Stage 2 final processing: {e}")
+        print(f"❌ Error pushing Stage 2 final to HuggingFace: {e}")
         import traceback
         traceback.print_exc()
         return False
@@ -1476,8 +1425,7 @@ def compute_gradient_flow_metrics(model):
 def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 epoch, global_step, wandb_run=None, wandb_logger=None,
                 is_distributed=False, is_main_process=True, carbon_tracker=None,
-                attention_monitor=None, sliding_window_stopper=None,
-                best_model_tracker=None):
+                attention_monitor=None, sliding_window_stopper=None):
     """Train for one epoch
     
     Args:
@@ -1495,8 +1443,7 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
         is_main_process: Whether this is the main process (rank 0)
         carbon_tracker: CarbonComputeTracker for emissions/FLOPs tracking
         attention_monitor: AttentionQualityMonitor for tracking attention quality
-        sliding_window_stopper: SlidingWindowEarlyStopping instance (optional)
-        best_model_tracker: BestStage2ModelTracker for tracking best model (optional)
+        sliding_window_stopper: SlidingWindowEarlyStopping for step-wise loss plateau detection
     """
     model.train()
 
@@ -1781,56 +1728,14 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                 wandb_logger.log_language_model_metrics(
                     outputs, input_ids, global_step)
 
-                # Sliding window early stopping metrics (comprehensive logging for debugging)
+                # Sliding window early stopping metrics
                 if sliding_window_stopper is not None:
                     sw_status = sliding_window_stopper.get_status()
                     wandb_logger.log_metrics({
-                        # Core metrics
                         'sliding_window/best_window_loss': sw_status['best_window_loss'],
                         'sliding_window/current_window_loss': sw_status['current_window_loss'],
                         'sliding_window/steps_without_improvement': sw_status['steps_without_improvement'],
-                        # New diagnostic metrics
-                        'sliding_window/consecutive_stagnant_windows': sw_status.get('consecutive_stagnant_windows', 0),
-                        'sliding_window/windows_until_stop': sw_status.get('windows_until_stop', 0),
-                        'sliding_window/total_windows_completed': sw_status.get('total_windows_completed', 0),
-                        'sliding_window/last_improvement_delta_pct': sw_status.get('last_improvement_delta', 0) * 100,
                     }, step=global_step)
-
-        # Best Model Tracking (main process only, every best_model_check_interval steps)
-        best_check_interval = getattr(config, 'best_model_check_interval', 100)
-        if is_main_process and best_model_tracker is not None and global_step % best_check_interval == 0:
-            # Compute gradient norm for stability tracking
-            total_grad_norm = 0.0
-            for p in model.parameters():
-                if p.grad is not None:
-                    total_grad_norm += p.grad.data.norm(2).item() ** 2
-            total_grad_norm = total_grad_norm ** 0.5
-
-            # Prepare metrics for best model tracking
-            best_tracker_metrics = {
-                'loss': loss.item(),
-                'gradient_norm': total_grad_norm,
-                'memory_kl': outputs.get('memory_kl', torch.tensor(0.0)).item() if isinstance(outputs.get('memory_kl'), torch.Tensor) else outputs.get('memory_kl', 0.0),
-                'alignment_loss': outputs.get('alignment_loss', torch.tensor(0.0)).item() if isinstance(outputs.get('alignment_loss'), torch.Tensor) else outputs.get('alignment_loss', 0.0),
-            }
-
-            # Update best model tracker
-            is_new_best = best_model_tracker.update(
-                model=model,
-                optimizer=optimizer,
-                step=global_step,
-                metrics=best_tracker_metrics
-            )
-
-            # Log best model metrics to wandb
-            if wandb_logger:
-                best_info = best_model_tracker.get_best_info()
-                wandb_logger.log_metrics({
-                    'best_model/best_score': best_info['score'],
-                    'best_model/best_step': best_info['step'],
-                    'best_model/current_score': -best_tracker_metrics['loss'],
-                    'best_model/is_new_best': 1.0 if is_new_best else 0.0,
-                }, step=global_step)
 
             # Legacy simple logging (fallback)
             elif wandb_run:
@@ -2153,7 +2058,6 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
 
         # ===== Sliding Window Early Stopping =====
         # Check sliding window early stopping after each batch
-        # Note: The stopper only evaluates at window boundaries (non-overlapping)
         if sliding_window_stopper is not None and is_main_process:
             should_stop = sliding_window_stopper.add_loss(loss.item(), global_step)
             if should_stop:
@@ -2169,16 +2073,13 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
                         'early_stopping/best_window_loss': stopper_status['best_window_loss'],
                         'early_stopping/current_window_loss': stopper_status['current_window_loss'],
                         'early_stopping/steps_without_improvement': stopper_status['steps_without_improvement'],
-                        # New detailed metrics
-                        'early_stopping/consecutive_stagnant_windows': stopper_status.get('consecutive_stagnant_windows', 0),
-                        'early_stopping/total_windows_completed': stopper_status.get('total_windows_completed', 0),
-                        'early_stopping/last_improvement_delta_pct': stopper_status.get('last_improvement_delta', 0) * 100,
-                        'early_stopping/relative_threshold_pct': stopper_status.get('relative_threshold', 0.02) * 100,
                     }, step=global_step)
 
                 # Return with sliding window stop signal
                 avg_loss = total_loss / max(batch_idx + 1, 1)
                 return avg_loss, global_step, 'sliding_window_plateau', stopper_status
+
+        # Remove step-based checkpointing (only save at end of epoch)
 
     # End epoch tracking for carbon tracker
     if carbon_tracker is not None:
@@ -2191,38 +2092,266 @@ def train_epoch(model, train_loader, optimizer, scheduler, config, visualizer,
     return avg_loss, global_step, None, None
 
 
-def main():
-    """Main training entry point for MicroVLM-V Stage 2 with sliding window early stopping."""
-    import argparse
-    from src.training.staged_config import load_config as load_staged_config
-    from src.models import create_microvlm, create_microvlm_fiber
+def count_parameters(model):
+    """Count total and trainable parameters"""
+    # Handle DDP/DataParallel wrapped models
+    base_model = model.module if hasattr(model, 'module') else model
+    total_params = sum(p.numel() for p in base_model.parameters())
+    trainable_params = sum(p.numel() for p in base_model.parameters() if p.requires_grad)
+    frozen_params = total_params - trainable_params
+    return {
+        'total': total_params,
+        'trainable': trainable_params,
+        'frozen': frozen_params
+    }
 
+
+def get_model_statistics(model, config):
+    """Get comprehensive model statistics"""
+    # Unwrap DDP model if necessary
+    base_model = model.module if hasattr(model, 'module') else model
+    
+    stats = {}
+
+    # Overall parameters (use base_model for accurate counting)
+    overall = count_parameters(base_model)
+    stats['total_parameters'] = overall['total']
+    stats['trainable_parameters'] = overall['trainable']
+    stats['frozen_parameters'] = overall['frozen']
+    stats['trainable_percentage'] = 100.0 * overall['trainable'] / \
+        overall['total'] if overall['total'] > 0 else 0.0
+
+    # Vision encoder parameters
+    if hasattr(base_model, 'vision_encoder'):
+        vision_stats = count_parameters(base_model.vision_encoder)
+        stats['vision_total_params'] = vision_stats['total']
+        stats['vision_trainable_params'] = vision_stats['trainable']
+        stats['vision_frozen_params'] = vision_stats['frozen']
+
+    # Language model parameters
+    if hasattr(base_model, 'language_model'):
+        lang_stats = count_parameters(base_model.language_model)
+        stats['language_total_params'] = lang_stats['total']
+        stats['language_trainable_params'] = lang_stats['trainable']
+        stats['language_frozen_params'] = lang_stats['frozen']
+
+    # Adapter parameters
+    if hasattr(base_model, 'multimodal_adapter'):
+        adapter_stats = count_parameters(base_model.multimodal_adapter)
+        stats['adapter_total_params'] = adapter_stats['total']
+        stats['adapter_trainable_params'] = adapter_stats['trainable']
+
+    # Memory parameters
+    if hasattr(base_model, 'episodic_memory'):
+        memory_stats = count_parameters(base_model.episodic_memory)
+        stats['memory_total_params'] = memory_stats['total']
+        stats['memory_trainable_params'] = memory_stats['trainable']
+
+    # Quantization info
+    stats['vision_4bit_quantized'] = getattr(
+        config, 'quantize_vision_4bit', False)
+    stats['language_4bit_quantized'] = getattr(
+        config, 'quantize_language_4bit', False)
+    stats['memory_158bit_quantized'] = getattr(
+        config, 'quantize_memory_158bit', False)
+
+    # Estimate memory size (approximate)
+    # 4-bit: 0.5 bytes per param, 1.58-bit: ~0.2 bytes per param, fp16: 2 bytes, fp32: 4 bytes
+    total_size_mb = 0
+    if stats.get('vision_4bit_quantized'):
+        total_size_mb += stats.get('vision_total_params', 0) * 0.5 / 1e6
+    else:
+        total_size_mb += stats.get('vision_total_params', 0) * 2 / 1e6  # fp16
+
+    if stats.get('language_4bit_quantized'):
+        total_size_mb += stats.get('language_total_params', 0) * 0.5 / 1e6
+    else:
+        total_size_mb += stats.get('language_total_params',
+                                   0) * 2 / 1e6  # fp16
+
+    if stats.get('memory_158bit_quantized'):
+        total_size_mb += stats.get('memory_total_params', 0) * 0.2 / 1e6
+    else:
+        total_size_mb += stats.get('memory_total_params', 0) * 4 / 1e6  # fp32
+
+    # Add other components (adapter, etc.)
+    total_size_mb += stats.get('adapter_total_params', 0) * 4 / 1e6
+
+    stats['estimated_model_size_mb'] = round(total_size_mb, 2)
+
+    return stats
+
+
+def print_model_statistics(stats, epoch):
+    """Print model statistics in a formatted way"""
+    print("\n" + "="*80)
+    print(f"MODEL STATISTICS - Epoch {epoch}")
+    print("="*80)
+
+    print("\n📊 Overall Parameters:")
+    print(f"  Total:      {stats['total_parameters']:>15,}")
+    print(
+        f"  Trainable:  {stats['trainable_parameters']:>15,} ({stats['trainable_percentage']:.2f}%)")
+    print(f"  Frozen:     {stats['frozen_parameters']:>15,}")
+
+    print("\n🖼️  Vision Encoder:")
+    print(f"  Total:      {stats.get('vision_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('vision_trainable_params', 0):>15,}")
+    print(f"  Frozen:     {stats.get('vision_frozen_params', 0):>15,}")
+
+    print("\n💬 Language Model:")
+    print(f"  Total:      {stats.get('language_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('language_trainable_params', 0):>15,}")
+    print(f"  Frozen:     {stats.get('language_frozen_params', 0):>15,}")
+
+    print("\n🔗 Multimodal Adapter:")
+    print(f"  Total:      {stats.get('adapter_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('adapter_trainable_params', 0):>15,}")
+
+    print("\n🧠 Episodic Memory:")
+    print(f"  Total:      {stats.get('memory_total_params', 0):>15,}")
+    print(f"  Trainable:  {stats.get('memory_trainable_params', 0):>15,}")
+
+    print("\n⚙️  Quantization:")
+    print(
+        f"  Vision 4-bit:     {'✓' if stats.get('vision_4bit_quantized') else '✗'}")
+    print(
+        f"  Language 4-bit:   {'✓' if stats.get('language_4bit_quantized') else '✗'}")
+    print(
+        f"  Memory 1.58-bit:  {'✓' if stats.get('memory_158bit_quantized') else '✗'}")
+
+    print("\n💾 Estimated Model Size:")
+    print(f"  ~{stats['estimated_model_size_mb']:.2f} MB")
+
+    print("="*80 + "\n")
+
+
+def save_epoch_checkpoint(model, optimizer, epoch, global_step, config, stage_name="default"):
+    """Save model checkpoint after each epoch"""
+    checkpoint_dir = Path(config.output_dir) / "checkpoints"
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
+    # Get and print model statistics
+    stats = get_model_statistics(model, config)
+    print_model_statistics(stats, epoch)
+
+    # Save checkpoint with epoch number
+    checkpoint_path = checkpoint_dir / f"epoch_{epoch}_checkpoint.pt"
+
+    torch.save({
+        'epoch': epoch,
+        'global_step': global_step,
+        'model_state_dict': model.state_dict(),
+        'optimizer_state_dict': optimizer.state_dict(),
+        'config': vars(config),
+        'model_statistics': stats
+    }, checkpoint_path)
+
+    print(f"✅ Checkpoint saved: {checkpoint_path}")
+
+    # Save statistics as JSON
+    stats_path = checkpoint_dir / f"epoch_{epoch}_statistics.json"
+    with open(stats_path, 'w') as f:
+        json.dump(stats, f, indent=2)
+    print(f"📊 Statistics saved: {stats_path}")
+
+    return checkpoint_path, stats
+
+
+def main():
     parser = argparse.ArgumentParser(description="Train MicroVLM-V")
-    parser.add_argument('--config', type=str, default='stage2',
-                       choices=['test', 'stage1', 'stage2', 'default', 'full_quantized'],
-                       help='Training configuration')
+    parser.add_argument('--config', type=str, default='default',
+                        choices=['test', 'stage1', 'stage2',
+                                 'default', 'full_quantized'],
+                        help='Training configuration')
     parser.add_argument('--resume', type=str, default=None,
-                       help='Path to checkpoint to resume from')
+                        help='Path to checkpoint to resume from')
+    parser.add_argument('--use-staged-config', action='store_true',
+                        help='Use staged configuration system')
+    parser.add_argument('--num_images', type=int, default=None,
+                        help='Limit total dataset size to N images. '
+                             'Auto-splits into train/val (95%%/5%%). '
+                             'E.g., --num_images=2000000 uses 1.9M train, 100K val.')
+    parser.add_argument('--val_split', type=float, default=0.05,
+                        help='Validation split ratio when using --num_images (default: 0.05)')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='Number of DataLoader workers (default: 4, max: 32)')
+    parser.add_argument('--multi_gpu', action='store_true',
+                        help='Enable multi-GPU training with DistributedDataParallel')
     parser.add_argument('--local_rank', type=int, default=-1,
-                       help='Local rank for distributed training')
+                        help='Local rank for distributed training (set automatically by torchrun)')
+    parser.add_argument('--alignment_mode', type=str, default='baseline',
+                        choices=['baseline', 'fiber'],
+                        help='Alignment mode: baseline (prefix-only) or fiber (fusion-in-backbone)')
+    parser.add_argument('--force-continue', action='store_true',
+                        help='If set, continue training until force_continue_steps even if best is found early')
+    parser.add_argument('--force-continue-steps', type=int, default=1500,
+                        help='Minimum steps to continue training when --force-continue is set (default: 1500)')
+    parser.add_argument('--fiber_layers', type=str, default='6,8,10',
+                        help='Comma-separated list of vision encoder layers for FIBER fusion (default: 6,8,10)')
+    parser.add_argument('--itc_weight', type=float, default=1.0,
+                        help='Weight for ITC (image-text contrastive) loss in FIBER mode')
+    parser.add_argument('--itm_weight', type=float, default=0.5,
+                        help='Weight for ITM (image-text matching) loss in FIBER mode')
 
     args = parser.parse_args()
 
-    # Setup distributed training
-    local_rank = int(os.environ.get('LOCAL_RANK', args.local_rank))
-    world_size = int(os.environ.get('WORLD_SIZE', 1))
-    is_main_process = local_rank in [-1, 0]
+    # Parse FIBER layers
+    fiber_fusion_layers = [int(x.strip()) for x in args.fiber_layers.split(',')]
 
-    if local_rank != -1:
+    # Cap num_workers at 32
+    args.num_workers = min(max(args.num_workers, 0), 32)
+
+    # ========== Multi-GPU / DDP Setup ==========
+    is_distributed = False
+    local_rank = 0
+    world_size = 1
+    
+    # Check for torchrun environment variables (preferred method)
+    if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
+        is_distributed = True
+        local_rank = int(os.environ.get('LOCAL_RANK', 0))
+        world_size = int(os.environ['WORLD_SIZE'])
+        rank = int(os.environ['RANK'])
+        
+        # Initialize distributed process group
+        dist.init_process_group(backend='nccl', init_method='env://')
         torch.cuda.set_device(local_rank)
-        dist.init_process_group(backend='nccl')
+        
+        if rank == 0:
+            print(f"\n{'='*60}")
+            print(f"  DISTRIBUTED TRAINING ENABLED")
+            print(f"  World size: {world_size} GPUs")
+            print(f"  Backend: NCCL")
+            print(f"{'='*60}\n")
+    elif args.multi_gpu and torch.cuda.device_count() > 1:
+        # Fallback: DataParallel mode (simpler but less efficient)
+        print(f"\n{'='*60}")
+        print(f"  MULTI-GPU MODE (DataParallel)")
+        print(f"  Available GPUs: {torch.cuda.device_count()}")
+        print(f"  NOTE: For best performance, use torchrun:")
+        print(f"    torchrun --nproc_per_node={torch.cuda.device_count()} scripts/train.py ...")
+        print(f"{'='*60}\n")
+    
+    # Helper to check if current process is main
+    is_main_process = (not is_distributed) or (dist.get_rank() == 0)
 
-    device = torch.device(f'cuda:{local_rank}' if local_rank != -1 else 'cuda')
-
-    # Load configuration
-    config = load_staged_config(args.config)
-    if is_main_process:
-        print(f"Loaded configuration: {args.config}")
+    # Load configuration - prioritize staged config if requested
+    if args.use_staged_config or args.config in ['stage1', 'stage2', 'full_quantized']:
+        config = load_staged_config(args.config)
+        if is_main_process:
+            print(f"Loaded STAGED configuration: {args.config}")
+    else:
+        config = load_config(args.config)
+        if is_main_process:
+            print(f"Loaded configuration: {args.config}")
+    
+    # Use config's alignment_mode if user didn't explicitly override via CLI
+    # (CLI default is 'baseline', but stage configs may specify 'fiber')
+    if hasattr(config, 'alignment_mode') and args.alignment_mode == 'baseline':
+        args.alignment_mode = config.alignment_mode
+        if is_main_process:
+            print(f"Using alignment_mode from config: {args.alignment_mode}")
 
     # Create output directories
     Path(config.output_dir).mkdir(parents=True, exist_ok=True)
@@ -2230,133 +2359,270 @@ def main():
     Path(config.output_dir).joinpath("visualizations").mkdir(exist_ok=True)
 
     # Load model configuration
-    model_config_path = Path(__file__).parent.parent / "configs" / "model_config.json"
+    model_config_path = Path(__file__).parent.parent / \
+        "configs" / "model_config.json"
+    if not model_config_path.exists():
+        print(f"ERROR: Model config not found: {model_config_path}")
+        print("Run: python scripts/extract_model_config.py")
+        sys.exit(1)
+
     with open(model_config_path, 'r') as f:
         model_config = json.load(f)
 
-    # Create run name
-    run_name = getattr(config, 'wandb_run_name', 'stage2_memory')
-    run_counter = random.randint(100, 999)
-    run_name = f"{run_name}_{run_counter}"
+    # Ensure memory_dim matches current language hidden size to avoid stale configs
+    model_dims = model_config.get('model_dimensions', {})
+    lang_hidden = model_dims.get('language_hidden_size')
+    mem_dim = model_dims.get('memory_dim')
+    if lang_hidden and mem_dim and lang_hidden != mem_dim:
+        if is_main_process:
+            print(f"⚠️  model_config memory_dim ({mem_dim}) != language_hidden_size ({lang_hidden}). Forcing match.")
+        model_dims['memory_dim'] = lang_hidden
+        model_config['model_dimensions'] = model_dims
 
-    # Setup WandB (main process only)
+    # Create run name
+    run_name, run_counter = create_run_name(args.config)
+    if hasattr(config, 'wandb_run_name') and config.wandb_run_name:
+        run_name = f"{config.wandb_run_name}_{run_counter}"
+    config.wandb_run_name = run_name
+
+    if is_main_process:
+        print(f"Run name: {run_name} (counter: {run_counter})")
+
+    # Setup WandB (main process only to avoid duplicate logging)
     wandb_run = None
     wandb_logger = None
     if is_main_process:
         wandb_run = setup_wandb(config, run_name)
-        if wandb_run:
-            wandb_logger = WandBLogger(config, wandb_run)
-        print(f"WandB initialized: {run_name}")
-        print(f"WandB project: {getattr(config, 'wandb_project', 'MicroVLM-V')}")
+        wandb_logger = WandBLogger(config, wandb_run) if wandb_run else None
 
-    # Create carbon tracker
+    # Initialize Carbon/Compute Tracker (main process only)
     carbon_tracker = None
-    try:
-        from src.training.carbon_tracker import CarbonTracker
-        carbon_tracker = CarbonTracker(log_dir="carbon_logs", enable_carbon=True)
-        if is_main_process:
-            print(f"[CarbonTracker] Initialized (carbon=True, gpu=True, flops=True)")
-    except Exception as e:
-        if is_main_process:
-            print(f"[CarbonTracker] Warning: {e}")
-
-    # Create attention monitor
-    attention_monitor = None
-    if getattr(config, 'use_attention_monitor', False):
-        from src.training.attention_monitor import AttentionMonitor
-        attention_monitor = AttentionMonitor(
-            quality_threshold=getattr(config, 'attention_quality_threshold', 0.25),
-            degradation_threshold=getattr(config, 'attention_degradation_threshold', 0.15),
-            min_steps=getattr(config, 'attention_min_steps', 2000)
+    track_carbon = getattr(config, 'track_carbon', True)
+    track_flops = getattr(config, 'track_flops', True)
+    track_gpu = getattr(config, 'track_gpu', True)
+    
+    if is_main_process and (track_carbon or track_flops or track_gpu):
+        carbon_log_dir = Path(config.output_dir) / "carbon_logs"
+        carbon_tracker = CarbonComputeTracker(
+            is_main_process=is_main_process,
+            output_dir=str(carbon_log_dir),
+            project_name=f"microvlm-v-{args.config}",
+            country_iso_code=getattr(config, 'country_iso_code', 'USA'),
+            track_carbon=track_carbon,
+            track_gpu=track_gpu,
+            track_flops=track_flops,
+            model=None  # Set after model creation
         )
-        if is_main_process:
-            print(f"[AttentionMonitor] Initialized for early stopping on attention degradation")
+        print(f"[CarbonTracker] Initialized (carbon={track_carbon}, gpu={track_gpu}, flops={track_flops})")
+    
+    # Initialize Attention Quality Monitor (for detecting attention degradation)
+    attention_monitor = None
+    use_attention_monitor = getattr(config, 'use_attention_monitor', True)
+    
+    if is_main_process and use_attention_monitor and args.alignment_mode == 'fiber':
+        attention_monitor = AttentionQualityMonitor(
+            min_health_score=getattr(config, 'attention_quality_threshold', 0.25),
+            max_edge_ratio=0.6,  # Alert if >60% attention on edges
+            patience=10,  # Consecutive bad steps before pause
+            auto_pause=True,
+            auto_adjust_lr=True,
+            grid_size=14,  # DeiT-Tiny: 14x14 patches
+            verbose=True
+        )
+        print(f"[AttentionMonitor] Initialized for early stopping on attention degradation")
 
-    # Create model
+    # Create model with quantization settings
     if is_main_process:
         print("Creating model...")
-        print(f"  - Alignment mode: {getattr(config, 'alignment_mode', 'baseline')}")
-        print(f"  - FIBER fusion layers: {getattr(config, 'fiber_fusion_layers', [6, 8, 10])}")
-        print(f"  - ITC weight: {getattr(config, 'itc_loss_weight', 1.0)}, ITM weight: {getattr(config, 'itm_loss_weight', 0.5)}")
+        print(f"  - Alignment mode: {args.alignment_mode}")
+        if args.alignment_mode == 'fiber':
+            print(f"  - FIBER fusion layers: {fiber_fusion_layers}")
+            print(f"  - ITC weight: {args.itc_weight}, ITM weight: {args.itm_weight}")
         print(f"  - 4-bit quantization: Vision={getattr(config, 'quantize_vision_4bit', False)}, "
               f"Language={getattr(config, 'quantize_language_4bit', False)}")
-        print(f"  - 1.58-bit memory quantization: {getattr(config, 'quantize_memory_158bit', False)}")
+        print(
+            f"  - 1.58-bit memory quantization: {getattr(config, 'quantize_memory_158bit', False)}")
 
-    alignment_mode = getattr(config, 'alignment_mode', 'baseline')
-    if alignment_mode == 'fiber':
-        model = create_microvlm_fiber(model_config['model_dimensions'])
-    else:
-        model = create_microvlm(model_config['model_dimensions'])
+    if args.alignment_mode == 'fiber':
+        # Create FIBER model with fusion-in-backbone alignment
+        # Build FIBER config
+        fiber_config = {
+            'fiber_fusion_layers': fiber_fusion_layers,
+            'cross_attention_heads': 4,
+            'cross_attention_dim': model_config['model_dimensions'].get('vision_hidden_size', 192),
+            'use_bidirectional': True,
+            'alpha_init': 0.0,
+            'embed_dim': 256,
+            'itc_weight': args.itc_weight,
+            'itm_weight': args.itm_weight,
+        }
+        
+        # Get quantization flags from config (default: 4-bit for language model)
+        quantize_4bit = getattr(config, 'quantize_language_4bit', True)
+        quantize_memory_158bit = getattr(config, 'quantize_memory_158bit', False)
+        
+        # Debug: Print critical dimensions before model creation
+        if is_main_process:
+            dims = model_config['model_dimensions']
+            print(f"   🔍 Model dimensions from config:")
+            print(f"      - memory_dim: {dims.get('memory_dim', 'NOT SET')}")
+            print(f"      - language_hidden_size: {dims.get('language_hidden_size', 'NOT SET')}")
+            print(f"      - memory_size: {dims.get('memory_size', 'NOT SET')}")
 
-    # Apply freezing strategy
-    from src.models.microvlm import apply_freezing_strategy as model_freeze_strategy
-    model_freeze_strategy(model, config, alignment_mode)
-
-    # Count parameters
-    total_params = sum(p.numel() for p in model.parameters())
-    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
-    frozen_params = total_params - trainable_params
-
-    if is_main_process:
-        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} ({100*trainable_params/total_params:.2f}%)")
-
-    # Clear CUDA cache and move model
-    torch.cuda.empty_cache()
-    model = model.to(device)
-
-    # Wrap with DDP if distributed
-    if local_rank != -1:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank,
-            find_unused_parameters=True
+        model = create_microvlm_fiber(
+            config=model_config['model_dimensions'],
+            vision_checkpoint=getattr(
+                config, 'vision_checkpoint', config.deit_checkpoint),
+            language_checkpoint=getattr(
+                config, 'language_checkpoint', config.qwen_model),
+            quantize_4bit=quantize_4bit,
+            quantize_memory_158bit=quantize_memory_158bit,
+            training_config=config,
+            fiber_config=fiber_config
         )
+
+        if is_main_process:
+            print(f"  ✓ Created MicroVLMFIBER model with fusion at layers {fiber_fusion_layers}")
+            print(f"  ✓ 4-bit quantization: {quantize_4bit}")
+    else:
+        # Create baseline MicroVLM model
+        model = create_microvlm(
+            config=model_config['model_dimensions'],
+            language_checkpoint=getattr(
+                config, 'language_checkpoint', config.qwen_model),
+            vision_checkpoint=getattr(
+                config, 'vision_checkpoint', config.deit_checkpoint),
+            quantize_4bit=(getattr(config, 'quantize_vision_4bit', False) or
+                           getattr(config, 'quantize_language_4bit', False)),
+            quantize_memory_158bit=getattr(
+                config, 'quantize_memory_158bit', False),
+            training_config=config
+        )
+
+    # Log quantization statistics if enabled
+    if getattr(config, 'quantize_memory_158bit', False) and hasattr(model, 'episodic_memory'):
+        quant_stats = get_memory_quantization_stats(model.episodic_memory)
+        print("\n=== Memory Quantization Statistics ===")
+        for key, value in quant_stats.items():
+            print(f"  {key}: {value}")
+        print("=" * 40 + "\n")
+
+        if wandb_logger:
+            wandb_logger.log_metrics(
+                quant_stats, step=0, prefix="quantization")
+
+    # Apply freezing strategy from staged config
+    apply_freezing_strategy(model, config, args.alignment_mode)
+    if is_main_process and getattr(config, 'train_adapter_only', False):
+        print("  ✓ Adapter-only training enabled (vision + LM frozen)")
+
+    # Print trainable parameters
+    trainable_params = model.get_trainable_params()
+    total_params = sum(p.numel() for p in model.parameters())
+    if is_main_process:
+        print(f"Trainable parameters: {trainable_params:,} / {total_params:,} "
+              f"({100*trainable_params/total_params:.2f}%)")
+        if args.alignment_mode == 'fiber':
+            print("  ✓ FIBER fusion layers are trainable")
+
+    # Move to device (use local_rank for DDP, otherwise config.device)
+    if is_distributed:
+        device = torch.device(f'cuda:{local_rank}')
+        model = model.to(device)
+        # Wrap model with DDP
+        model = DDP(model, device_ids=[local_rank], output_device=local_rank,
+                    find_unused_parameters=True)
         if is_main_process:
             print(f"Model wrapped with DistributedDataParallel on GPU {local_rank}")
+    elif args.multi_gpu and torch.cuda.device_count() > 1:
+        # DataParallel fallback
+        device = torch.device('cuda:0')
+        model = model.to(device)
+        model = nn.DataParallel(model)
+        print(f"Model wrapped with DataParallel across {torch.cuda.device_count()} GPUs")
+    else:
+        device = torch.device(config.device)
+        model = model.to(device)
 
-    # Estimate FLOPs
-    if carbon_tracker and is_main_process:
-        estimated_flops = total_params * 6
-        carbon_tracker._estimated_flops_per_forward = estimated_flops
-        print(f"[CarbonTracker] Estimated FLOPs from params: {estimated_flops/1e12:.2f} TFLOPs")
-        print(f"[CarbonTracker] Total params: {total_params:,}, Est. FLOPs/forward: {estimated_flops:.2e}")
+    # Update config device for consistency
+    config.device = device
 
-    # Create dataloaders
-    num_workers = min(getattr(config, 'num_workers', 4), 32)
+    # Store alignment mode in config for use in training loop
+    config.alignment_mode = args.alignment_mode
+    config.stage_name = args.config
+
+    if getattr(config, 'alignment_early_stop', False):
+        ensure_alignment_tracking_state(config)
+
+    # Force-continue settings (only applied when flag is provided)
+    config.force_continue = bool(getattr(args, 'force_continue', False))
+    config.force_continue_steps = getattr(args, 'force_continue_steps', 0) if config.force_continue else 0
+
+    # Initialize FLOPs estimation for carbon tracker
+    if carbon_tracker is not None and is_main_process:
+        base_model_for_flops = model.module if hasattr(model, 'module') else model
+        num_params = sum(p.numel() for p in base_model_for_flops.parameters())
+        # Estimate sequence length (prefix tokens + text tokens)
+        seq_len = getattr(config, 'max_length', 256) + getattr(config, 'num_image_tokens', 196)
+        estimated_flops = carbon_tracker.estimate_flops_from_params(num_params, seq_len)
+        print(f"[CarbonTracker] Total params: {num_params:,}, Est. FLOPs/forward: {estimated_flops:.2e}")
+
+    # Create visualizer
+    visualizer = create_attention_visualizer(model_config['model_dimensions'])
+
+    # Determine max_samples: CLI --num_images takes precedence over config
+    if args.num_images is not None:
+        # User specified --num_images, auto-split into train/val
+        num_val = int(args.num_images * args.val_split)
+        num_train = args.num_images - num_val
+        effective_max_samples = num_train
+        effective_max_val_samples = num_val
+        if is_main_process:
+            print(f"\n=== Dataset Limiting (--num_images={args.num_images:,}) ===")
+            print(f"  Train samples: {num_train:,}")
+            print(f"  Val samples:   {num_val:,}")
+            print(f"  Val split:     {args.val_split:.1%}")
+            print("=" * 50 + "\n")
+    else:
+        # Use config values
+        effective_max_samples = config.max_samples
+        effective_max_val_samples = getattr(config, 'max_val_samples', None)
+
+    # Determine effective num_workers (CLI takes precedence)
+    effective_num_workers = args.num_workers
     if is_main_process:
-        print(f"Using {num_workers} DataLoader workers (max: 32)")
+        print(f"Using {effective_num_workers} DataLoader workers (max: 32)")
+
+    # Get the underlying model for tokenizer access (handles DDP/DP wrapping)
+    base_model = model.module if hasattr(model, 'module') else model
+
+    # Create dataloaders with distributed support
+    if is_main_process:
         print("Creating dataloaders...")
 
-    from src.data.multimodal_dataset import create_dataloaders
-
-    # Get tokenizer from model
-    raw_model = model.module if hasattr(model, 'module') else model
-    tokenizer = raw_model.language_model.tokenizer if hasattr(raw_model.language_model, 'tokenizer') else None
-    if tokenizer is None:
-        from transformers import AutoTokenizer
-        tokenizer = AutoTokenizer.from_pretrained(getattr(config, 'qwen_model', 'Qwen/Qwen2.5-0.5B'))
-
-    train_loader, val_loader = create_dataloaders(
-        train_metadata_file=getattr(config, 'train_metadata', './data/cc12m/train_metadata.json'),
-        val_metadata_file=getattr(config, 'val_metadata', './data/cc12m/val_metadata.json'),
-        tokenizer=tokenizer,
+    train_loader, val_loader, train_sampler = create_dataloaders(
+        train_metadata_file=config.train_metadata_file,
+        val_metadata_file=config.val_metadata_file,
+        tokenizer=base_model.language_model.tokenizer,
         batch_size=config.batch_size,
-        num_workers=num_workers,
-        distributed=(local_rank != -1),
-        max_samples=getattr(config, 'max_samples', None),
-        max_val_samples=getattr(config, 'max_val_samples', None)
+        num_workers=effective_num_workers,
+        max_samples=effective_max_samples,
+        max_val_samples=effective_max_val_samples,
+        distributed=is_distributed,
+        world_size=world_size,
+        rank=local_rank if is_distributed else 0
     )
 
-    if is_main_process:
-        print(f"Created dataloaders: {len(train_loader.dataset)} train, {len(val_loader.dataset)} val")
-        if local_rank != -1:
-            print(f"  Distributed: world_size={world_size}, rank={local_rank}")
-
-    # Validate first batch
+    # Validate first batch to check data quality (main process only)
     if is_main_process:
         print("\nValidating first training batch...")
         first_batch = next(iter(train_loader))
-        print(f"  Image shape: {first_batch['images'].shape}")
+        print(f"  Image shape: {first_batch['image'].shape}")
         print(f"  Input IDs shape: {first_batch['input_ids'].shape}")
+        print(f"  Caption samples: {first_batch['caption'][:2]}")
+        print(
+            f"  Caption lengths: min={first_batch['attention_mask'].sum(dim=1).min().item()}, max={first_batch['attention_mask'].sum(dim=1).max().item()}")
+        del first_batch
 
     # Create optimizer and scheduler
     optimizer = create_optimizer(model, config)
@@ -2370,89 +2636,146 @@ def main():
     if args.resume:
         if is_main_process:
             print(f"Resuming from checkpoint: {args.resume}")
-        checkpoint = torch.load(args.resume, map_location=device)
-        raw_model = model.module if hasattr(model, 'module') else model
+        checkpoint = torch.load(args.resume, map_location=config.device)
 
-        # Handle state dict loading with possible key mismatches
-        state_dict = checkpoint.get('model_state_dict', checkpoint)
+        # Check if checkpoint has alignment_mode metadata
+        ckpt_alignment_mode = checkpoint.get('alignment_mode', None)
+        if ckpt_alignment_mode and ckpt_alignment_mode != args.alignment_mode:
+            if is_main_process:
+                print(f"⚠️  Warning: Checkpoint alignment_mode='{ckpt_alignment_mode}' differs from current='{args.alignment_mode}'")
+                print(f"   This may cause loading issues. Consider using --alignment_mode {ckpt_alignment_mode}")
+
+        # Get state dict from checkpoint
+        state_dict = checkpoint['model_state_dict']
+
+        # Strip 'module.' prefix if present (from DDP checkpoints)
+        new_state_dict = {}
+        for k, v in state_dict.items():
+            new_key = k.replace('module.', '') if k.startswith('module.') else k
+            new_state_dict[new_key] = v
+        state_dict = new_state_dict
+
+        # Detect stage transition (Stage 1 -> Stage 2)
+        ckpt_config = checkpoint.get('config', {})
+        ckpt_use_memory = ckpt_config.get('use_memory', False)
+        current_use_memory = getattr(config, 'use_memory', False)
+
+        # Check quantization mismatch
+        ckpt_quantize_lm = ckpt_config.get('quantize_language_4bit', False)
+        current_quantize_lm = getattr(config, 'quantize_language_4bit', False)
+
+        keys_to_remove = []
+
+        # Filter memory keys if transitioning from Stage 1 (no memory) to Stage 2 (with memory)
+        if not ckpt_use_memory and current_use_memory:
+            # Match any key containing memory-related module names
+            memory_patterns = ['episodic_memory', 'scope_detector', 'memory_mean', 'memory_logvar', 'ben_cohen', 'w_logvar', 'lstm_z', 'W_M']
+            memory_keys = [k for k in state_dict.keys() if any(p in k for p in memory_patterns)]
+            keys_to_remove.extend(memory_keys)
+            if memory_keys and is_main_process:
+                print(f"   🔄 Stage transition: filtering {len(memory_keys)} untrained memory keys")
+
+        # Filter language model keys if quantization settings differ
+        # (4-bit quantized weights have incompatible shapes with non-quantized model)
+        if ckpt_quantize_lm != current_quantize_lm:
+            lm_keys = [k for k in state_dict.keys() if 'language_model' in k]
+            keys_to_remove.extend(lm_keys)
+            if lm_keys and is_main_process:
+                print(f"   🔄 Quantization mismatch: filtering {len(lm_keys)} language model keys (will reload from Qwen)")
+
+        # Remove all flagged keys
+        for k in keys_to_remove:
+            if k in state_dict:
+                del state_dict[k]
+
+        # Debug: Print memory_mean shape BEFORE loading
+        if is_main_process:
+            base = model.module if hasattr(model, 'module') else model
+            if hasattr(base, 'episodic_memory'):
+                mem_shape = base.episodic_memory.memory_mean.shape
+                print(f"   🔍 Memory shape BEFORE load: {mem_shape} (code_size={mem_shape[1]})")
+
+        # Handle DDP/DP wrapped models - use strict=False to allow partial loading
+        if hasattr(model, 'module'):
+            missing, unexpected = model.module.load_state_dict(state_dict, strict=False)
+        else:
+            missing, unexpected = model.load_state_dict(state_dict, strict=False)
+
+        # Debug: Print memory_mean shape AFTER loading
+        if is_main_process:
+            base = model.module if hasattr(model, 'module') else model
+            if hasattr(base, 'episodic_memory'):
+                mem_shape = base.episodic_memory.memory_mean.shape
+                print(f"   🔍 Memory shape AFTER load: {mem_shape} (code_size={mem_shape[1]})")
+
+        # Report any mismatched keys (but don't crash)
+        if is_main_process and (missing or unexpected):
+            if missing:
+                print(f"   ℹ️  Missing keys (new modules): {len(missing)} keys")
+            if unexpected:
+                print(f"   ℹ️  Unexpected keys (removed modules): {len(unexpected)} keys")
+
+        # Load optimizer state (may fail if architecture changed significantly)
         try:
-            raw_model.load_state_dict(state_dict, strict=False)
+            optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         except Exception as e:
             if is_main_process:
-                print(f"   ⚠️  Partial load: {e}")
+                print(f"   ⚠️  Could not restore optimizer state (architecture changed): {e}")
+                print(f"   Starting with fresh optimizer state")
 
         start_epoch = checkpoint.get('epoch', 0)
         global_step = checkpoint.get('global_step', 0)
 
-        # Try to restore optimizer
-        try:
-            if 'optimizer_state_dict' in checkpoint:
-                optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        except Exception as e:
-            if is_main_process:
-                print(f"   ⚠️  Could not restore optimizer state: {e}")
-                print("   Starting with fresh optimizer state")
-
-    # Start carbon tracking
-    if carbon_tracker:
-        carbon_tracker.start_training()
         if is_main_process:
-            print("[CarbonTracker] Training tracking started")
+            print(f"   ✓ Resumed from epoch {start_epoch}, step {global_step}")
 
-    # Create visualizer
-    from src.visualization.attention_vis import create_attention_visualizer
-    visualizer = create_attention_visualizer(model_config['model_dimensions'])
+    # Start carbon/compute tracking
+    if carbon_tracker is not None:
+        carbon_tracker.start_training()
 
-    # ===== SLIDING WINDOW EARLY STOPPING =====
-    sliding_window_stopper = None
-    if getattr(config, 'use_sliding_window_early_stop', False):
-        # Read parameters from config with correct names
-        window_size = getattr(config, 'sliding_window_size', 2000)
-        min_delta = getattr(config, 'sliding_window_min_delta', 0.05)
-        patience_windows = getattr(config, 'sliding_window_patience_windows', 3)
-        patience_steps = patience_windows * window_size  # Convert windows to steps
-
-        sliding_window_stopper = SlidingWindowEarlyStopping(
-            window_size=window_size,
-            min_delta=min_delta,
-            patience_steps=patience_steps,
+    # Initialize early stopping
+    loss_early_stopper = None
+    if getattr(config, 'use_early_stopping', True):
+        loss_early_stopper = EarlyStopping(
+            patience=getattr(config, 'early_stop_patience', 2),
+            min_delta=getattr(config, 'early_stop_min_delta', 0.01),
             verbose=is_main_process
         )
+        if is_main_process:
+            print(f"\n📉 Early Stopping: patience={loss_early_stopper.patience}, min_delta={loss_early_stopper.min_delta}")
 
+    # Initialize sliding window early stopping (for step-based early stopping)
+    sliding_window_stopper = None
+    use_sliding_window = getattr(config, 'use_sliding_window_early_stop', False)
+    if use_sliding_window:
+        sliding_window_stopper = SlidingWindowEarlyStopping(
+            window_size=getattr(config, 'sliding_window_size', 2000),
+            min_delta=getattr(config, 'sliding_window_min_delta', 0.05),
+            patience_windows=getattr(config, 'sliding_window_patience_windows', 3),
+            verbose=is_main_process
+        )
         if is_main_process:
             print(f"\n🪟 Sliding Window Early Stopping:")
-            print(f"   Window size: {window_size} steps")
-            print(f"   Min delta: {min_delta} (loss must improve by at least this amount)")
-            print(f"   Patience: {patience_steps} steps ({patience_windows} windows)")
+            print(f"   Window size: {sliding_window_stopper.window_size} steps")
+            print(f"   Min delta: {sliding_window_stopper.min_delta}")
+            print(f"   Patience: {sliding_window_stopper.patience_windows} windows ({sliding_window_stopper.patience_windows * sliding_window_stopper.window_size} steps)")
             print(f"   Auto-push to HF: {getattr(config, 'push_to_hf_on_stop', True)}")
 
-    # ===== BEST MODEL TRACKER =====
-    best_model_tracker = None
-    if getattr(config, 'track_best_model', True):
-        best_model_tracker = BestStage2ModelTracker(
-            output_dir=config.output_dir,
-            config=config,
-            verbose=is_main_process
-        )
-
-        if is_main_process:
-            print(f"\n⭐ Best Stage 2 Model Tracking:")
-            print(f"   Metrics: ['loss', 'memory_kl', 'alignment_loss', 'gradient_norm']")
-            print(f"   Check interval: {getattr(config, 'best_model_check_interval', 100)} steps")
-            print(f"   Min improvement: {getattr(config, 'early_stop_min_delta', 0.01)}")
-            print(f"   Checkpoint: {config.output_dir}/checkpoints/best-stage2-checkpoint.pt")
-            print(f"   HuggingFace path: checkpoints/best-stage2/")
-
-    # ===== TRAINING LOOP =====
+    # Training loop
     if is_main_process:
         print(f"Starting training for up to {config.num_epochs} epochs...")
 
-    early_stop_reason = None
-    stopper_status = None
+    # Track training history for model card
+    training_history = []
+    early_stop = False
+    loss_converged = False
 
     for epoch in range(start_epoch, config.num_epochs):
-        # Train one epoch
-        avg_loss, global_step, stop_reason, stop_status = train_epoch(
+        # Set epoch for distributed sampler (ensures proper shuffling)
+        if train_sampler is not None:
+            train_sampler.set_epoch(epoch)
+
+        result = train_epoch(
             model=model,
             train_loader=train_loader,
             optimizer=optimizer,
@@ -2463,111 +2786,180 @@ def main():
             global_step=global_step,
             wandb_run=wandb_run,
             wandb_logger=wandb_logger,
+            is_distributed=is_distributed,
             is_main_process=is_main_process,
             carbon_tracker=carbon_tracker,
             attention_monitor=attention_monitor,
-            sliding_window_stopper=sliding_window_stopper,
-            best_model_tracker=best_model_tracker
+            sliding_window_stopper=sliding_window_stopper
         )
 
-        # Check for early stopping
-        if stop_reason is not None:
-            early_stop_reason = stop_reason
-            stopper_status = stop_status
+        # Unpack results (handle both old and new formats)
+        if len(result) == 4:
+            avg_loss, global_step, stop_reason, stopper_status = result
+        else:
+            avg_loss, global_step, stop_reason = result
+            stopper_status = None
 
+        # Handle early stopping reason
+        if stop_reason:
             if is_main_process:
                 print(f"\n⚠️  Training stopped early at epoch {epoch}, step {global_step}")
-                print(f"   Reason: {stop_reason}")
-                if stop_status:
-                    print(f"   Best window loss: {stop_status.get('best_window_loss', 'N/A')}")
-                    print(f"   Current window loss: {stop_status.get('current_window_loss', 'N/A')}")
-                    print(f"   Steps without improvement: {stop_status.get('steps_without_improvement', 'N/A')}")
-                    print(f"   Improvement threshold: {stop_status.get('min_delta', 'N/A')}")
+                if stop_reason == 'attention':
+                    print("   Reason: Attention quality degraded below threshold")
+                elif stop_reason == 'alignment_plateau':
+                    print("   Reason: Alignment similarity plateaued")
+                elif stop_reason == 'alignment_negative':
+                    print("   Reason: Alignment similarity stayed below threshold")
+                elif stop_reason == 'sliding_window_plateau':
+                    print("   Reason: Sliding window plateau - no meaningful training loss improvement")
+                    if stopper_status:
+                        print(f"   Best window loss: {stopper_status['best_window_loss']:.4f}")
+                        print(f"   Steps without improvement: {stopper_status['steps_without_improvement']}")
+                else:
+                    print(f"   Reason: {stop_reason}")
                 print("   Saving final checkpoint before exit...")
+
+                checkpoint_path, stats = save_epoch_checkpoint(
+                    model, optimizer, epoch, global_step, config,
+                    f"{args.config}_early_stop"
+                )
+                print(f"   Emergency checkpoint saved: {checkpoint_path}")
+
+                # Handle sliding window early stopping with HF push
+                if stop_reason == 'sliding_window_plateau' and stopper_status:
+                    # Add current step info to training history
+                    training_history.append({
+                        'step': global_step,
+                        'loss': avg_loss,
+                        'lr': optimizer.param_groups[0]['lr'],
+                        'epoch': epoch
+                    })
+
+                    # Automatically push to HuggingFace if enabled
+                    if getattr(config, 'push_to_hf_on_stop', True):
+                        print(f"\n🚀 Automatically pushing Stage 2 final model to HuggingFace...")
+                        success = push_stage2_final_to_hf(
+                            checkpoint_path=checkpoint_path,
+                            config=config,
+                            early_stop_metrics=stopper_status,
+                            training_history=training_history,
+                            model_statistics=stats
+                        )
+                        if success:
+                            print(f"✅ Stage 2 final model successfully uploaded to HuggingFace!")
+                        else:
+                            print(f"⚠️  Failed to push Stage 2 final model to HuggingFace")
+
+                if stop_reason.startswith('alignment') and getattr(config, '_best_alignment_checkpoint', None):
+                    print(f"   Best alignment checkpoint: {config._best_alignment_checkpoint}")
+                    print(f"   Best correct_sim: {config._best_alignment_sim:.4f} (step {config._best_alignment_step})")
             break
 
-        # Save epoch checkpoint
-        if is_main_process:
-            stats = get_model_statistics(model.module if hasattr(model, 'module') else model, config)
-            print_model_statistics(stats, epoch)
-            save_epoch_checkpoint(model.module if hasattr(model, 'module') else model,
-                                  optimizer, epoch, global_step, config, args.config)
+        # Check loss-based early stopping
+        if loss_early_stopper is not None:
+            loss_converged = loss_early_stopper(epoch, avg_loss)
+            if loss_converged:
+                if is_main_process:
+                    # Save final checkpoint before stopping
+                    stage_name = args.config if hasattr(args, 'config') else 'default'
+                    checkpoint_path, stats = save_epoch_checkpoint(
+                        model, optimizer, epoch, global_step, config, stage_name
+                    )
+                    push_to_huggingface(
+                        checkpoint_path=checkpoint_path,
+                        stats=stats,
+                        epoch=epoch,
+                        total_epochs=epoch + 1,
+                        stage_name=stage_name,
+                        config=config,
+                        training_history=training_history
+                    )
+                break
 
-        # Sync across processes
-        if local_rank != -1:
+        if is_main_process:
+            print(f"Epoch {epoch} completed. Average loss: {avg_loss:.4f}")
+
+            # Log weight histograms at end of epoch (if wandb_logger available)
+            if wandb_logger and (epoch % max(1, config.num_epochs // 5) == 0):
+                wandb_logger.log_model_weights_histogram(model, global_step)
+
+            # Determine stage name for HF commit message
+            stage_name = args.config if hasattr(args, 'config') else 'default'
+
+            # Save epoch checkpoint with statistics
+            checkpoint_path, stats = save_epoch_checkpoint(
+                model, optimizer, epoch, global_step, config, stage_name
+            )
+
+            # Add to training history (for model card)
+            training_history.append({
+                'epoch': epoch,
+                'train_loss': avg_loss,
+                'alignment_loss': stats.get('alignment_loss', 0),
+                'learning_rate': optimizer.param_groups[0]['lr'],
+                'gradient_norm': stats.get('gradient_norm', 0)
+            })
+
+            # Log statistics to WandB
+            if wandb_logger:
+                wandb_logger.log_metrics(
+                    stats, step=global_step, prefix="model_stats")
+
+            # Push ONLY latest checkpoint to HuggingFace (replaces previous)
+            push_to_huggingface(
+                checkpoint_path=checkpoint_path,
+                stats=stats,
+                epoch=epoch,
+                total_epochs=config.num_epochs,
+                stage_name=stage_name,
+                config=config,
+                training_history=training_history
+            )
+        
+        # Synchronize all processes before next epoch
+        if is_distributed:
             dist.barrier()
 
-    # ===== POST-TRAINING =====
+    # End carbon/compute tracking and log final summary
+    if carbon_tracker is not None:
+        final_metrics = carbon_tracker.end_training()
+        
+        # Log final carbon/compute summary to WandB
+        if is_main_process and wandb_logger:
+            final_wandb_metrics = carbon_tracker.get_wandb_metrics(final_metrics, prefix="final_compute")
+            wandb_logger.log_metrics(final_wandb_metrics, step=global_step)
+            
+            # Log summary statistics as WandB summary
+            if wandb_run:
+                wandb_run.summary["total_training_hours"] = final_metrics.total_time_seconds / 3600
+                wandb_run.summary["total_flops"] = final_metrics.cumulative_flops
+                wandb_run.summary["total_tflops"] = final_metrics.cumulative_flops / 1e12
+                if final_metrics.emissions_kg > 0:
+                    wandb_run.summary["carbon_emissions_g"] = final_metrics.emissions_kg * 1000
+                    wandb_run.summary["energy_consumed_kwh"] = final_metrics.energy_consumed_kwh
+        
+        # Cleanup tracker resources
+        carbon_tracker.cleanup()
+
+    # Final save (main process only)
     if is_main_process:
-        # Print best model info
-        if best_model_tracker and best_model_tracker.best_checkpoint_path:
-            print(f"\n⭐ Best Stage 2 Model Information:")
-            print(f"   Checkpoint: {best_model_tracker.best_checkpoint_path}")
-            print(f"   Step: {best_model_tracker.best_step}")
-            print(f"   Composite Score: {best_model_tracker.best_score:.6f}")
-            print(f"   Best Metrics:")
-            for k, v in best_model_tracker.best_metrics.items():
-                print(f"     {k}: {v:.6f}" if isinstance(v, float) else f"     {k}: {v}")
-            print(f"   Location on HuggingFace: checkpoints/best-stage2/")
-
-        # Carbon tracking summary
-        if carbon_tracker:
-            summary = carbon_tracker.end_training()
-            print(f"\n{'='*60}")
-            print("CARBON & COMPUTE TRACKING SUMMARY")
-            print('='*60)
-            if summary:
-                print(f"Total Training Time:     {summary.get('total_time_hours', 0):.2f} hours")
-                print(f"Total Samples Processed: {summary.get('total_samples', 0):,}")
-                print(f"Throughput:              {summary.get('throughput', 0):.2f} samples/sec")
-            print('='*60)
-
-        print(f"\n📊 Training Summary: {epoch + 1}/{config.num_epochs} epochs, {global_step} steps")
-
-        # Save final model
+        actual_epochs = epoch + 1
+        print(f"\n📊 Training Summary: {actual_epochs}/{config.num_epochs} epochs, {global_step} steps")
+        if loss_converged:
+            print(f"   Stopped early - loss plateaued")
+        
         final_path = Path(config.output_dir) / "final_model.pt"
-        raw_model = model.module if hasattr(model, 'module') else model
-        torch.save({
-            'model_state_dict': raw_model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'epoch': epoch,
-            'global_step': global_step,
-            'config': vars(config) if hasattr(config, '__dict__') else str(config),
-            'early_stop_reason': early_stop_reason,
-            'stopper_status': stopper_status
-        }, final_path)
-        print(f"Checkpoint saved to {final_path}")
+        base_model = model.module if hasattr(model, 'module') else model
+        base_model.save_checkpoint(str(final_path))
         print(f"Training complete! Final model saved to {final_path}")
 
-        # ===== POST-TRAINING QUANTIZATION =====
-        if getattr(config, 'apply_post_training_quantization', True):
-            print("\n" + "="*60)
-            print("🔧 APPLYING POST-TRAINING QUANTIZATION")
-            print("="*60)
-
-            # Find best checkpoint
-            best_checkpoint = None
-            if best_model_tracker and best_model_tracker.best_checkpoint_path:
-                best_checkpoint = best_model_tracker.best_checkpoint_path
-            else:
-                # Use final model if no best tracker
-                best_checkpoint = str(final_path)
-
-            push_stage2_final_to_hf(
-                checkpoint_path=best_checkpoint,
-                config=config,
-                early_stop_metrics=stopper_status,
-                training_history=None,
-                model_statistics=get_model_statistics(raw_model, config)
-            )
-        else:
-            print("\n⚠️  Post-training quantization disabled in config")
-
-    # Cleanup
-    if wandb_run:
-        wandb_run.finish()
-
-    if local_rank != -1:
+        if wandb_run:
+            wandb_run.summary["actual_epochs"] = actual_epochs
+            wandb_run.summary["early_stopped"] = loss_converged
+            wandb_run.finish()
+    
+    # Clean up distributed training
+    if is_distributed:
         dist.destroy_process_group()
 
 

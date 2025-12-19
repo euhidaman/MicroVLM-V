@@ -2,7 +2,7 @@
 Training Configuration with Staged Learning and Quantization
 """
 
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from typing import Optional
 
 
@@ -87,7 +87,6 @@ class TrainingConfig:
     alignment_negative_patience: int = 100
     save_best_alignment_checkpoint: bool = True
     alignment_save_cooldown: int = 100  # min steps between best-checkpoint saves
-    alignment_min_stop_steps: int = 0  # do not stop on alignment before this step
     alignment_min_stop_steps: int = 0  # do not stop on alignment before this step
 
     # WandB
@@ -238,28 +237,19 @@ class Stage2Config(TrainingConfig):
     output_dir: str = "./checkpoints/stage2"
     hf_repo_name: str = "MicroVLM-V-stage2"
 
-    # Early stopping for Stage 2 (loss-based, epoch-level)
+    # Early stopping for Stage 2 (loss-based)
     use_early_stopping: bool = True
     early_stop_patience: int = 3  # More patience for memory learning
     early_stop_min_delta: float = 0.005  # Smaller delta for finer convergence
 
-    # ===== SLIDING WINDOW EARLY STOPPING (step-based, robust plateau detection) =====
-    # Uses rolling window to compute loss average, checks every step
-    use_sliding_window_early_stop: bool = True  # Enable step-based early stopping
-    sliding_window_size: int = 2000  # Steps per window (rolling window of recent losses)
-    sliding_window_min_delta: float = 0.05  # Loss must improve by at least 0.05 to count as progress
-    sliding_window_patience_windows: int = 3  # Stop after 3 windows without improvement (6000 steps)
-    sliding_window_hysteresis: float = 0.005  # Extra threshold to reset patience (unused in current impl)
-    sliding_window_ema_alpha: float = 0.1  # EMA smoothing for noise reduction (unused in current impl)
-
-    # Best model tracking
-    track_best_model: bool = True  # Track and save best model during training
-    best_model_check_interval: int = 100  # Check for best model every N steps
-
-    # Post-training quantization (generates 4-bit, 3-bit, 1.58-bit variants at end)
-    apply_post_training_quantization: bool = True  # Generate quantized variants when training ends
-    quantization_bit_widths: list = None  # Will default to [4, 3, 1.58] if None
-    push_to_hf_on_stop: bool = True  # Auto-push quantized variants to HuggingFace
+    # ===== SLIDING WINDOW EARLY STOPPING (Step-wise) =====
+    # This is the primary early stopping mechanism for Stage 2
+    # It monitors training loss over non-overlapping windows
+    use_sliding_window_early_stop: bool = True
+    sliding_window_size: int = 2000  # Steps per window (non-overlapping)
+    sliding_window_min_delta: float = 0.05  # Min improvement between windows
+    sliding_window_patience_windows: int = 3  # Windows without improvement before stop
+    push_to_hf_on_stop: bool = True  # Auto-push best model to HF on early stop
 
     # Visualization
     visualize_interval: int = 100
@@ -291,7 +281,6 @@ class TestConfig(TrainingConfig):
     device: str = "cuda"
     train_metadata: str = "train_metadata.json"
     val_metadata: str = "val_metadata.json"
-    max_samples: int = 5000
 
 
 @dataclass
